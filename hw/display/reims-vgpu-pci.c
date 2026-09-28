@@ -137,7 +137,9 @@ struct ReimsVGPUPCIState {
      * not. `harvest_done` is the highest ask whose guest stores a completed
      * harvest has seen, so the drain can wait for exactly the asks it needs.
      * `async_harvest` is the x-async-harvest property: false keeps the
-     * harvest inline in the MMIO write.
+     * harvest inline in the MMIO write. `harvest_rearm` records that the
+     * drain was told "not settled" and left work behind, so the harvest
+     * thread wakes it once it has caught up.
      */
     QemuThread harvest_thread;
     QemuMutex harvest_mutex;
@@ -147,6 +149,7 @@ struct ReimsVGPUPCIState {
     uint64_t harvest_done;
     bool harvest_stopping;
     bool harvest_started;
+    bool harvest_rearm;
     bool async_harvest;
     Notifier shutdown_notifier;
     bool shutdown_notifier_registered;
@@ -787,10 +790,47 @@ static void *reims_vgpu_pci_harvest_thread(void *opaque)
         qemu_mutex_lock(&s->harvest_mutex);
         s->harvest_done = target;
         qemu_cond_broadcast(&s->harvest_done_cond);
+        if (s->harvest_rearm && s->harvest_done >= s->harvest_asked) {
+            /* The wakeup an unsettled answer promised; see harvests_settled. */
+            s->harvest_rearm = false;
+            qemu_mutex_unlock(&s->harvest_mutex);
+            reims_vgpu_pci_schedule_bh(s);
+            qemu_mutex_lock(&s->harvest_mutex);
+        }
     }
     qemu_mutex_unlock(&s->harvest_mutex);
     rcu_unregister_thread();
     return NULL;
+}
+
+/*
+ * HostOps harvests_settled (ABI v21): whether every harvest a register write
+ * has asked for has finished. The Rust drain asks this, with the device lock
+ * held, before it serves work a doorbell handed over, including work folded
+ * or applied at its lock acquisition after reims_vgpu_pci_wait_harvest and
+ * rings that arrive mid-tranche; when the answer is no, it leaves that work
+ * pending. harvest_mutex is a leaf, so the call never blocks on the BQL or
+ * the device.
+ *
+ * The write behind an unsettled answer need not have been a doorbell, so
+ * nothing else may wake the drain for the work it left: arm the harvest
+ * thread to do it once it catches up.
+ */
+static int reims_vgpu_pci_harvests_settled(void *ctx)
+{
+    ReimsVGPUPCIState *s = ctx;
+    bool settled;
+
+    if (!s->harvest_started) {
+        return 1;
+    }
+    qemu_mutex_lock(&s->harvest_mutex);
+    settled = s->harvest_done >= s->harvest_asked;
+    if (!settled) {
+        s->harvest_rearm = true;
+    }
+    qemu_mutex_unlock(&s->harvest_mutex);
+    return settled;
 }
 
 /* Every harvest asked for before this call has completed, or we stop. */
@@ -965,15 +1005,13 @@ static void reims_vgpu_pci_gfx_write(void *opaque, hwaddr offset, uint64_t data,
      * observed before anything that work does can reuse a host-side copy of
      * those pages.
      *
-     * With the harvest thread running, the write only asks for the harvest.
-     * The ask comes first, so the drain this write wakes waits for it before
-     * it takes the device lock, and the vCPU no longer sits in the MMIO exit,
-     * holding the BQL, for the accelerator's dirty-log sync. That does not
-     * cover work the drain picks up without a wakeup of its own — a ring
-     * served by a tranche that is already running, or a write landing between
-     * the drain's wait and its taking the device lock. Such work can run
-     * before the harvest its write asked for, which reports those stores just
-     * after. x-async-harvest=off keeps the strict order.
+     * With the harvest thread running, the write only asks for the harvest,
+     * and the vCPU no longer sits in the MMIO exit, holding the BQL, for the
+     * accelerator's dirty-log sync. The ask comes first, so the drain this
+     * write wakes waits for it before it takes the device lock. Work the drain
+     * would reach without a wakeup of its own — a ring served by a tranche
+     * already running, or a write landing between that wait and the lock —
+     * it holds back until reims_vgpu_pci_harvests_settled says yes.
      *
      * Inline, it has to be here: the sync needs the BQL, which a vCPU MMIO
      * write holds and the drain thread must never take. Cheap either way when
@@ -1190,6 +1228,7 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         .guest_write_gen = reims_vgpu_pci_guest_write_gen,
         .guest_written_pages = reims_vgpu_pci_guest_written_pages,
         .page_alias_census = reims_vgpu_pci_page_alias_census,
+        .harvests_settled = reims_vgpu_pci_harvests_settled,
     };
     s->dirty = reims_vgpu_dirty_new();
 
@@ -1376,7 +1415,7 @@ static void reims_vgpu_pci_instance_init(Object *obj)
 }
 
 static const Property reims_vgpu_pci_properties[] = {
-    /* Off: harvest inline in the MMIO write, strict order (see gfx_write). */
+    /* Off: harvest inline in the MMIO write, as before (see gfx_write). */
     DEFINE_PROP_BOOL("x-async-harvest", ReimsVGPUPCIState, async_harvest, true),
 };
 
