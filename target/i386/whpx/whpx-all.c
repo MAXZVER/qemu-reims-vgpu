@@ -1049,6 +1049,23 @@ static int emulate_msr_instruction(CPUState *cpu,
 }
 
 /*
+ * QEMU_WHPX_PRERUN_FAST=1 lets a pre-run with nothing pending skip the BQL.
+ * Opt-in: no frame-rate gain has been measured through the guest's bimodal
+ * 60/120 Hz latch yet, and one of four boots with it on hung in OpenCore
+ * (cause not established).
+ */
+static bool whpx_prerun_fast_path(void)
+{
+    static int on = -1;
+
+    if (qatomic_read(&on) < 0) {
+        const char *v = g_getenv("QEMU_WHPX_PRERUN_FAST");
+        qatomic_set(&on, v && strcmp(v, "1") == 0);
+    }
+    return qatomic_read(&on) > 0;
+}
+
+/*
  * Fast path for the MMIO shape that dominates a busy guest: a plain register
  * load, mov r32/r64 <- [mem], from a region that declared lockless I/O. The
  * generic path fetches all GPRs, re-derives the linear address from the ModRM
@@ -2135,6 +2152,22 @@ static void whpx_vcpu_pre_run(CPUState *cpu)
 
     memset(&new_int, 0, sizeof(new_int));
     memset(reg_values, 0, sizeof(reg_values));
+
+    /*
+     * With the APIC in the hypervisor, every step below acts on a pending
+     * interrupt_request bit (NMI/SMI, INIT/TPR, HARD) and does nothing without
+     * one, yet it took the BQL on every exit to find that out -- so a device
+     * handler holding the BQL for milliseconds (a dirty-log sync) stalled
+     * every vCPU at its next exit. With no bit pending there is nothing to
+     * inject and no register to set. A bit raised after this read is
+     * followed by a kick, which cancels the run this returns to, exactly as
+     * one raised after the unlock below always could be.
+     */
+    if (whpx_prerun_fast_path() && whpx_irqchip_in_kernel() &&
+        !cpu_test_interrupt(cpu, ~0)) {
+        vcpu->ready_for_pic_interrupt = false;
+        return;
+    }
 
     bql_lock();
 
