@@ -883,22 +883,31 @@ static void *reims_vgpu_pci_drain_thread(void *opaque)
 
 /*
  * Oversample the Rust-owned VBL limiter (DISPLAY_VBL_MIN_INTERVAL_MS = 8 ms for
- * the 120 Hz advertised mode). Polling at 4 ms guarantees the 8 ms limiter is
- * the gate even when the main loop stalls under input/QMP/display work. This
- * thread only supplies poll opportunities and schedules the existing main-loop
- * BH; Rust owns pacing and protocol state, while the BH remains the sole
- * HostAction applier.
+ * the 120 Hz advertised mode). This thread only supplies poll opportunities
+ * and schedules the existing main-loop BH; Rust owns pacing and protocol
+ * state, while the BH remains the sole HostAction applier.
+ *
+ * 1 ms, not 4: the limiter's catch-up grid only phase-locks when polls land
+ * well inside the 8.33 ms interval, and a Windows host's 4 ms condvar waits
+ * (plus the poll's own maintenance) drifted past it often enough that CSS
+ * animation sat at ~95 fps median; at 1 ms it reads ~106-112 on the same host.
+ * REIMS_VGPU_HEARTBEAT_MS (1-16) overrides it for A/B runs.
  */
-#define REIMS_VGPU_PCI_HEARTBEAT_MS 4
+#define REIMS_VGPU_PCI_HEARTBEAT_MS 1
 
 static void *reims_vgpu_pci_heartbeat_thread(void *opaque)
 {
     ReimsVGPUPCIState *s = opaque;
+    int period_ms = REIMS_VGPU_PCI_HEARTBEAT_MS;
+    const char *hb = getenv("REIMS_VGPU_HEARTBEAT_MS");   /* lab A/B */
 
+    if (hb && atoi(hb) >= 1 && atoi(hb) <= 16) {
+        period_ms = atoi(hb);
+    }
     qemu_mutex_lock(&s->heartbeat_mutex);
     while (!s->heartbeat_stopping) {
         qemu_cond_timedwait(&s->heartbeat_cond, &s->heartbeat_mutex,
-                            REIMS_VGPU_PCI_HEARTBEAT_MS);
+                            period_ms);
         if (s->heartbeat_stopping) {
             break;
         }
