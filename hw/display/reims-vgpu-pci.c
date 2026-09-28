@@ -930,11 +930,16 @@ static void *reims_vgpu_pci_drain_thread(void *opaque)
 static void *reims_vgpu_pci_heartbeat_thread(void *opaque)
 {
     ReimsVGPUPCIState *s = opaque;
+    int period_ms = REIMS_VGPU_PCI_HEARTBEAT_MS;
+    const char *hb = getenv("REIMS_VGPU_HEARTBEAT_MS");   /* lab A/B */
 
+    if (hb && atoi(hb) >= 1 && atoi(hb) <= 16) {
+        period_ms = atoi(hb);
+    }
     qemu_mutex_lock(&s->heartbeat_mutex);
     while (!s->heartbeat_stopping) {
         qemu_cond_timedwait(&s->heartbeat_cond, &s->heartbeat_mutex,
-                            REIMS_VGPU_PCI_HEARTBEAT_MS);
+                            period_ms);
         if (s->heartbeat_stopping) {
             break;
         }
