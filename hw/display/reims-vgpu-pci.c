@@ -154,7 +154,7 @@ struct ReimsVGPUPCIState {
     bool async_harvest;
     /*
      * EXPERIMENTAL: HostOps.irq_pulse may raise MSIs off the BQL.
-     * REIMS_VGPU_IRQ_DIRECT=off turns it off for A/B runs.
+     * Opt-in with REIMS_VGPU_IRQ_DIRECT=on, for A/B runs.
      */
     bool irq_direct;
     Notifier shutdown_notifier;
@@ -1339,7 +1339,12 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
     {
         const char *d = getenv("REIMS_VGPU_IRQ_DIRECT");   /* lab A/B */
 
-        s->irq_direct = !(d && strcmp(d, "off") == 0);
+        /*
+         * Opt-in: with the 1 ms heartbeat the direct pulse lost to the action
+         * BH on the same host (vCPUs waited ~70% longer for the BQL in prerun
+         * and the guest's kernel_task doubled), so it stays a lab arm.
+         */
+        s->irq_direct = d && strcmp(d, "on") == 0;
     }
     /* Before the drain exists, so it never sees harvest_started change. */
     if (s->async_harvest) {
