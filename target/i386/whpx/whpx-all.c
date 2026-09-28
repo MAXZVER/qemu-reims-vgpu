@@ -1048,10 +1048,105 @@ static int emulate_msr_instruction(CPUState *cpu,
     return 0;
 }
 
+/*
+ * Fast path for the MMIO shape that dominates a busy guest: a plain register
+ * load, mov r32/r64 <- [mem], from a region that declared lockless I/O. The
+ * generic path fetches all GPRs, re-derives the linear address from the ModRM
+ * operand (segment and control-register reads plus a guest page walk, each a
+ * hypercall or several) and writes the GPRs back, about 8 us per exit here --
+ * for an address the exit context already carries as a GPA. This path makes
+ * one hypercall: the store of the loaded value and the advanced RIP.
+ *
+ * Deliberately narrow: 64-bit code, opcode 8B with at most a REX prefix, so
+ * the destination write is a whole-register (zero-extending) store and the
+ * instruction length follows from ModRM/SIB/displacement alone. Anything else,
+ * and every region that still needs the BQL, takes the generic path.
+ */
+static bool whpx_mmio_fast_load(CPUState *cpu,
+                                const WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
+{
+    const WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
+    const WHV_VP_EXIT_CONTEXT *vp = &exit_ctx->VpContext;
+    const uint8_t *b = ctx->InstructionBytes;
+    unsigned n = ctx->InstructionByteCount, i = 0, rex = 0, disp;
+    unsigned modrm, mod, rm, size;
+    MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+    WHV_REGISTER_NAME names[2];
+    WHV_REGISTER_VALUE values[2] = {};
+    MemoryRegion *mr;
+    hwaddr xlat, len;
+    uint64_t val = 0;
+    HRESULT hr;
+
+    if (ctx->AccessInfo.AccessType != WHvMemoryAccessRead ||
+        !vp->ExecutionState.EferLma || !vp->Cs.Long ||
+        vp->ExecutionState.InterruptionPending || (vp->Rflags & TF_MASK)) {
+        return false;
+    }
+    if (i < n && (b[i] & 0xf0) == 0x40) {
+        rex = b[i++];
+    }
+    if (i + 2 > n || b[i] != 0x8b) {
+        return false;
+    }
+    modrm = b[i + 1];
+    i += 2;
+    mod = modrm >> 6;
+    rm = modrm & 7;
+    if (mod == 3) {
+        return false;
+    }
+    disp = mod == 1 ? 1 : mod == 2 ? 4 : 0;
+    if (rm == 4) {
+        if (i >= n) {
+            return false;
+        }
+        if (mod == 0 && (b[i] & 7) == 5) {
+            disp = 4;                   /* SIB, no base: disp32 */
+        }
+        i++;
+    } else if (mod == 0 && rm == 5) {
+        disp = 4;                       /* RIP-relative */
+    }
+    i += disp;
+    if (i > n) {
+        return false;
+    }
+    size = (rex & 8) ? 8 : 4;
+
+    RCU_READ_LOCK_GUARD();
+    len = size;
+    mr = address_space_translate(&address_space_memory, ctx->Gpa, &xlat, &len,
+                                 false, attrs);
+    if (!mr->lockless_io || len < size ||
+        memory_access_is_direct(mr, false, attrs)) {
+        return false;
+    }
+    /* Past here the device has seen the read; the access must complete. */
+    memory_region_dispatch_read(mr, xlat, &val, size_memop(size), attrs);
+
+    names[0] = (WHV_REGISTER_NAME)(WHvX64RegisterRax +
+                                   (((modrm >> 3) & 7) | ((rex & 4) << 1)));
+    values[0].Reg64 = size == 4 ? (uint32_t)val : val;
+    names[1] = WHvX64RegisterRip;
+    values[1].Reg64 = vp->Rip + i;
+    hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
+        whpx_global.partition, cpu->cpu_index, names, 2, values);
+    if (FAILED(hr)) {
+        error_report("WHPX: fast MMIO load: failed to set registers, "
+                     "hr=%08lx", hr);
+    }
+    return true;
+}
+
 static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
 {
     WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
     int ret;
+
+    if (whpx_mmio_fast_load(cpu, exit_ctx)) {
+        return 0;
+    }
 
     /*
      * Device MMIO handlers run under the BQL in every other accelerator
