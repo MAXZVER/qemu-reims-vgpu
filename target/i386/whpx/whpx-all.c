@@ -1645,13 +1645,24 @@ static UINT64 whpx_get_default_exceptions(void)
     }
 
     /*
-     * Always intercept page faults: the hypervisor delivers them to the
-     * guest only when the guest's fault path is mapped; early-boot guests
-     * with a page-fault-heavy init otherwise end up in a nested-fault storm
-     * and the VP dies with an UnrecoverableException. Intercepting and
-     * re-injecting the fault as a pending event keeps the guest in control.
+     * Intercept page faults: the hypervisor delivers them to the guest only
+     * when the guest's fault path is mapped; early-boot guests with a
+     * page-fault-heavy init otherwise end up in a nested-fault storm and the
+     * VP dies with an UnrecoverableException (seen on AMD hosts). Intercepting
+     * and re-injecting the fault as a pending event keeps the guest in control.
+     *
+     * Every guest #PF then costs a VM exit to user space, tens of thousands a
+     * second under a desktop workload, so QEMU_WHPX_PF_INTERCEPT=0 turns the
+     * intercept off for hosts that boot without it.
      */
-    intercepts |= 1UL << WHvX64ExceptionTypePageFault;
+    static int pf_intercept = -1;
+    if (pf_intercept < 0) {
+        const char *v = g_getenv("QEMU_WHPX_PF_INTERCEPT");
+        pf_intercept = !(v && strcmp(v, "0") == 0);
+    }
+    if (pf_intercept) {
+        intercepts |= 1UL << WHvX64ExceptionTypePageFault;
+    }
 
     return intercepts;
 }
