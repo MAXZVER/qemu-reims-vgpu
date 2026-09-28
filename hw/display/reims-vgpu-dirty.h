@@ -22,6 +22,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 typedef struct ReimsVgpuDirty ReimsVgpuDirty;
 
@@ -87,5 +88,12 @@ int64_t reims_vgpu_dirty_written_since(ReimsVgpuDirty *d, uint64_t token,
  * nothing is tracked or when no generation has been read since the last call.
  */
 void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d);
+/*
+ * On-demand sync: doorbells advance an epoch, and a generation read of a set
+ * not synced since the last doorbell syncs that set first. note_doorbell()
+ * returns whether a background harvest is still wanted.
+ */
+void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on);
+bool reims_vgpu_dirty_note_doorbell(ReimsVgpuDirty *d);
 
 #endif /* REIMS_VGPU_DIRTY_H */

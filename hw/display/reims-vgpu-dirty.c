@@ -53,10 +53,15 @@ typedef struct ReimsVgpuDirtySet {
     uint64_t gen;           /* 0 until armed */
     uint64_t arm_at;        /* harvest count at which gen may leave 0 */
     /*
-     * The global write sequence (see page_seq) this set's generation last
-     * accounted for. A page stamped past it was written since.
+     * On-demand sync (see reims_vgpu_dirty_gen): the doorbell epoch this set
+     * was last brought up to date at, and the global write sequence its
+     * generation last accounted for. A page stamped past `seen_seq` was
+     * written since.
      */
+    uint64_t synced_epoch;
     uint64_t seen_seq;
+    uint64_t last_query_epoch;  /* epoch of the last generation or page read */
+    uint64_t claim_epoch;       /* epoch a sync is running for, or 0 */
 } ReimsVgpuDirtySet;
 
 struct ReimsVgpuDirty {
@@ -113,6 +118,17 @@ struct ReimsVgpuDirty {
     uint64_t global_seq;
     uint64_t *page_seq;
     uint64_t page_seq_n;
+    /*
+     * On-demand mode: doorbells only advance `epoch`; a generation read of a
+     * set not synced since the last doorbell syncs that set's pages first. The
+     * background harvest is then asked for only to turn logging on
+     * (`log_wanted`), the one step that needs the BQL.
+     */
+    bool ondemand;
+    bool log_wanted;
+    uint64_t epoch;
+    /* Signalled when an on-demand sync finishes; see claim_epoch. */
+    QemuCond synced_cond;
 };
 
 static void reims_vgpu_dirty_set_free(gpointer p)
@@ -129,6 +145,7 @@ ReimsVgpuDirty *reims_vgpu_dirty_new(void)
     ReimsVgpuDirty *d = g_new0(ReimsVgpuDirty, 1);
 
     qemu_mutex_init(&d->lock);
+    qemu_cond_init(&d->synced_cond);
     d->sets = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free,
                                     reims_vgpu_dirty_set_free);
     d->logged = g_hash_table_new(NULL, NULL);
@@ -159,6 +176,7 @@ void reims_vgpu_dirty_free(ReimsVgpuDirty *d)
         g_array_free(d->sync_ranges, TRUE);
     }
     g_free(d->page_seq);
+    qemu_cond_destroy(&d->synced_cond);
     qemu_mutex_destroy(&d->lock);
     g_free(d);
 }
@@ -281,18 +299,29 @@ void reims_vgpu_dirty_untrack(ReimsVgpuDirty *d, uint64_t token)
     qemu_mutex_unlock(&d->lock);
 }
 
+static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token);
+
 uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token)
 {
     ReimsVgpuDirtySet *s;
     uint64_t gen = 0;
+    bool stale;
 
     if (!d || token == 0) {
         return 0;
     }
     qemu_mutex_lock(&d->lock);
     s = g_hash_table_lookup(d->sets, &token);
+    stale = s && d->ondemand && s->synced_epoch < d->epoch;
+    qemu_mutex_unlock(&d->lock);
+    if (stale) {
+        reims_vgpu_dirty_sync_one(d, token);
+    }
+    qemu_mutex_lock(&d->lock);
+    s = g_hash_table_lookup(d->sets, &token);
     if (s) {
         gen = s->gen;
+        s->last_query_epoch = d->epoch;
     }
     d->reads_since_harvest++;
     qemu_mutex_unlock(&d->lock);
@@ -312,6 +341,19 @@ int64_t reims_vgpu_dirty_written_since(ReimsVgpuDirty *d, uint64_t token,
     }
     qemu_mutex_lock(&d->lock);
     s = g_hash_table_lookup(d->sets, &token);
+    if (s && d->ondemand && s->synced_epoch < d->epoch) {
+        /*
+         * A page list read in a later epoch than the set's last sync would
+         * miss what the guest wrote since; bring the set up to date first.
+         */
+        qemu_mutex_unlock(&d->lock);
+        reims_vgpu_dirty_sync_one(d, token);
+        qemu_mutex_lock(&d->lock);
+        s = g_hash_table_lookup(d->sets, &token);
+    }
+    if (s) {
+        s->last_query_epoch = d->epoch;
+    }
     /*
      * `since_gen == 0` is a caller that never recorded a readable observation,
      * and `s->gen == 0` is a set still inside its startup window. Neither can
@@ -344,7 +386,8 @@ int64_t reims_vgpu_dirty_written_since(ReimsVgpuDirty *d, uint64_t token,
 }
 
 typedef struct ReimsVgpuDirtyRamScan {
-    ReimsVgpuDirty *d;
+    ReimsVgpuDirtySlice **buf;
+    int *cap;
     int n;
 } ReimsVgpuDirtyRamScan;
 
@@ -353,17 +396,16 @@ static bool reims_vgpu_dirty_ram_range(Int128 start, Int128 len,
                                        hwaddr offset_in_region, void *opaque)
 {
     ReimsVgpuDirtyRamScan *scan = opaque;
-    ReimsVgpuDirty *d = scan->d;
     ReimsVgpuDirtySlice *sl;
 
     if (!mr->ram || !int128_nz(len)) {
         return false;
     }
-    if (scan->n == d->slices_cap) {
-        d->slices_cap = d->slices_cap ? d->slices_cap * 2 : 16;
-        d->slices = g_renew(ReimsVgpuDirtySlice, d->slices, d->slices_cap);
+    if (scan->n == *scan->cap) {
+        *scan->cap = *scan->cap ? *scan->cap * 2 : 16;
+        *scan->buf = g_renew(ReimsVgpuDirtySlice, *scan->buf, *scan->cap);
     }
-    sl = &d->slices[scan->n++];
+    sl = &(*scan->buf)[scan->n++];
     sl->logged = false;
     sl->needs_log = false;
     /*
@@ -419,14 +461,19 @@ static bool reims_vgpu_dirty_ram_range(Int128 start, Int128 len,
  * Growth is amortized and the steady state reallocates nothing, because the
  * table is owned across harvests and the flat view's shape does not churn.
  */
-static int reims_vgpu_dirty_ram_slices(ReimsVgpuDirty *d)
+static int reims_vgpu_dirty_ram_slices_into(ReimsVgpuDirtySlice **buf, int *cap)
 {
-    ReimsVgpuDirtyRamScan scan = { d, 0 };
+    ReimsVgpuDirtyRamScan scan = { buf, cap, 0 };
 
     RCU_READ_LOCK_GUARD();
     flatview_for_each_range(address_space_to_flatview(&address_space_memory),
                             reims_vgpu_dirty_ram_range, &scan);
     return scan.n;
+}
+
+static int reims_vgpu_dirty_ram_slices(ReimsVgpuDirty *d)
+{
+    return reims_vgpu_dirty_ram_slices_into(&d->slices, &d->slices_cap);
 }
 
 /* Which slice holds `gpa`, or -1. Slices are few and ordered, so a linear
@@ -526,10 +573,17 @@ static void reims_vgpu_dirty_consume_set(ReimsVgpuDirty *d,
  * Fold the page stamps into one set's generation and per-page generations: the
  * per-set half of a harvest. `hit` is scratch. Returns whether some page of the
  * set sits in a range this device was not yet recording. d->lock held.
+ *
+ * `by_harvest` keeps the harvest's arming rule (`arm_at`, counted in
+ * harvests). An on-demand evaluation cannot count harvests — there may be none
+ * — so it arms a set on its first evaluation with every page in a logged
+ * range: logging was on before the set existed, so nothing since its creation
+ * went unrecorded. A page in a range not yet logged reads as written, flags the
+ * range, and keeps an unarmed set unreadable, as in the harvest.
  */
 static bool reims_vgpu_dirty_eval_set(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
                                       ReimsVgpuDirtySlice *slices, int n,
-                                      GArray *hit)
+                                      GArray *hit, bool by_harvest)
 {
     const int shift = qemu_target_page_bits();
     const uint64_t target = 1ULL << shift;
@@ -576,30 +630,40 @@ static bool reims_vgpu_dirty_eval_set(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
             g_array_append_val(hit, p);
         }
     }
-    /*
-     * Some page of this set sits in a region whose writes this device was
-     * not yet recording when the sync ran, so writes older than it were never
-     * recorded and their absence is not evidence. Wait for a harvest that
-     * covered every page.
-     *
-     * This is what lets `reims_vgpu_dirty_track` arm at +1 instead of +2.
-     * The +2 was paying for this case on every set; this pays for it on the
-     * sets it applies to, which after the first surface of a boot is none.
-     * The test is `s->gen == 0` — never armed — because an already armed set
-     * must not be sent back through its startup window: its pages read as
-     * written above, which is the conservative answer and needs no help.
-     */
-    if (s->gen == 0 && unlogged) {
-        s->arm_at = d->harvests + 1;
-    }
-    if (d->harvests < s->arm_at) {
+    if (by_harvest) {
         /*
-         * Startup window: an absence of reports says nothing about the
-         * guest yet, so the generation stays unreadable.
+         * Some page of this set sits in a region whose writes this device
+         * was not yet recording when the sync ran, so writes older than it
+         * were never recorded and their absence is not evidence. Wait for a
+         * harvest that covered every page.
+         *
+         * This is what lets `reims_vgpu_dirty_track` arm at +1 instead of
+         * +2. The +2 was paying for this case on every set; this pays for it
+         * on the sets it applies to, which after the first surface of a boot
+         * is none. The test is `s->gen == 0` — never armed — because an
+         * already armed set must not be sent back through its startup
+         * window: its pages read as written above, which is the conservative
+         * answer and needs no help.
          */
-        s->gen = 0;
+        if (s->gen == 0 && unlogged) {
+            s->arm_at = d->harvests + 1;
+        }
+        if (d->harvests < s->arm_at) {
+            /*
+             * Startup window: an absence of reports says nothing about the
+             * guest yet, so the generation stays unreadable.
+             */
+            s->gen = 0;
+        } else if (s->gen == 0) {
+            s->gen = 1;
+        } else if (any) {
+            s->gen++;
+        }
     } else if (s->gen == 0) {
-        s->gen = 1;
+        /* On demand: armed at the first evaluation with every page logged. */
+        if (!unlogged) {
+            s->gen = 1;
+        }
     } else if (any) {
         s->gen++;
     }
@@ -810,6 +874,7 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
     GHashTableIter it;
     gpointer key, val;
     int n, i;
+    uint64_t epoch;
 
     if (!d) {
         return;
@@ -820,6 +885,8 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
         qemu_mutex_unlock(&d->lock);
         return;
     }
+    /* Every doorbell before this point is covered by the sync below. */
+    epoch = d->epoch;
     qemu_mutex_unlock(&d->lock);
 
     n = reims_vgpu_dirty_ram_slices(d);
@@ -867,7 +934,10 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
     }
     g_hash_table_iter_init(&it, d->sets);
     while (g_hash_table_iter_next(&it, &key, &val)) {
-        reims_vgpu_dirty_eval_set(d, val, slices, n, hit);
+        ReimsVgpuDirtySet *set = val;
+
+        reims_vgpu_dirty_eval_set(d, set, slices, n, hit, true);
+        set->synced_epoch = MAX(set->synced_epoch, epoch);
     }
     qemu_mutex_unlock(&d->lock);
 
@@ -929,4 +999,163 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
             bql_unlock();
         }
     }
+    qemu_mutex_lock(&d->lock);
+    d->log_wanted = false;
+    qemu_mutex_unlock(&d->lock);
+}
+
+/*
+ * Bring one set up to date: sync the hypervisor's dirty log for its pages
+ * alone, consume their bits into the page stamps, and fold them into its
+ * generation. The on-demand half of the tracker; see reims_vgpu_dirty_gen.
+ *
+ * Runs on the drain without the BQL, which is what makes it possible at all:
+ * the ranged sync is RCU and atomic bitmap work, and the one BQL step — turning
+ * logging on for a range — is left to the background harvest (`log_wanted`).
+ * The set's page list is copied out under the lock and re-looked-up after the
+ * sync, so an untrack meanwhile is an answer rather than a use after free.
+ */
+static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token)
+{
+    const int shift = qemu_target_page_bits();
+    ReimsVgpuDirtySlice *slices = NULL;
+    int cap = 0, n, i;
+    ReimsVgpuDirtySet *s;
+    g_autofree uint64_t *pages = NULL;
+    g_autoptr(GArray) ranges = NULL;
+    g_autoptr(GArray) written = NULL;
+    g_autoptr(GArray) hit = NULL;
+    size_t count, p;
+    uint64_t page_size, epoch;
+
+    qemu_mutex_lock(&d->lock);
+    s = g_hash_table_lookup(d->sets, &token);
+    if (!s) {
+        qemu_mutex_unlock(&d->lock);
+        return;
+    }
+    epoch = d->epoch;
+    /*
+     * Up to date already, or being brought up to date for this epoch by the
+     * other thread (drain or prefetch): wait for that one rather than repeat
+     * its hypervisor calls. The claimant holds no lock while it syncs.
+     */
+    while (s && s->synced_epoch < epoch && s->claim_epoch >= epoch) {
+        qemu_cond_wait(&d->synced_cond, &d->lock);
+        s = g_hash_table_lookup(d->sets, &token);
+    }
+    if (!s || s->synced_epoch >= epoch) {
+        qemu_mutex_unlock(&d->lock);
+        return;
+    }
+    s->claim_epoch = epoch;
+    count = s->count;
+    page_size = s->page_size;
+    pages = g_memdup2(s->pages, count * sizeof(uint64_t));
+    qemu_mutex_unlock(&d->lock);
+
+    n = reims_vgpu_dirty_ram_slices_into(&slices, &cap);
+    qemu_mutex_lock(&d->lock);
+    for (i = 0; i < n; i++) {
+        slices[i].logged = g_hash_table_contains(d->logged, slices[i].mr);
+    }
+    qemu_mutex_unlock(&d->lock);
+
+    /* Contiguous runs of this set's pages, per logged region. */
+    ranges = g_array_new(FALSE, FALSE, sizeof(MemoryRegionRange));
+    for (i = 0; i < n; i++) {
+        const ReimsVgpuDirtySlice *sl = &slices[i];
+        bool seen = false;
+        int j;
+
+        for (j = 0; j < i; j++) {
+            seen |= slices[j].logged && slices[j].mr == sl->mr;
+        }
+        if (!sl->logged || seen) {
+            continue;
+        }
+        g_array_set_size(ranges, 0);
+        for (j = i; j < n; j++) {
+            const ReimsVgpuDirtySlice *sj = &slices[j];
+            MemoryRegionRange r = { 0, 0 };
+            bool open = false;
+
+            if (!sj->logged || sj->mr != sl->mr) {
+                continue;
+            }
+            for (p = 0; p < count; p++) {
+                uint64_t gpa = pages[p];
+
+                if (gpa < sj->gpa || gpa - sj->gpa >= sj->len) {
+                    continue;
+                }
+                if (open && r.start + r.len + REIMS_VGPU_DIRTY_SYNC_GAP_PAGES *
+                    (1ULL << shift) >= sj->offset + (gpa - sj->gpa)) {
+                    r.len = sj->offset + (gpa - sj->gpa) + page_size - r.start;
+                    continue;
+                }
+                if (open) {
+                    g_array_append_val(ranges, r);
+                }
+                r.start = sj->offset + (gpa - sj->gpa);
+                r.len = page_size;
+                open = true;
+            }
+            if (open) {
+                g_array_append_val(ranges, r);
+            }
+        }
+        memory_region_sync_dirty_ranges(sl->mr,
+                                        &g_array_index(ranges,
+                                                       MemoryRegionRange, 0),
+                                        ranges->len);
+    }
+
+    written = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyWritten));
+    hit = g_array_new(FALSE, FALSE, sizeof(size_t));
+    qemu_mutex_lock(&d->lock);
+    s = g_hash_table_lookup(d->sets, &token);
+    if (s) {
+        reims_vgpu_dirty_consume_set(d, s, slices, n, written);
+        if (reims_vgpu_dirty_eval_set(d, s, slices, n, hit, false)) {
+            d->log_wanted = true;
+        }
+        s->synced_epoch = MAX(s->synced_epoch, epoch);
+        if (s->claim_epoch == epoch) {
+            s->claim_epoch = 0;
+        }
+    }
+    qemu_cond_broadcast(&d->synced_cond);
+    qemu_mutex_unlock(&d->lock);
+    reims_vgpu_dirty_clear_written(written, slices, n);
+    g_free(slices);
+}
+
+void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
+{
+    if (d) {
+        qemu_mutex_lock(&d->lock);
+        d->ondemand = on;
+        qemu_mutex_unlock(&d->lock);
+    }
+}
+
+/*
+ * A doorbell: every guest store before it must be seen by any generation read
+ * after it. In on-demand mode that is all a doorbell does — the next read of
+ * each set syncs it. Returns whether the background harvest is still owed
+ * something (turning logging on), which is the only reason left to ask for one.
+ */
+bool reims_vgpu_dirty_note_doorbell(ReimsVgpuDirty *d)
+{
+    bool want;
+
+    if (!d) {
+        return false;
+    }
+    qemu_mutex_lock(&d->lock);
+    d->epoch++;
+    want = d->log_wanted || g_hash_table_size(d->logged) == 0;
+    qemu_mutex_unlock(&d->lock);
+    return want;
 }
