@@ -30,6 +30,7 @@
 #include "system/memory.h"
 #include "system/ramblock.h"
 #include "system/runstate.h"
+#include "system/whpx.h"
 #include "ui/console.h"
 #include "ui/surface.h"
 #include "trace.h"
@@ -151,6 +152,11 @@ struct ReimsVGPUPCIState {
     bool harvest_started;
     bool harvest_rearm;
     bool async_harvest;
+    /*
+     * EXPERIMENTAL: HostOps.irq_pulse may raise MSIs off the BQL.
+     * REIMS_VGPU_IRQ_DIRECT=off turns it off for A/B runs.
+     */
+    bool irq_direct;
     Notifier shutdown_notifier;
     bool shutdown_notifier_registered;
 };
@@ -806,6 +812,36 @@ static void *reims_vgpu_pci_harvest_thread(void *opaque)
 }
 
 /*
+ * HostOps.irq_pulse: raise the device's MSI from the calling thread, which may
+ * be the drain holding the device lock without the BQL.
+ *
+ * Only where the delivery takes no lock at all. Under WHPX with the in-kernel
+ * irqchip, msi_notify ends in a write to the WHPX APIC's MSI region, which is
+ * lockless and injects with WHvRequestInterrupt; anywhere else the MMIO
+ * dispatch would take the BQL inside this call, and a caller holding the device
+ * lock would then deadlock against a vCPU that holds the BQL and waits for it.
+ * Those hosts answer 0 and the pulse is queued for the action BH as before.
+ * No per-vector masking is advertised (msi_init above), so msi_notify never
+ * touches pending bits here.
+ */
+static int reims_vgpu_pci_irq_pulse(void *ctx, uint32_t kind)
+{
+    ReimsVGPUPCIState *s = ctx;
+    PCIDevice *pdev = PCI_DEVICE(s);
+
+    if (!s->irq_direct || !whpx_enabled() || !whpx_irqchip_in_kernel() ||
+        !msi_enabled(pdev)) {
+        return 0;
+    }
+    if (kind != REIMS_VGPU_HOST_ACTION_IRQ_GFX &&
+        kind != REIMS_VGPU_HOST_ACTION_IRQ_IOSFC) {
+        return 0;
+    }
+    msi_notify(pdev, 0);
+    return 1;
+}
+
+/*
  * HostOps harvests_settled (ABI v21): whether every harvest a register write
  * has asked for has finished. The Rust drain asks this, with the device lock
  * held, before it serves work a doorbell handed over, including work folded
@@ -1251,6 +1287,7 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         .guest_written_pages = reims_vgpu_pci_guest_written_pages,
         .page_alias_census = reims_vgpu_pci_page_alias_census,
         .harvests_settled = reims_vgpu_pci_harvests_settled,
+        .irq_pulse = reims_vgpu_pci_irq_pulse,
     };
     s->dirty = reims_vgpu_dirty_new();
 
@@ -1288,6 +1325,11 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         return;
     }
     s->rust_handle = out.handle;
+    {
+        const char *d = getenv("REIMS_VGPU_IRQ_DIRECT");   /* lab A/B */
+
+        s->irq_direct = !(d && strcmp(d, "off") == 0);
+    }
     /* Before the drain exists, so it never sees harvest_started change. */
     if (s->async_harvest) {
         qemu_thread_create(&s->harvest_thread, "reims-vgpu-pci-harvest",
