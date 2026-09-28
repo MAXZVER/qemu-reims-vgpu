@@ -925,7 +925,13 @@ static void *reims_vgpu_pci_drain_thread(void *opaque)
  * BH; Rust owns pacing and protocol state, while the BH remains the sole
  * HostAction applier.
  */
-#define REIMS_VGPU_PCI_HEARTBEAT_MS 4
+/*
+ * 1 ms, not 4: the limiter's catch-up grid only phase-locks when polls land
+ * well inside the 8.33 ms interval, and a Windows host's 4 ms condvar waits
+ * (plus the poll's own maintenance) drifted past it often enough that CSS
+ * animation sat at ~95 fps median; at 1 ms it reads ~106-112 on the same host.
+ */
+#define REIMS_VGPU_PCI_HEARTBEAT_MS 1
 
 static void *reims_vgpu_pci_heartbeat_thread(void *opaque)
 {
