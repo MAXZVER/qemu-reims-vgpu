@@ -476,6 +476,7 @@ static MemoryListener whpx_memory_listener = {
     .region_add = whpx_region_add,
     .region_del = whpx_region_del,
     .log_sync = whpx_log_sync,
+    .log_sync_ranged = true,
     .priority = MEMORY_LISTENER_PRIORITY_ACCEL,
 };
 
