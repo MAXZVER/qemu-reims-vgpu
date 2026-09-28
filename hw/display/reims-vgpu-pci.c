@@ -805,8 +805,9 @@ static void *reims_vgpu_pci_harvest_thread(void *opaque)
          * tracker takes the BQL itself for the one MemoryRegion transaction
          * it may need. Held for the whole walk, the BQL stalled every vCPU
          * exit that needed it for ~6 ms a harvest, ~75 harvests a second.
+         * In on-demand mode this is the prefetch of the hot sets.
          */
-        reims_vgpu_dirty_harvest(s->dirty);
+        reims_vgpu_dirty_background(s->dirty);
         if (!s->harvest_nobql) {
             bql_unlock();
         }

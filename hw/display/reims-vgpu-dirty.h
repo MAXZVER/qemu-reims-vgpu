@@ -95,5 +95,7 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d);
  */
 void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on);
 bool reims_vgpu_dirty_note_doorbell(ReimsVgpuDirty *d);
+/* The harvest thread's job: a full harvest, or the on-demand prefetch. */
+void reims_vgpu_dirty_background(ReimsVgpuDirty *d);
 
 #endif /* REIMS_VGPU_DIRTY_H */

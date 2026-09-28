@@ -127,6 +127,12 @@ struct ReimsVgpuDirty {
     bool ondemand;
     bool log_wanted;
     uint64_t epoch;
+    /*
+     * Prefetch (REIMS_VGPU_DIRTY_OD_PREFETCH=off turns it off): at each
+     * doorbell the harvest thread syncs the sets read in the last two epochs,
+     * in parallel with the drain, which then finds most of them up to date.
+     */
+    bool od_prefetch;
     /* Signalled when an on-demand sync finishes; see claim_epoch. */
     QemuCond synced_cond;
 };
@@ -1134,8 +1140,15 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token)
 void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
 {
     if (d) {
+        const char *op = getenv("REIMS_VGPU_DIRTY_OD_PREFETCH");   /* lab A/B */
+
         qemu_mutex_lock(&d->lock);
         d->ondemand = on;
+        /*
+         * On by default (lab: CSS animation ~108 -> ~115 fps, scroll
+         * ~88 -> ~100).
+         */
+        d->od_prefetch = !(op && strcmp(op, "off") == 0);
         qemu_mutex_unlock(&d->lock);
     }
 }
@@ -1155,7 +1168,57 @@ bool reims_vgpu_dirty_note_doorbell(ReimsVgpuDirty *d)
     }
     qemu_mutex_lock(&d->lock);
     d->epoch++;
-    want = d->log_wanted || g_hash_table_size(d->logged) == 0;
+    want = d->log_wanted || g_hash_table_size(d->logged) == 0 || d->od_prefetch;
     qemu_mutex_unlock(&d->lock);
     return want;
+}
+
+/*
+ * The harvest thread's work: a full harvest, or in on-demand mode with
+ * prefetch, a sync of every set read in the last two epochs that is not up to
+ * date for this one, so the drain finds them ready. Turning logging on still
+ * takes a full harvest.
+ */
+void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
+{
+    g_autoptr(GArray) tokens = NULL;
+    GHashTableIter it;
+    gpointer key, val;
+    uint64_t epoch;
+    bool full;
+    guint t;
+
+    if (!d) {
+        return;
+    }
+    qemu_mutex_lock(&d->lock);
+    full = !d->ondemand || !d->od_prefetch || d->log_wanted ||
+           g_hash_table_size(d->logged) == 0;
+    qemu_mutex_unlock(&d->lock);
+    if (full) {
+        reims_vgpu_dirty_harvest(d);
+        return;
+    }
+    tokens = g_array_new(FALSE, FALSE, sizeof(uint64_t));
+    qemu_mutex_lock(&d->lock);
+    epoch = d->epoch;
+    g_hash_table_iter_init(&it, d->sets);
+    while (g_hash_table_iter_next(&it, &key, &val)) {
+        ReimsVgpuDirtySet *set = val;
+
+        if (set->synced_epoch < epoch && set->last_query_epoch + 2 >= epoch) {
+            g_array_append_val(tokens, *(uint64_t *)key);
+        }
+    }
+    qemu_mutex_unlock(&d->lock);
+    for (t = 0; t < tokens->len; t++) {
+        qemu_mutex_lock(&d->lock);
+        if (d->epoch != epoch) {
+            /* A newer doorbell: the next prefetch covers it from the start. */
+            qemu_mutex_unlock(&d->lock);
+            break;
+        }
+        qemu_mutex_unlock(&d->lock);
+        reims_vgpu_dirty_sync_one(d, g_array_index(tokens, uint64_t, t));
+    }
 }
