@@ -5,6 +5,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
 #include "qemu/thread.h"
 #include "qemu/rcu.h"
 #include "qemu/bitmap.h"
@@ -835,9 +836,11 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
      * is a MemoryRegion transaction that rebuilds the flat view, which would
      * leave this slice table describing a view that no longer exists.
      */
+    qemu_mutex_lock(&d->lock);
     for (i = 0; i < n; i++) {
         slices[i].logged = g_hash_table_contains(d->logged, slices[i].mr);
     }
+    qemu_mutex_unlock(&d->lock);
 
     /* One sync covering every tracked page, then only reads. */
     reims_vgpu_dirty_sync_tracked(d, slices, n);
@@ -892,8 +895,20 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
      * and no set whose pages were among them armed on this harvest.
      */
     for (i = 0; i < n; i++) {
+        bool relock;
+
         if (!slices[i].needs_log) {
             continue;
+        }
+        /*
+         * The one step of a harvest that needs the BQL: a MemoryRegion
+         * transaction. The harvest thread runs everything above without it
+         * (RCU and atomic bitmap operations only), so take it here, and only
+         * for the regions that ask — after the first surface of a boot, none.
+         */
+        relock = !bql_locked();
+        if (relock) {
+            bql_lock();
         }
         /*
          * One MemoryRegion can supply several ranges — on x86 q35 guest RAM is
@@ -902,9 +917,16 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
          * key was new, which keeps the reference this table owns at one per
          * region however many of its ranges asked.
          */
+        qemu_mutex_lock(&d->lock);
         if (g_hash_table_add(d->logged, slices[i].mr)) {
+            qemu_mutex_unlock(&d->lock);
             memory_region_ref(slices[i].mr);
             memory_region_set_log(slices[i].mr, true, DIRTY_MEMORY_VGA);
+        } else {
+            qemu_mutex_unlock(&d->lock);
+        }
+        if (relock) {
+            bql_unlock();
         }
     }
 }

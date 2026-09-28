@@ -30,6 +30,7 @@
 #include "system/memory.h"
 #include "system/ramblock.h"
 #include "system/runstate.h"
+#include "system/whpx.h"
 #include "ui/console.h"
 #include "ui/surface.h"
 #include "trace.h"
@@ -151,6 +152,11 @@ struct ReimsVGPUPCIState {
     bool harvest_started;
     bool harvest_rearm;
     bool async_harvest;
+    /*
+     * Run the harvest without the BQL (default on WHPX;
+     * REIMS_VGPU_HARVEST_BQL=on restores it for A/B runs).
+     */
+    bool harvest_nobql;
     Notifier shutdown_notifier;
     bool shutdown_notifier_registered;
 };
@@ -778,16 +784,26 @@ static void *reims_vgpu_pci_harvest_thread(void *opaque)
         }
         qemu_mutex_unlock(&s->harvest_mutex);
 
-        bql_lock();
+        if (!s->harvest_nobql) {
+            bql_lock();
+        }
         /*
-         * Sampled with the BQL held and before the sync, so every ask it
-         * counts was made before the sync ran and its guest stores are in it.
+         * Sampled before the sync, so every ask it counts was made before the
+         * sync ran and its guest stores are in it.
          */
         qemu_mutex_lock(&s->harvest_mutex);
         target = s->harvest_asked;
         qemu_mutex_unlock(&s->harvest_mutex);
+        /*
+         * Without the BQL the harvest is RCU and atomic bitmap work; the
+         * tracker takes the BQL itself for the one MemoryRegion transaction
+         * it may need. Held for the whole walk, the BQL stalled every vCPU
+         * exit that needed it for ~6 ms a harvest, ~75 harvests a second.
+         */
         reims_vgpu_dirty_harvest(s->dirty);
-        bql_unlock();
+        if (!s->harvest_nobql) {
+            bql_unlock();
+        }
 
         qemu_mutex_lock(&s->harvest_mutex);
         s->harvest_done = target;
@@ -1297,6 +1313,16 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         return;
     }
     s->rust_handle = out.handle;
+    {
+        const char *hb = getenv("REIMS_VGPU_HARVEST_BQL");     /* lab A/B */
+
+        /*
+         * Off the BQL only where the dirty log allows it. WHPX's log_sync is
+         * safe to run from any thread (it drops the BQL itself for long
+         * walks); KVM's dirty-ring flush asserts that the BQL is held.
+         */
+        s->harvest_nobql = whpx_enabled() && !(hb && strcmp(hb, "on") == 0);
+    }
     /* Before the drain exists, so it never sees harvest_started change. */
     if (s->async_harvest) {
         qemu_thread_create(&s->harvest_thread, "reims-vgpu-pci-harvest",
