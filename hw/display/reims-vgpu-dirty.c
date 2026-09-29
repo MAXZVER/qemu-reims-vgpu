@@ -146,6 +146,20 @@ struct ReimsVgpuDirty {
     bool od_prefetch;
     /* Signalled when an on-demand sync finishes; see claim_epoch. */
     QemuCond synced_cond;
+    /*
+     * Prefetch pool (REIMS_VGPU_DIRTY_OD_THREADS, default 3 extra threads, 0
+     * leaves the prefetch to the harvest thread alone): the prefetch's token
+     * list is shared with worker threads that take the next token in turn, so
+     * an epoch's sets are brought up to date in parallel hypervisor queries
+     * and mostly before the drain reaches them.
+     */
+    QemuThread *od_workers;
+    int od_nworkers;
+    bool od_stop;
+    QemuCond od_work_cond;
+    GArray *od_work;          /* uint64_t tokens of the current prefetch */
+    guint od_work_next;
+    uint64_t od_work_epoch;   /* epoch the list was built for; 0 = none */
 };
 
 static void reims_vgpu_dirty_set_free(gpointer p)
@@ -163,6 +177,8 @@ ReimsVgpuDirty *reims_vgpu_dirty_new(void)
 
     qemu_mutex_init(&d->lock);
     qemu_cond_init(&d->synced_cond);
+    qemu_cond_init(&d->od_work_cond);
+    d->od_work = g_array_new(FALSE, FALSE, sizeof(uint64_t));
     d->sets = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free,
                                     reims_vgpu_dirty_set_free);
     d->logged = g_hash_table_new(NULL, NULL);
@@ -176,6 +192,22 @@ void reims_vgpu_dirty_free(ReimsVgpuDirty *d)
 
     if (!d) {
         return;
+    }
+    /*
+     * The pool's workers take no BQL, so joining them here, under it, cannot
+     * wait on ourselves; one in the middle of a sync finishes it first.
+     */
+    if (d->od_nworkers) {
+        int w;
+
+        qemu_mutex_lock(&d->lock);
+        d->od_stop = true;
+        qemu_cond_broadcast(&d->od_work_cond);
+        qemu_mutex_unlock(&d->lock);
+        for (w = 0; w < d->od_nworkers; w++) {
+            qemu_thread_join(&d->od_workers[w]);
+        }
+        g_free(d->od_workers);
     }
     /* BQL: memory_region_set_log is a MemoryRegion transaction. */
     g_hash_table_iter_init(&it, d->logged);
@@ -194,6 +226,8 @@ void reims_vgpu_dirty_free(ReimsVgpuDirty *d)
     }
     g_free(d->page_seq);
     g_free(d->page_qepoch);
+    g_array_free(d->od_work, TRUE);
+    qemu_cond_destroy(&d->od_work_cond);
     qemu_cond_destroy(&d->synced_cond);
     qemu_mutex_destroy(&d->lock);
     g_free(d);
@@ -1206,6 +1240,52 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token)
     g_free(slices);
 }
 
+/*
+ * Take the prefetch's tokens in turn until the list is used up or a newer
+ * doorbell makes it stale. Called by the harvest thread and by each worker.
+ */
+static void reims_vgpu_dirty_prefetch_drain(ReimsVgpuDirty *d, uint64_t epoch)
+{
+    for (;;) {
+        uint64_t token;
+
+        qemu_mutex_lock(&d->lock);
+        if (d->od_stop || d->od_work_epoch != epoch || d->epoch != epoch ||
+            d->od_work_next >= d->od_work->len) {
+            qemu_mutex_unlock(&d->lock);
+            return;
+        }
+        token = g_array_index(d->od_work, uint64_t, d->od_work_next++);
+        qemu_mutex_unlock(&d->lock);
+        reims_vgpu_dirty_sync_one(d, token);
+    }
+}
+
+static void *reims_vgpu_dirty_od_worker(void *opaque)
+{
+    ReimsVgpuDirty *d = opaque;
+    uint64_t done = 0;
+
+    /* A sync walks the flat view and syncs the log under RCU. */
+    rcu_register_thread();
+    qemu_mutex_lock(&d->lock);
+    while (!d->od_stop) {
+        uint64_t epoch = d->od_work_epoch;
+
+        if (epoch == done || epoch == 0) {
+            qemu_cond_wait(&d->od_work_cond, &d->lock);
+            continue;
+        }
+        done = epoch;
+        qemu_mutex_unlock(&d->lock);
+        reims_vgpu_dirty_prefetch_drain(d, epoch);
+        qemu_mutex_lock(&d->lock);
+    }
+    qemu_mutex_unlock(&d->lock);
+    rcu_unregister_thread();
+    return NULL;
+}
+
 void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
 {
     if (d) {
@@ -1219,6 +1299,22 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
          */
         d->od_prefetch = !(op && strcmp(op, "off") == 0);
         qemu_mutex_unlock(&d->lock);
+        if (on && d->od_prefetch && d->od_nworkers == 0) {
+            /* See od_workers: 0 leaves the prefetch to the harvest thread. */
+            const char *nt = getenv("REIMS_VGPU_DIRTY_OD_THREADS");
+            int w, want = nt ? atoi(nt) : 3;
+
+            want = MAX(0, MIN(want, 8));
+            if (want > 0) {
+                d->od_workers = g_new0(QemuThread, want);
+                for (w = 0; w < want; w++) {
+                    qemu_thread_create(&d->od_workers[w], "reims-vgpu-od",
+                                       reims_vgpu_dirty_od_worker, d,
+                                       QEMU_THREAD_JOINABLE);
+                }
+                d->od_nworkers = want;
+            }
+        }
     }
 }
 
@@ -1245,7 +1341,8 @@ bool reims_vgpu_dirty_note_doorbell(ReimsVgpuDirty *d)
 /*
  * The harvest thread's work: a full harvest, or in on-demand mode with
  * prefetch, a sync of every set read in the last two epochs that is not up to
- * date for this one, so the drain finds them ready. Turning logging on still
+ * date for this one, so the drain finds them ready. The prefetch pool's
+ * workers take their tokens from the same list. Turning logging on still
  * takes a full harvest.
  */
 void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
@@ -1255,7 +1352,6 @@ void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
     gpointer key, val;
     uint64_t epoch;
     bool full;
-    guint t;
 
     if (!d) {
         return;
@@ -1279,15 +1375,16 @@ void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
             g_array_append_val(tokens, *(uint64_t *)key);
         }
     }
+    /*
+     * Publish the list; the workers and this thread take tokens in turn. A
+     * newer doorbell makes it stale, and the next prefetch covers that epoch
+     * from the start.
+     */
+    g_array_set_size(d->od_work, 0);
+    g_array_append_vals(d->od_work, tokens->data, tokens->len);
+    d->od_work_next = 0;
+    d->od_work_epoch = epoch;
+    qemu_cond_broadcast(&d->od_work_cond);
     qemu_mutex_unlock(&d->lock);
-    for (t = 0; t < tokens->len; t++) {
-        qemu_mutex_lock(&d->lock);
-        if (d->epoch != epoch) {
-            /* A newer doorbell: the next prefetch covers it from the start. */
-            qemu_mutex_unlock(&d->lock);
-            break;
-        }
-        qemu_mutex_unlock(&d->lock);
-        reims_vgpu_dirty_sync_one(d, g_array_index(tokens, uint64_t, t));
-    }
+    reims_vgpu_dirty_prefetch_drain(d, epoch);
 }

@@ -92,6 +92,9 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d);
  * On-demand sync: doorbells advance an epoch, and a generation read of a set
  * not synced since the last doorbell syncs that set first. note_doorbell()
  * returns whether a background harvest is still wanted.
+ *
+ * Turning it on with the prefetch also starts the prefetch pool's worker
+ * threads (REIMS_VGPU_DIRTY_OD_THREADS); reims_vgpu_dirty_free() joins them.
  */
 void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on);
 bool reims_vgpu_dirty_note_doorbell(ReimsVgpuDirty *d);
