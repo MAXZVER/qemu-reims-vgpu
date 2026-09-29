@@ -119,17 +119,6 @@ struct ReimsVgpuDirty {
     uint64_t *page_seq;
     uint64_t page_seq_n;
     /*
-     * On-demand mode: the epoch in which each target page frame was last
-     * queried from the hypervisor, recorded once that query's bits are in the
-     * VGA bitmap. Sets share pages (a framebuffer and the textures that alias
-     * it), and a second query of a page in the same epoch can only return
-     * stores made after the doorbell, which that epoch does not owe anyone; so
-     * a set's sync skips pages already queried in its epoch and takes their
-     * bits (or the stamps of whoever took them) like any other. Same indexing
-     * and length as `page_seq`.
-     */
-    uint64_t *page_qepoch;
-    /*
      * On-demand mode: doorbells only advance `epoch`; a generation read of a
      * set not synced since the last doorbell syncs that set's pages first. The
      * background harvest is then asked for only to turn logging on
@@ -146,20 +135,6 @@ struct ReimsVgpuDirty {
     bool od_prefetch;
     /* Signalled when an on-demand sync finishes; see claim_epoch. */
     QemuCond synced_cond;
-    /*
-     * Prefetch pool (REIMS_VGPU_DIRTY_OD_THREADS, default 3 extra threads, 0
-     * leaves the prefetch to the harvest thread alone): the prefetch's token
-     * list is shared with worker threads that take the next token in turn, so
-     * an epoch's sets are brought up to date in parallel hypervisor queries
-     * and mostly before the drain reaches them.
-     */
-    QemuThread *od_workers;
-    int od_nworkers;
-    bool od_stop;
-    QemuCond od_work_cond;
-    GArray *od_work;          /* uint64_t tokens of the current prefetch */
-    guint od_work_next;
-    uint64_t od_work_epoch;   /* epoch the list was built for; 0 = none */
 };
 
 static void reims_vgpu_dirty_set_free(gpointer p)
@@ -177,8 +152,6 @@ ReimsVgpuDirty *reims_vgpu_dirty_new(void)
 
     qemu_mutex_init(&d->lock);
     qemu_cond_init(&d->synced_cond);
-    qemu_cond_init(&d->od_work_cond);
-    d->od_work = g_array_new(FALSE, FALSE, sizeof(uint64_t));
     d->sets = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free,
                                     reims_vgpu_dirty_set_free);
     d->logged = g_hash_table_new(NULL, NULL);
@@ -192,22 +165,6 @@ void reims_vgpu_dirty_free(ReimsVgpuDirty *d)
 
     if (!d) {
         return;
-    }
-    /*
-     * The pool's workers take no BQL, so joining them here, under it, cannot
-     * wait on ourselves; one in the middle of a sync finishes it first.
-     */
-    if (d->od_nworkers) {
-        int w;
-
-        qemu_mutex_lock(&d->lock);
-        d->od_stop = true;
-        qemu_cond_broadcast(&d->od_work_cond);
-        qemu_mutex_unlock(&d->lock);
-        for (w = 0; w < d->od_nworkers; w++) {
-            qemu_thread_join(&d->od_workers[w]);
-        }
-        g_free(d->od_workers);
     }
     /* BQL: memory_region_set_log is a MemoryRegion transaction. */
     g_hash_table_iter_init(&it, d->logged);
@@ -225,9 +182,6 @@ void reims_vgpu_dirty_free(ReimsVgpuDirty *d)
         g_array_free(d->sync_ranges, TRUE);
     }
     g_free(d->page_seq);
-    g_free(d->page_qepoch);
-    g_array_free(d->od_work, TRUE);
-    qemu_cond_destroy(&d->od_work_cond);
     qemu_cond_destroy(&d->synced_cond);
     qemu_mutex_destroy(&d->lock);
     g_free(d);
@@ -544,8 +498,8 @@ static int reims_vgpu_dirty_slice_of(const ReimsVgpuDirtySlice *slices, int n,
 }
 
 /*
- * Grow the page stamps, and the query epochs beside them, to cover target
- * page frames below `end_pfn`. d->lock held.
+ * Grow the page stamps to cover target page frames below `end_pfn`.
+ * d->lock held.
  */
 static void reims_vgpu_dirty_page_seq_cover(ReimsVgpuDirty *d, uint64_t end_pfn)
 {
@@ -557,9 +511,6 @@ static void reims_vgpu_dirty_page_seq_cover(ReimsVgpuDirty *d, uint64_t end_pfn)
     n = MAX(end_pfn, d->page_seq_n * 2);
     d->page_seq = g_renew(uint64_t, d->page_seq, n);
     memset(d->page_seq + d->page_seq_n, 0,
-           (n - d->page_seq_n) * sizeof(uint64_t));
-    d->page_qepoch = g_renew(uint64_t, d->page_qepoch, n);
-    memset(d->page_qepoch + d->page_seq_n, 0,
            (n - d->page_seq_n) * sizeof(uint64_t));
     d->page_seq_n = n;
 }
@@ -1063,8 +1014,6 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
  * Bring one set up to date: sync the hypervisor's dirty log for its pages
  * alone, consume their bits into the page stamps, and fold them into its
  * generation. The on-demand half of the tracker; see reims_vgpu_dirty_gen.
- * Pages another sync already queried in this epoch are left out of the
- * queries but consumed and folded like the rest (see `page_qepoch`).
  *
  * Runs on the drain without the BQL, which is what makes it possible at all:
  * the ranged sync is RCU and atomic bitmap work, and the one BQL step — turning
@@ -1080,7 +1029,6 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token)
     ReimsVgpuDirtySet *s;
     g_autofree uint64_t *pages = NULL;
     g_autoptr(GArray) ranges = NULL;
-    g_autoptr(GArray) walked = NULL;
     g_autoptr(GArray) written = NULL;
     g_autoptr(GArray) hit = NULL;
     size_t count, p;
@@ -1107,27 +1055,9 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token)
         return;
     }
     s->claim_epoch = epoch;
+    count = s->count;
     page_size = s->page_size;
-    /*
-     * Leave out the pages another sync already queried in this epoch (see
-     * `page_qepoch`): their bits are in the VGA bitmap, and the consume below
-     * takes them, or reads the stamp of whoever took them, like any other
-     * page's. A page is left out only if every target page of it was queried.
-     */
-    pages = g_new(uint64_t, s->count);
-    count = 0;
-    for (p = 0; p < s->count; p++) {
-        uint64_t pfn = s->pages[p] >> shift;
-        uint64_t end = (s->pages[p] + page_size) >> shift;
-
-        while (pfn < end && pfn < d->page_seq_n &&
-               d->page_qepoch[pfn] >= epoch) {
-            pfn++;
-        }
-        if (pfn < end) {
-            pages[count++] = s->pages[p];
-        }
-    }
+    pages = g_memdup2(s->pages, count * sizeof(uint64_t));
     qemu_mutex_unlock(&d->lock);
 
     n = reims_vgpu_dirty_ram_slices_into(&slices, &cap);
@@ -1137,12 +1067,8 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token)
     }
     qemu_mutex_unlock(&d->lock);
 
-    /*
-     * Contiguous runs of this set's pages, per logged region, and the same
-     * runs as guest-physical spans (`walked`), gaps included.
-     */
+    /* Contiguous runs of this set's pages, per logged region. */
     ranges = g_array_new(FALSE, FALSE, sizeof(MemoryRegionRange));
-    walked = g_array_new(FALSE, FALSE, sizeof(MemoryRegionRange));
     for (i = 0; i < n; i++) {
         const ReimsVgpuDirtySlice *sl = &slices[i];
         bool seen = false;
@@ -1175,24 +1101,14 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token)
                     continue;
                 }
                 if (open) {
-                    MemoryRegionRange w = {
-                        sj->gpa + (r.start - sj->offset), r.len
-                    };
-
                     g_array_append_val(ranges, r);
-                    g_array_append_val(walked, w);
                 }
                 r.start = sj->offset + (gpa - sj->gpa);
                 r.len = page_size;
                 open = true;
             }
             if (open) {
-                MemoryRegionRange w = {
-                    sj->gpa + (r.start - sj->offset), r.len
-                };
-
                 g_array_append_val(ranges, r);
-                g_array_append_val(walked, w);
             }
         }
         memory_region_sync_dirty_ranges(sl->mr,
@@ -1204,25 +1120,6 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token)
     written = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyWritten));
     hit = g_array_new(FALSE, FALSE, sizeof(size_t));
     qemu_mutex_lock(&d->lock);
-    /*
-     * Every page the queries walked, the gaps they bridged included: those gaps
-     * are mostly other sets' pages (surfaces interleave in guest RAM), whose
-     * bits are now in the VGA bitmap too. Only logged slices were queried, so a
-     * page outside them stays unmarked (the consume reads it as written).
-     * Marked only now, after the queries returned, so a sync that finds a page
-     * marked for its epoch knows that page's bits are already in the bitmap.
-     */
-    for (p = 0; p < walked->len; p++) {
-        const MemoryRegionRange *w = &g_array_index(walked,
-                                                    MemoryRegionRange, p);
-        uint64_t pfn = w->start >> shift;
-        uint64_t end = (w->start + w->len) >> shift;
-
-        reims_vgpu_dirty_page_seq_cover(d, end);
-        for (; pfn < end; pfn++) {
-            d->page_qepoch[pfn] = MAX(d->page_qepoch[pfn], epoch);
-        }
-    }
     s = g_hash_table_lookup(d->sets, &token);
     if (s) {
         reims_vgpu_dirty_consume_set(d, s, slices, n, written);
@@ -1240,52 +1137,6 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token)
     g_free(slices);
 }
 
-/*
- * Take the prefetch's tokens in turn until the list is used up or a newer
- * doorbell makes it stale. Called by the harvest thread and by each worker.
- */
-static void reims_vgpu_dirty_prefetch_drain(ReimsVgpuDirty *d, uint64_t epoch)
-{
-    for (;;) {
-        uint64_t token;
-
-        qemu_mutex_lock(&d->lock);
-        if (d->od_stop || d->od_work_epoch != epoch || d->epoch != epoch ||
-            d->od_work_next >= d->od_work->len) {
-            qemu_mutex_unlock(&d->lock);
-            return;
-        }
-        token = g_array_index(d->od_work, uint64_t, d->od_work_next++);
-        qemu_mutex_unlock(&d->lock);
-        reims_vgpu_dirty_sync_one(d, token);
-    }
-}
-
-static void *reims_vgpu_dirty_od_worker(void *opaque)
-{
-    ReimsVgpuDirty *d = opaque;
-    uint64_t done = 0;
-
-    /* A sync walks the flat view and syncs the log under RCU. */
-    rcu_register_thread();
-    qemu_mutex_lock(&d->lock);
-    while (!d->od_stop) {
-        uint64_t epoch = d->od_work_epoch;
-
-        if (epoch == done || epoch == 0) {
-            qemu_cond_wait(&d->od_work_cond, &d->lock);
-            continue;
-        }
-        done = epoch;
-        qemu_mutex_unlock(&d->lock);
-        reims_vgpu_dirty_prefetch_drain(d, epoch);
-        qemu_mutex_lock(&d->lock);
-    }
-    qemu_mutex_unlock(&d->lock);
-    rcu_unregister_thread();
-    return NULL;
-}
-
 void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
 {
     if (d) {
@@ -1299,22 +1150,6 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
          */
         d->od_prefetch = !(op && strcmp(op, "off") == 0);
         qemu_mutex_unlock(&d->lock);
-        if (on && d->od_prefetch && d->od_nworkers == 0) {
-            /* See od_workers: 0 leaves the prefetch to the harvest thread. */
-            const char *nt = getenv("REIMS_VGPU_DIRTY_OD_THREADS");
-            int w, want = nt ? atoi(nt) : 3;
-
-            want = MAX(0, MIN(want, 8));
-            if (want > 0) {
-                d->od_workers = g_new0(QemuThread, want);
-                for (w = 0; w < want; w++) {
-                    qemu_thread_create(&d->od_workers[w], "reims-vgpu-od",
-                                       reims_vgpu_dirty_od_worker, d,
-                                       QEMU_THREAD_JOINABLE);
-                }
-                d->od_nworkers = want;
-            }
-        }
     }
 }
 
@@ -1341,8 +1176,7 @@ bool reims_vgpu_dirty_note_doorbell(ReimsVgpuDirty *d)
 /*
  * The harvest thread's work: a full harvest, or in on-demand mode with
  * prefetch, a sync of every set read in the last two epochs that is not up to
- * date for this one, so the drain finds them ready. The prefetch pool's
- * workers take their tokens from the same list. Turning logging on still
+ * date for this one, so the drain finds them ready. Turning logging on still
  * takes a full harvest.
  */
 void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
@@ -1352,6 +1186,7 @@ void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
     gpointer key, val;
     uint64_t epoch;
     bool full;
+    guint t;
 
     if (!d) {
         return;
@@ -1375,16 +1210,15 @@ void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
             g_array_append_val(tokens, *(uint64_t *)key);
         }
     }
-    /*
-     * Publish the list; the workers and this thread take tokens in turn. A
-     * newer doorbell makes it stale, and the next prefetch covers that epoch
-     * from the start.
-     */
-    g_array_set_size(d->od_work, 0);
-    g_array_append_vals(d->od_work, tokens->data, tokens->len);
-    d->od_work_next = 0;
-    d->od_work_epoch = epoch;
-    qemu_cond_broadcast(&d->od_work_cond);
     qemu_mutex_unlock(&d->lock);
-    reims_vgpu_dirty_prefetch_drain(d, epoch);
+    for (t = 0; t < tokens->len; t++) {
+        qemu_mutex_lock(&d->lock);
+        if (d->epoch != epoch) {
+            /* A newer doorbell: the next prefetch covers it from the start. */
+            qemu_mutex_unlock(&d->lock);
+            break;
+        }
+        qemu_mutex_unlock(&d->lock);
+        reims_vgpu_dirty_sync_one(d, g_array_index(tokens, uint64_t, t));
+    }
 }
