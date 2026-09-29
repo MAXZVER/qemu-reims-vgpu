@@ -30,6 +30,7 @@
 #include "system/memory.h"
 #include "system/ramblock.h"
 #include "system/runstate.h"
+#include "system/whpx.h"
 #include "ui/console.h"
 #include "ui/surface.h"
 #include "trace.h"
@@ -151,6 +152,17 @@ struct ReimsVGPUPCIState {
     bool harvest_started;
     bool harvest_rearm;
     bool async_harvest;
+    /*
+     * Run the harvest without the BQL (default on WHPX;
+     * REIMS_VGPU_HARVEST_BQL=on restores it for A/B runs).
+     */
+    bool harvest_nobql;
+    /*
+     * Sync the dirty log on demand instead of harvesting per doorbell
+     * (default; REIMS_VGPU_DIRTY_ONDEMAND=off restores the harvest; see
+     * realize).
+     */
+    bool dirty_ondemand;
     Notifier shutdown_notifier;
     bool shutdown_notifier_registered;
 };
@@ -778,16 +790,27 @@ static void *reims_vgpu_pci_harvest_thread(void *opaque)
         }
         qemu_mutex_unlock(&s->harvest_mutex);
 
-        bql_lock();
+        if (!s->harvest_nobql) {
+            bql_lock();
+        }
         /*
-         * Sampled with the BQL held and before the sync, so every ask it
-         * counts was made before the sync ran and its guest stores are in it.
+         * Sampled before the sync, so every ask it counts was made before the
+         * sync ran and its guest stores are in it.
          */
         qemu_mutex_lock(&s->harvest_mutex);
         target = s->harvest_asked;
         qemu_mutex_unlock(&s->harvest_mutex);
-        reims_vgpu_dirty_harvest(s->dirty);
-        bql_unlock();
+        /*
+         * Without the BQL the harvest is RCU and atomic bitmap work; the
+         * tracker takes the BQL itself for the one MemoryRegion transaction
+         * it may need. Held for the whole walk, the BQL stalled every vCPU
+         * exit that needed it for ~6 ms a harvest, ~75 harvests a second.
+         * In on-demand mode this is the prefetch of the hot sets.
+         */
+        reims_vgpu_dirty_background(s->dirty);
+        if (!s->harvest_nobql) {
+            bql_unlock();
+        }
 
         qemu_mutex_lock(&s->harvest_mutex);
         s->harvest_done = target;
@@ -823,7 +846,11 @@ static int reims_vgpu_pci_harvests_settled(void *ctx)
     ReimsVGPUPCIState *s = ctx;
     bool settled;
 
-    if (!s->harvest_started) {
+    if (!s->harvest_started || s->dirty_ondemand) {
+        /*
+         * On demand, every generation read syncs its own set: there is
+         * nothing to wait for.
+         */
         return 1;
     }
     qemu_mutex_lock(&s->harvest_mutex);
@@ -840,7 +867,7 @@ static void reims_vgpu_pci_wait_harvest(ReimsVGPUPCIState *s)
 {
     uint64_t target;
 
-    if (!s->harvest_started) {
+    if (!s->harvest_started || s->dirty_ondemand) {
         return;
     }
     qemu_mutex_lock(&s->harvest_mutex);
@@ -883,22 +910,31 @@ static void *reims_vgpu_pci_drain_thread(void *opaque)
 
 /*
  * Oversample the Rust-owned VBL limiter (DISPLAY_VBL_MIN_INTERVAL_MS = 8 ms for
- * the 120 Hz advertised mode). Polling at 4 ms guarantees the 8 ms limiter is
- * the gate even when the main loop stalls under input/QMP/display work. This
- * thread only supplies poll opportunities and schedules the existing main-loop
- * BH; Rust owns pacing and protocol state, while the BH remains the sole
- * HostAction applier.
+ * the 120 Hz advertised mode). This thread only supplies poll opportunities
+ * and schedules the existing main-loop BH; Rust owns pacing and protocol
+ * state, while the BH remains the sole HostAction applier.
+ *
+ * 1 ms, not 4: the limiter's catch-up grid only phase-locks when polls land
+ * well inside the 8.33 ms interval, and a Windows host's 4 ms condvar waits
+ * (plus the poll's own maintenance) drifted past it often enough that CSS
+ * animation sat at ~95 fps median; at 1 ms it reads ~106-112 on the same host.
+ * REIMS_VGPU_HEARTBEAT_MS (1-16) overrides it for A/B runs.
  */
-#define REIMS_VGPU_PCI_HEARTBEAT_MS 4
+#define REIMS_VGPU_PCI_HEARTBEAT_MS 1
 
 static void *reims_vgpu_pci_heartbeat_thread(void *opaque)
 {
     ReimsVGPUPCIState *s = opaque;
+    int period_ms = REIMS_VGPU_PCI_HEARTBEAT_MS;
+    const char *hb = getenv("REIMS_VGPU_HEARTBEAT_MS");   /* lab A/B */
 
+    if (hb && atoi(hb) >= 1 && atoi(hb) <= 16) {
+        period_ms = atoi(hb);
+    }
     qemu_mutex_lock(&s->heartbeat_mutex);
     while (!s->heartbeat_stopping) {
         qemu_cond_timedwait(&s->heartbeat_cond, &s->heartbeat_mutex,
-                            REIMS_VGPU_PCI_HEARTBEAT_MS);
+                            period_ms);
         if (s->heartbeat_stopping) {
             break;
         }
@@ -1033,7 +1069,20 @@ static void reims_vgpu_pci_gfx_write(void *opaque, hwaddr offset, uint64_t data,
      * nothing is tracked or nothing has read a generation since the last
      * harvest, so a burst of register writes costs one sync.
      */
-    if (s->harvest_started) {
+    if (s->dirty_ondemand) {
+        /*
+         * Before the register write, as below: the epoch this bumps is what
+         * makes the next generation read of every set sync it first. The
+         * background harvest is asked only while logging is still to be turned
+         * on — its one BQL step — and nothing waits for it.
+         */
+        if (reims_vgpu_dirty_note_doorbell(s->dirty) && s->harvest_started) {
+            qemu_mutex_lock(&s->harvest_mutex);
+            s->harvest_asked++;
+            qemu_cond_signal(&s->harvest_cond);
+            qemu_mutex_unlock(&s->harvest_mutex);
+        }
+    } else if (s->harvest_started) {
         qemu_mutex_lock(&s->harvest_mutex);
         s->harvest_asked++;
         qemu_cond_signal(&s->harvest_cond);
@@ -1288,6 +1337,34 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         return;
     }
     s->rust_handle = out.handle;
+    {
+        const char *hb = getenv("REIMS_VGPU_HARVEST_BQL");     /* lab A/B */
+        const char *od = getenv("REIMS_VGPU_DIRTY_ONDEMAND");  /* lab A/B */
+
+        /*
+         * Off the BQL only where the dirty log allows it. WHPX's log_sync is
+         * safe to run from any thread (it drops the BQL itself for long
+         * walks); KVM's dirty-ring flush asserts that the BQL is held.
+         */
+        s->harvest_nobql = whpx_enabled() && !(hb && strcmp(hb, "on") == 0);
+        /*
+         * On demand needs the same, the harvest thread to turn logging on,
+         * and a log that can sync a few pages cheaply, as WHPX's ranged
+         * log_sync can.
+         *
+         * Default (`off` restores the per-doorbell harvest): each generation
+         * read syncs its own set, so the drain stops waiting for a harvest per
+         * doorbell (lab: CSS scroll ~90 -> 115-120 fps, Safari scroll ~66 ->
+         * ~90). The stale tile pages this mode once left on a full-screen page
+         * were lost dirty bits, not ordering:
+         * physical_memory_set_dirty_lebitmap() mis-strode unaligned ranges on
+         * LLP64 hosts, and the per-set ranges reims-vgpu-dirty.c syncs are
+         * rarely aligned.
+         */
+        s->dirty_ondemand = s->harvest_nobql && s->async_harvest &&
+                            !(od && strcmp(od, "off") == 0);
+        reims_vgpu_dirty_set_ondemand(s->dirty, s->dirty_ondemand);
+    }
     /* Before the drain exists, so it never sees harvest_started change. */
     if (s->async_harvest) {
         qemu_thread_create(&s->harvest_thread, "reims-vgpu-pci-harvest",
