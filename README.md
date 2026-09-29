@@ -13,9 +13,51 @@ Windows 11 with QEMU's WHPX accelerator (Windows Hypervisor Platform). On one la
 fullscreen CSS animation in a macOS 13 guest at 1920x1080 went from **5–7 fps to a median of
 ~93 fps** over the course of this work.
 
-The default branch, `windows`, is what you build. Every change in it is also offered to the
-fork it came from as a pull request (see [What changed](#what-changed)). This README is the only
-file that exists just for this fork; QEMU's own README is [README.rst](README.rst), unchanged.
+The default branch, `windows`, is what you build. Nearly every change in it is also offered to
+the fork it came from as a pull request; the one exception is marked in
+[What changed](#what-changed). This README is the only file that exists just for this fork;
+QEMU's own README is [README.rst](README.rst), unchanged.
+
+## Latest results (2026-09-29)
+
+These come from the same lab PC (RTX 4060, Windows 11 + WHPX), with a macOS Ventura 13.7.8
+guest. The figures are median present rates in Hz. Boot-to-boot variance in the lab is large, so
+read them as ranges. They were measured on the lab's development trees, which carry the changes
+below plus temporary diagnostics; the published branches have been compile-checked, not
+re-benchmarked on their own.
+
+| Guest | CSS animation | Full-screen CSS scroll | Wheel scroll |
+|---|---|---|---|
+| 1920x1080 | ~92–97 | ~116–118 | ~88–96 |
+| 5120x2160 | ~98–106 | ~47–51 | ~63–71 |
+
+What is new:
+
+- **LLP64 dirty-bitmap fix.** `physical_memory_set_dirty_lebitmap()` used the pointer width as
+  the width of the bitmap's `unsigned long` words. On Windows `long` is 32 bits, so in every
+  unaligned range the bits past the first 32 pages were dropped or landed on the wrong page. The
+  dropped bits were the stale tile pages; on full-screen scroll the streak detector now reads 0
+  stale-page streaks.
+  The misplaced bits had been marking random surfaces as written, which cost a lot at 5K; fixing
+  them was a large part of the 5K speedup. The fix is in
+  [steelbrain#10](https://github.com/steelbrain/qemu-reims-vgpu/pull/10).
+- **On-demand dirty sync is the default.** The drain no longer waits for a dirty-log harvest per
+  doorbell: each generation read syncs only its own surface's pages.
+  `REIMS_VGPU_DIRTY_ONDEMAND=off` restores the per-doorbell harvest.
+- **reims-vgpu's page-diff writeback is the default** on its `windows` branch. A presented
+  framebuffer is written back into guest RAM page by page, with only the pages that changed and
+  the pages the guest CPU wrote since the last write-back. At 5K this raised CSS animation from
+  ~93 to ~100–106, wheel scroll from ~64 to ~71 and window drag from ~23 to ~28–30; 1080p is
+  unchanged. `REIMS_VGPU_PAY_DIFF=off` writes whole frames back instead.
+
+Known limits:
+
+- 5K does not reach 120 Hz yet. Full-screen scrolling is the slowest case at ~47–51.
+- At 5K the remaining cost is the per-doorbell hypervisor dirty-log queries, at about 300
+  doorbells a second. Work on running the prefetch in parallel is in progress.
+- A macOS 26 Tahoe guest has not been tested in the lab yet.
+
+The older tables below are kept for comparison.
 
 ## What this is
 
@@ -81,12 +123,15 @@ a pull request to the fork whose tree holds the code it touches.
 | WHPX: serve plain MMIO loads from lockless regions without emulation | [Hi-Jiajun#1](https://github.com/Hi-Jiajun/qemu-reims-vgpu/pull/1) | A polled register read costs ~1.3–2 µs instead of ~8.5 µs. |
 | `reims-vgpu-pci`: serve BAR0 reads without the BQL | [steelbrain#11](https://github.com/steelbrain/qemu-reims-vgpu/pull/11) | Lets the guest's polling reads skip the BQL, and the WHPX fast path serve them. |
 | Windows build fixes: copy instead of symlink without Developer Mode; guard `munmap` | [steelbrain#8](https://github.com/steelbrain/qemu-reims-vgpu/pull/8) | `host-reims-vgpu-vmapple` does not configure or compile on Windows without them. |
+| `physmem`: use `BITS_PER_LONG` in the lebitmap slow path (LLP64 hosts) | [steelbrain#10](https://github.com/steelbrain/qemu-reims-vgpu/pull/10) (fifth commit) | Fixes the dirty bits that the ranged WHPX syncs lost or misplaced on Windows. See [Latest results](#latest-results-2026-09-29). |
+| `reims-vgpu-dirty`/`-pci`: on-demand dirty sync (the default) with a prefetch at each doorbell, a harvest without the BQL that takes bits atomically, and a 1 ms display heartbeat | Not proposed yet. Fork branch `windows-dirty-ondemand` | The drain stops waiting for a harvest per doorbell. `REIMS_VGPU_DIRTY_ONDEMAND=off` restores the harvest. |
 
 The pull requests have the measurements, the caveats and how each was tested.
 
 ### Branches
 
 - **`windows`** (default): the integration branch above. Build this.
+- **`windows-dirty-ondemand`**: the on-demand dirty-sync series, merged into `windows`.
 - **`experimental/direct-irq`**: `windows` plus work that is still being measured, clearly
   labelled in each commit: a 1 ms display heartbeat (tunable), a lockless WHPX APIC MSI region
   with opt-in direct MSI delivery from the device (needs reims-vgpu ABI v22, which is not
@@ -173,7 +218,8 @@ No binaries or releases are published here.
 - **Experimental.** reims-vgpu calls itself alpha, and so is this.
 - **One machine.** Only an Intel CPU with an NVIDIA RTX 4060 has been measured. Hi-Jiajun
   validated his WHPX fixes on an AMD Ryzen host; our changes have not been tried on AMD.
-- **Only 1080p and macOS 13** so far.
+- **macOS 13 only**, at 1920x1080 and, since 2026-09-29, 5120x2160. 5K does not reach 120 Hz
+  yet.
 
 ### Roadmap
 
