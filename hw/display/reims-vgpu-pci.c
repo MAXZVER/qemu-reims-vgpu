@@ -159,7 +159,8 @@ struct ReimsVGPUPCIState {
     bool harvest_nobql;
     /*
      * Sync the dirty log on demand instead of harvesting per doorbell
-     * (opt-in with REIMS_VGPU_DIRTY_ONDEMAND=on; see realize).
+     * (default; REIMS_VGPU_DIRTY_ONDEMAND=off restores the harvest; see
+     * realize).
      */
     bool dirty_ondemand;
     Notifier shutdown_notifier;
@@ -1351,16 +1352,17 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
          * and a log that can sync a few pages cheaply, as WHPX's ranged
          * log_sync can.
          *
-         * Opt-in (`on`): the drain stops waiting for a harvest per doorbell
-         * (lab: CSS scroll ~90 -> 120 fps, Safari scroll ~66 -> ~90-110),
-         * but a full-screen Safari page then keeps stale tile pages on
-         * screen. The device reads some guest bytes before the generation
-         * that vouches for them, which is safe only while generations move
-         * between drain passes, as the per-doorbell harvest guarantees. The
-         * default stays the harvest until those read sites are ordered.
+         * Default (`off` restores the per-doorbell harvest): each generation
+         * read syncs its own set, so the drain stops waiting for a harvest per
+         * doorbell (lab: CSS scroll ~90 -> 115-120 fps, Safari scroll ~66 ->
+         * ~90). The stale tile pages this mode once left on a full-screen page
+         * were lost dirty bits, not ordering:
+         * physical_memory_set_dirty_lebitmap() mis-strode unaligned ranges on
+         * LLP64 hosts, and the per-set ranges reims-vgpu-dirty.c syncs are
+         * rarely aligned.
          */
         s->dirty_ondemand = s->harvest_nobql && s->async_harvest &&
-                            od && strcmp(od, "on") == 0;
+                            !(od && strcmp(od, "off") == 0);
         reims_vgpu_dirty_set_ondemand(s->dirty, s->dirty_ondemand);
     }
     /* Before the drain exists, so it never sees harvest_started change. */
