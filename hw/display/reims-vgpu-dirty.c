@@ -119,17 +119,6 @@ struct ReimsVgpuDirty {
     uint64_t *page_seq;
     uint64_t page_seq_n;
     /*
-     * On-demand mode: the epoch in which each target page frame was last
-     * queried from the hypervisor, recorded once that query's bits are in the
-     * VGA bitmap. Sets share pages (a framebuffer and the textures that alias
-     * it), and a second query of a page in the same epoch can only return
-     * stores made after the doorbell, which that epoch does not owe anyone; so
-     * a set's sync skips pages already queried in its epoch and takes their
-     * bits (or the stamps of whoever took them) like any other. Same indexing
-     * and length as `page_seq`.
-     */
-    uint64_t *page_qepoch;
-    /*
      * On-demand mode: doorbells only advance `epoch`; a generation read of a
      * set not synced since the last doorbell syncs that set's pages first. The
      * background harvest is then asked for only to turn logging on
@@ -193,7 +182,6 @@ void reims_vgpu_dirty_free(ReimsVgpuDirty *d)
         g_array_free(d->sync_ranges, TRUE);
     }
     g_free(d->page_seq);
-    g_free(d->page_qepoch);
     qemu_cond_destroy(&d->synced_cond);
     qemu_mutex_destroy(&d->lock);
     g_free(d);
@@ -510,8 +498,8 @@ static int reims_vgpu_dirty_slice_of(const ReimsVgpuDirtySlice *slices, int n,
 }
 
 /*
- * Grow the page stamps, and the query epochs beside them, to cover target
- * page frames below `end_pfn`. d->lock held.
+ * Grow the page stamps to cover target page frames below `end_pfn`.
+ * d->lock held.
  */
 static void reims_vgpu_dirty_page_seq_cover(ReimsVgpuDirty *d, uint64_t end_pfn)
 {
@@ -523,9 +511,6 @@ static void reims_vgpu_dirty_page_seq_cover(ReimsVgpuDirty *d, uint64_t end_pfn)
     n = MAX(end_pfn, d->page_seq_n * 2);
     d->page_seq = g_renew(uint64_t, d->page_seq, n);
     memset(d->page_seq + d->page_seq_n, 0,
-           (n - d->page_seq_n) * sizeof(uint64_t));
-    d->page_qepoch = g_renew(uint64_t, d->page_qepoch, n);
-    memset(d->page_qepoch + d->page_seq_n, 0,
            (n - d->page_seq_n) * sizeof(uint64_t));
     d->page_seq_n = n;
 }
@@ -1029,8 +1014,6 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
  * Bring one set up to date: sync the hypervisor's dirty log for its pages
  * alone, consume their bits into the page stamps, and fold them into its
  * generation. The on-demand half of the tracker; see reims_vgpu_dirty_gen.
- * Pages another sync already queried in this epoch are left out of the
- * queries but consumed and folded like the rest (see `page_qepoch`).
  *
  * Runs on the drain without the BQL, which is what makes it possible at all:
  * the ranged sync is RCU and atomic bitmap work, and the one BQL step — turning
@@ -1046,7 +1029,6 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token)
     ReimsVgpuDirtySet *s;
     g_autofree uint64_t *pages = NULL;
     g_autoptr(GArray) ranges = NULL;
-    g_autoptr(GArray) walked = NULL;
     g_autoptr(GArray) written = NULL;
     g_autoptr(GArray) hit = NULL;
     size_t count, p;
@@ -1073,27 +1055,9 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token)
         return;
     }
     s->claim_epoch = epoch;
+    count = s->count;
     page_size = s->page_size;
-    /*
-     * Leave out the pages another sync already queried in this epoch (see
-     * `page_qepoch`): their bits are in the VGA bitmap, and the consume below
-     * takes them, or reads the stamp of whoever took them, like any other
-     * page's. A page is left out only if every target page of it was queried.
-     */
-    pages = g_new(uint64_t, s->count);
-    count = 0;
-    for (p = 0; p < s->count; p++) {
-        uint64_t pfn = s->pages[p] >> shift;
-        uint64_t end = (s->pages[p] + page_size) >> shift;
-
-        while (pfn < end && pfn < d->page_seq_n &&
-               d->page_qepoch[pfn] >= epoch) {
-            pfn++;
-        }
-        if (pfn < end) {
-            pages[count++] = s->pages[p];
-        }
-    }
+    pages = g_memdup2(s->pages, count * sizeof(uint64_t));
     qemu_mutex_unlock(&d->lock);
 
     n = reims_vgpu_dirty_ram_slices_into(&slices, &cap);
@@ -1103,12 +1067,8 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token)
     }
     qemu_mutex_unlock(&d->lock);
 
-    /*
-     * Contiguous runs of this set's pages, per logged region, and the same
-     * runs as guest-physical spans (`walked`), gaps included.
-     */
+    /* Contiguous runs of this set's pages, per logged region. */
     ranges = g_array_new(FALSE, FALSE, sizeof(MemoryRegionRange));
-    walked = g_array_new(FALSE, FALSE, sizeof(MemoryRegionRange));
     for (i = 0; i < n; i++) {
         const ReimsVgpuDirtySlice *sl = &slices[i];
         bool seen = false;
@@ -1141,24 +1101,14 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token)
                     continue;
                 }
                 if (open) {
-                    MemoryRegionRange w = {
-                        sj->gpa + (r.start - sj->offset), r.len
-                    };
-
                     g_array_append_val(ranges, r);
-                    g_array_append_val(walked, w);
                 }
                 r.start = sj->offset + (gpa - sj->gpa);
                 r.len = page_size;
                 open = true;
             }
             if (open) {
-                MemoryRegionRange w = {
-                    sj->gpa + (r.start - sj->offset), r.len
-                };
-
                 g_array_append_val(ranges, r);
-                g_array_append_val(walked, w);
             }
         }
         memory_region_sync_dirty_ranges(sl->mr,
@@ -1170,25 +1120,6 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token)
     written = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyWritten));
     hit = g_array_new(FALSE, FALSE, sizeof(size_t));
     qemu_mutex_lock(&d->lock);
-    /*
-     * Every page the queries walked, the gaps they bridged included: those gaps
-     * are mostly other sets' pages (surfaces interleave in guest RAM), whose
-     * bits are now in the VGA bitmap too. Only logged slices were queried, so a
-     * page outside them stays unmarked (the consume reads it as written).
-     * Marked only now, after the queries returned, so a sync that finds a page
-     * marked for its epoch knows that page's bits are already in the bitmap.
-     */
-    for (p = 0; p < walked->len; p++) {
-        const MemoryRegionRange *w = &g_array_index(walked,
-                                                    MemoryRegionRange, p);
-        uint64_t pfn = w->start >> shift;
-        uint64_t end = (w->start + w->len) >> shift;
-
-        reims_vgpu_dirty_page_seq_cover(d, end);
-        for (; pfn < end; pfn++) {
-            d->page_qepoch[pfn] = MAX(d->page_qepoch[pfn], epoch);
-        }
-    }
     s = g_hash_table_lookup(d->sets, &token);
     if (s) {
         reims_vgpu_dirty_consume_set(d, s, slices, n, written);
