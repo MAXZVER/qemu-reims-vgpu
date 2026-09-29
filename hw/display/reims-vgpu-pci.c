@@ -159,8 +159,7 @@ struct ReimsVGPUPCIState {
     bool harvest_nobql;
     /*
      * Sync the dirty log on demand instead of harvesting per doorbell
-     * (default where the harvest runs without the BQL;
-     * REIMS_VGPU_DIRTY_ONDEMAND=off restores the harvest).
+     * (opt-in with REIMS_VGPU_DIRTY_ONDEMAND=on; see realize).
      */
     bool dirty_ondemand;
     Notifier shutdown_notifier;
@@ -1350,10 +1349,18 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         /*
          * On demand needs the same, the harvest thread to turn logging on,
          * and a log that can sync a few pages cheaply, as WHPX's ranged
-         * log_sync can. Lab: CSS scroll 90-97 -> 120 fps.
+         * log_sync can.
+         *
+         * Opt-in (`on`): the drain stops waiting for a harvest per doorbell
+         * (lab: CSS scroll ~90 -> 120 fps, Safari scroll ~66 -> ~90-110),
+         * but a full-screen Safari page then keeps stale tile pages on
+         * screen. The device reads some guest bytes before the generation
+         * that vouches for them, which is safe only while generations move
+         * between drain passes, as the per-doorbell harvest guarantees. The
+         * default stays the harvest until those read sites are ordered.
          */
         s->dirty_ondemand = s->harvest_nobql && s->async_harvest &&
-                            !(od && strcmp(od, "off") == 0);
+                            od && strcmp(od, "on") == 0;
         reims_vgpu_dirty_set_ondemand(s->dirty, s->dirty_ondemand);
     }
     /* Before the drain exists, so it never sees harvest_started change. */
