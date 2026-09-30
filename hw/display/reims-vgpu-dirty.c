@@ -192,6 +192,19 @@ struct ReimsVgpuDirty {
     bool gen_fast;
     uint64_t lab_gen_fast;    /* TEMP lab: fast-path answers since the last report */
     /*
+     * The prefetch batch's page union: one bit per target page frame, set for
+     * every page of every claimed set and cleared again as the runs are read
+     * back out, so it is all-zero between batches. Scanning it yields the
+     * union's maximal runs in GPA order, which the batch used to get by
+     * sorting every set's runs with g_array_sort — a comparator call per
+     * element, a fifth of the harvest thread at 5K. Owned by the batch, whose
+     * only caller is the device's harvest thread; bits are set under `lock`
+     * with the claims and read back without it.
+     */
+    unsigned long *pb_bits;
+    uint64_t pb_nbits;
+    uint64_t pb_lo, pb_hi;    /* frames that may hold a set bit: [pb_lo, pb_hi) */
+    /*
      * The epoch when the drain last read a ring's tail (0 = never, or the lab
      * A/B REIMS_VGPU_DIRTY_WORK_EPOCH=off). The packets it runs were handed over
      * no later than that read, so a generation read for them needs its set
@@ -308,6 +321,7 @@ void reims_vgpu_dirty_free(ReimsVgpuDirty *d)
     if (d->sync_ranges) {
         g_array_free(d->sync_ranges, TRUE);
     }
+    g_free(d->pb_bits);
     qemu_mutex_destroy(&d->sets_lock);
     qemu_mutex_destroy(&d->lock);
     g_free(d);
@@ -2045,14 +2059,6 @@ static gint reims_vgpu_dirty_cmp_ordered(gconstpointer a, gconstpointer b)
     return x < y ? -1 : x > y;
 }
 
-static gint reims_vgpu_dirty_cmp_span(gconstpointer a, gconstpointer b)
-{
-    uint64_t x = ((const MemoryRegionRange *)a)->start;
-    uint64_t y = ((const MemoryRegionRange *)b)->start;
-
-    return x < y ? -1 : x > y;
-}
-
 /*
  * Prefetch batch: bring every hot set up to date for `epoch` under one query
  * ticket. The sets are claimed first, so a drain that needs one waits for the
@@ -2061,6 +2067,66 @@ static gint reims_vgpu_dirty_cmp_span(gconstpointer a, gconstpointer b)
  * skipped, and the walk is split across the pool. One ticket in flight instead
  * of one per worker is what the ticket settle waits on.
  */
+/* Add one set's target page frames to the batch union. d->lock held. */
+static void reims_vgpu_dirty_pb_mark(ReimsVgpuDirty *d, const ReimsVgpuDirtySet *s,
+                                     int shift)
+{
+    const uint64_t per = s->page_size >> shift;
+    uint64_t lo, hi;
+    size_t p;
+
+    if (s->count == 0) {
+        return;
+    }
+    lo = s->pages[0] >> shift;
+    hi = (s->pages[s->count - 1] + s->page_size) >> shift;
+    if (hi > d->pb_nbits) {
+        uint64_t nbits = MAX(hi, d->pb_nbits * 2);
+
+        d->pb_bits = bitmap_zero_extend(d->pb_bits, d->pb_nbits, nbits);
+        d->pb_nbits = nbits;
+    }
+    for (p = 0; p < s->count; p++) {
+        uint64_t pfn = s->pages[p] >> shift;
+
+        if (per == 1) {
+            set_bit(pfn, d->pb_bits);
+        } else {
+            bitmap_set(d->pb_bits, pfn, per);
+        }
+    }
+    if (d->pb_hi == 0) {
+        d->pb_lo = lo;
+    }
+    d->pb_lo = MIN(d->pb_lo, lo);
+    d->pb_hi = MAX(d->pb_hi, hi);
+}
+
+/*
+ * Read the batch union back as maximal runs in GPA order, clearing it. Pages
+ * two sets share appear once, where the sorted per-set runs held them twice.
+ */
+static void reims_vgpu_dirty_pb_runs(ReimsVgpuDirty *d, int shift, GArray *runs)
+{
+    unsigned long bit, end;
+
+    if (d->pb_hi == 0) {
+        return;
+    }
+    bit = find_next_bit(d->pb_bits, d->pb_hi, d->pb_lo);
+    while (bit < d->pb_hi) {
+        MemoryRegionRange run;
+
+        end = find_next_zero_bit(d->pb_bits, d->pb_hi, bit);
+        run.start = (uint64_t)bit << shift;
+        run.len = (uint64_t)(end - bit) << shift;
+        g_array_append_val(runs, run);
+        bitmap_clear(d->pb_bits, bit, end - bit);
+        bit = find_next_bit(d->pb_bits, d->pb_hi, end);
+    }
+    d->pb_lo = d->pb_hi = 0;
+}
+
 static void reims_vgpu_dirty_prefetch_batch(ReimsVgpuDirty *d, GArray *tokens,
                                             uint64_t epoch)
 {
@@ -2094,7 +2160,6 @@ static void reims_vgpu_dirty_prefetch_batch(ReimsVgpuDirty *d, GArray *tokens,
     for (t = 0; t < tokens->len; t++) {
         uint64_t tk = g_array_index(tokens, uint64_t, t);
         ReimsVgpuDirtySet *set = g_hash_table_lookup(d->sets, &tk);
-        size_t p;
 
         if (!set || set->synced_epoch >= epoch || set->claim_epoch >= epoch) {
             continue;
@@ -2102,18 +2167,10 @@ static void reims_vgpu_dirty_prefetch_batch(ReimsVgpuDirty *d, GArray *tokens,
         set->claim_epoch = epoch;
         g_array_append_val(claimed, tk);
         setpages += set->count * (set->page_size / target);
-        /* The set's runs of adjacent pages; the sort below merges the sets. */
-        for (p = 0; p < set->count;) {
-            MemoryRegionRange run = { set->pages[p], set->page_size };
-
-            for (p++; p < set->count && set->pages[p] == run.start + run.len; p++) {
-                run.len += set->page_size;
-            }
-            g_array_append_val(pages, run);
-        }
+        reims_vgpu_dirty_pb_mark(d, set, shift);
     }
     qemu_mutex_unlock(&d->lock);
-    g_array_sort(pages, reims_vgpu_dirty_cmp_span);
+    reims_vgpu_dirty_pb_runs(d, shift, pages);
     if (claimed->len == 0) {
         return;
     }
@@ -2150,6 +2207,12 @@ static void reims_vgpu_dirty_prefetch_batch(ReimsVgpuDirty *d, GArray *tokens,
             off = slices[i].offset + (gpa - slices[i].gpa);
             last = chunks->len ? &g_array_index(chunks, ReimsVgpuDirtyChunk,
                                                 chunks->len - 1) : NULL;
+            {
+                /* Set pages this batch queries: the ones it may vouch for. */
+                MemoryRegionRange w = { gpa, send - gpa };
+
+                g_array_append_val(walked, w);
+            }
             if (last && last->mr == slices[i].mr && off >= last->r.start &&
                 last->r.start + last->r.len +
                 REIMS_VGPU_DIRTY_SYNC_GAP_PAGES * target >= off) {
@@ -2164,29 +2227,6 @@ static void reims_vgpu_dirty_prefetch_batch(ReimsVgpuDirty *d, GArray *tokens,
                 g_array_append_val(chunks, c);
             }
             gpa = send;
-        }
-    }
-    /*
-     * Every page the queries walk, in GPA: each chunk mapped back through the
-     * logged slices of its region, the gaps it bridges included.
-     */
-    for (pi = 0; pi < chunks->len; pi++) {
-        const ReimsVgpuDirtyChunk *c = &g_array_index(chunks, ReimsVgpuDirtyChunk, pi);
-
-        for (i = 0; i < n; i++) {
-            uint64_t lo, hi;
-
-            if (slices[i].mr != c->mr || !slices[i].logged) {
-                continue;
-            }
-            lo = MAX(c->r.start, slices[i].offset);
-            hi = MIN(c->r.start + c->r.len, slices[i].offset + slices[i].len);
-            if (lo < hi) {
-                MemoryRegionRange w = { slices[i].gpa + (lo - slices[i].offset),
-                                        hi - lo };
-
-                g_array_append_val(walked, w);
-            }
         }
     }
 
@@ -2251,8 +2291,11 @@ static void reims_vgpu_dirty_prefetch_batch(ReimsVgpuDirty *d, GArray *tokens,
     reims_vgpu_dirty_query_settle(d, qticket);
     pb3 = get_clock();
     /*
-     * Every page the queries walked, the gaps they bridged included, as in
-     * reims_vgpu_dirty_sync_one: their bits are in the VGA bitmap now.
+     * Stamp the set pages as queried for this epoch. The gap pages between
+     * them were queried too, but no set of this batch names them, and leaving
+     * them unstamped only lets a later sync of some other set query them
+     * again — the harmless direction. Stamping them was three quarters of
+     * this loop, run under `lock`.
      */
     for (pi = 0; pi < walked->len; pi++) {
         const MemoryRegionRange *w = &g_array_index(walked, MemoryRegionRange, pi);
