@@ -9,6 +9,7 @@ struct AccelCPUState {
     bool ready_for_pic_interrupt;
     uint64_t tpr;
     bool interruption_pending;
+    bool mmio_fast;             /* last MMIO exit took whpx_mmio_fast_load */
     /* Must be the last field as it may have a tail */
     WHV_RUN_VP_EXIT_CONTEXT exit_ctx;
 };

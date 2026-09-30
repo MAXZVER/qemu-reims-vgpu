@@ -18,6 +18,7 @@
 #include "qemu/main-loop.h"
 #include "qemu/aio.h"
 #include "qemu/thread.h"
+#include "qemu/rcu.h"
 #include "qapi/error.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msi.h"
@@ -28,6 +29,7 @@
 #include "system/memory.h"
 #include "system/ramblock.h"
 #include "system/runstate.h"
+#include "system/whpx.h"
 #include "ui/console.h"
 #include "ui/surface.h"
 #include "trace.h"
@@ -129,6 +131,31 @@ struct ReimsVGPUPCIState {
     bool drain_started;
     bool heartbeat_stopping;
     bool heartbeat_started;
+    /*
+     * Dirty-log harvest off the vCPU. The harvest has to finish before the
+     * drain acts on the work a doorbell handed over, but nothing requires the
+     * guest to wait for it: a vCPU that rang the doorbell used to sit in the
+     * MMIO exit, holding the BQL, for the whole accelerator sync.
+     */
+    QemuThread harvest_thread;
+    QemuMutex harvest_mutex;
+    QemuCond harvest_cond;
+    QemuCond harvest_done_cond;
+    uint64_t harvest_asked;
+    /* Harvest without the BQL (lab A/B: REIMS_VGPU_HARVEST_BQL=on restores it). */
+    bool harvest_nobql;
+    /* On-demand dirty sync (default; REIMS_VGPU_DIRTY_ONDEMAND=off restores the harvest). */
+    bool dirty_ondemand;
+    /* TEMP lab diagnostic: harvest cost and the drain's wait on it, per second. */
+    uint64_t lab_hv_n, lab_hv_ns, lab_hv_max_ns, lab_wait_n, lab_wait_ns, lab_wait_max_ns;
+    int64_t lab_hv_last;
+    uint64_t harvest_done;
+    bool harvest_stopping;
+    bool harvest_started;
+    /* The drain was told "not settled" and left work; wake it on catch-up. */
+    bool harvest_rearm;
+    /* HostOps.irq_pulse may raise MSIs off the BQL (lab A/B: REIMS_VGPU_IRQ_DIRECT=on). */
+    bool irq_direct;
     Notifier shutdown_notifier;
     bool shutdown_notifier_registered;
 };
@@ -730,10 +757,185 @@ static void reims_vgpu_pci_bh(void *opaque)
     reims_vgpu_pci_deliver_actions(s);
 }
 
+/*
+ * Run the dirty-log harvest a doorbell asked for, under the BQL, then release
+ * the drain. Holds only the BQL and the tracker's own lock — never the device —
+ * so the drain waiting on it cannot close a cycle.
+ */
+static void *reims_vgpu_pci_harvest_thread(void *opaque)
+{
+    ReimsVGPUPCIState *s = opaque;
+
+    /*
+     * This thread reads the FlatView under RCU (the dirty tracker's RAM walk,
+     * address-space lookups through HostOps); an unregistered reader is not
+     * waited for by synchronize_rcu() and can see a freed view.
+     */
+    rcu_register_thread();
+    for (;;) {
+        uint64_t target;
+
+        qemu_mutex_lock(&s->harvest_mutex);
+        while (s->harvest_done >= s->harvest_asked && !s->harvest_stopping) {
+            qemu_cond_wait(&s->harvest_cond, &s->harvest_mutex);
+        }
+        if (s->harvest_stopping) {
+            qemu_mutex_unlock(&s->harvest_mutex);
+            break;
+        }
+        target = s->harvest_asked;
+        qemu_mutex_unlock(&s->harvest_mutex);
+
+        {
+            int64_t t0 = get_clock(), dt;
+
+            if (s->harvest_nobql) {
+                /* RCU and atomic bitmap operations only; the dirty tracker takes
+                 * the BQL itself for the one MemoryRegion transaction it may
+                 * need. Held for the whole walk, the BQL stalled every vCPU exit
+                 * that needed it for ~6 ms a harvest, ~75 harvests a second.
+                 * In on-demand mode this is the prefetch of the hot sets. */
+                reims_vgpu_dirty_background(s->dirty);
+            } else {
+                bql_lock();
+                reims_vgpu_dirty_harvest(s->dirty);
+                bql_unlock();
+            }
+            dt = get_clock() - t0;
+            qemu_mutex_lock(&s->harvest_mutex);
+            s->lab_hv_n++;
+            s->lab_hv_ns += dt;
+            s->lab_hv_max_ns = MAX(s->lab_hv_max_ns, (uint64_t)dt);
+            qemu_mutex_unlock(&s->harvest_mutex);
+        }
+
+        qemu_mutex_lock(&s->harvest_mutex);
+        s->harvest_done = target;
+        qemu_cond_broadcast(&s->harvest_done_cond);
+        if (s->harvest_rearm && s->harvest_done >= s->harvest_asked) {
+            /* The wakeup an unsettled answer promised; see harvests_settled. */
+            s->harvest_rearm = false;
+            qemu_mutex_unlock(&s->harvest_mutex);
+            reims_vgpu_pci_schedule_bh(s);
+            qemu_mutex_lock(&s->harvest_mutex);
+        }
+        qemu_mutex_unlock(&s->harvest_mutex);
+    }
+    rcu_unregister_thread();
+    return NULL;
+}
+
+/*
+ * HostOps.irq_pulse: raise the device's MSI from the calling thread, which may
+ * be the drain holding the device lock without the BQL.
+ *
+ * Only where the delivery takes no lock at all. Under WHPX with the in-kernel
+ * irqchip, msi_notify ends in a write to the WHPX APIC's MSI region, which is
+ * lockless and injects with WHvRequestInterrupt; anywhere else the MMIO
+ * dispatch would take the BQL inside this call, and a caller holding the device
+ * lock would then deadlock against a vCPU that holds the BQL and waits for it.
+ * Those hosts answer 0 and the pulse is queued for the action BH as before.
+ * No per-vector masking is advertised (msi_init above), so msi_notify never
+ * touches pending bits here.
+ */
+/* HostOps.note_work_scope: which doorbells bind the reads that follow. */
+static void reims_vgpu_pci_note_work_scope(void *ctx, uint32_t scope)
+{
+    ReimsVGPUPCIState *s = ctx;
+
+    if (s->dirty_ondemand) {
+        reims_vgpu_dirty_note_work_scope(s->dirty, scope);
+    }
+}
+
+static int reims_vgpu_pci_irq_pulse(void *ctx, uint32_t kind)
+{
+    ReimsVGPUPCIState *s = ctx;
+    PCIDevice *pdev = PCI_DEVICE(s);
+
+    if (!s->irq_direct || !whpx_enabled() || !whpx_irqchip_in_kernel() ||
+        !msi_enabled(pdev)) {
+        return 0;
+    }
+    if (kind != REIMS_VGPU_HOST_ACTION_IRQ_GFX &&
+        kind != REIMS_VGPU_HOST_ACTION_IRQ_IOSFC) {
+        return 0;
+    }
+    msi_notify(pdev, 0);
+    return 1;
+}
+
+/* HostOps.harvests_settled: never blocks; the harvest mutex is a leaf lock. */
+static int reims_vgpu_pci_harvests_settled(void *ctx)
+{
+    ReimsVGPUPCIState *s = ctx;
+    int settled;
+
+    if (!s->harvest_started || s->dirty_ondemand) {
+        /* On demand, every generation read syncs its own set: nothing to wait for. */
+        return 1;
+    }
+    qemu_mutex_lock(&s->harvest_mutex);
+    settled = s->harvest_done >= s->harvest_asked;
+    if (!settled) {
+        /* The write behind this may not have been a doorbell: nothing else
+         * would wake the drain for the work it leaves. */
+        s->harvest_rearm = true;
+    }
+    qemu_mutex_unlock(&s->harvest_mutex);
+    return settled;
+}
+
+/* Every harvest a doorbell asked for before this call has finished. */
+static void reims_vgpu_pci_wait_harvest(ReimsVGPUPCIState *s)
+{
+    uint64_t target;
+
+    if (!s->harvest_started || s->dirty_ondemand) {
+        return;
+    }
+    qemu_mutex_lock(&s->harvest_mutex);
+    target = s->harvest_asked;
+    if (s->harvest_done < target) {
+        int64_t t0 = get_clock(), dt;
+
+        while (s->harvest_done < target && !s->harvest_stopping) {
+            qemu_cond_wait(&s->harvest_done_cond, &s->harvest_mutex);
+        }
+        dt = get_clock() - t0;
+        s->lab_wait_n++;
+        s->lab_wait_ns += dt;
+        s->lab_wait_max_ns = MAX(s->lab_wait_max_ns, (uint64_t)dt);
+    }
+    {
+        int64_t now = get_clock();
+
+        if (now - s->lab_hv_last >= NANOSECONDS_PER_SECOND) {
+            fprintf(stderr, "reims-harvest epoch_ms=%" PRId64 " harvests=%" PRIu64
+                    " harvest_us=%" PRIu64 " harvest_max_us=%" PRIu64
+                    " waits=%" PRIu64 " wait_us=%" PRIu64 " wait_max_us=%" PRIu64
+                    " nobql=%d\n", g_get_real_time() / 1000, s->lab_hv_n,
+                    s->lab_hv_ns / 1000, s->lab_hv_max_ns / 1000, s->lab_wait_n,
+                    s->lab_wait_ns / 1000, s->lab_wait_max_ns / 1000,
+                    s->harvest_nobql);
+            s->lab_hv_n = s->lab_hv_ns = s->lab_hv_max_ns = 0;
+            s->lab_wait_n = s->lab_wait_ns = s->lab_wait_max_ns = 0;
+            s->lab_hv_last = now;
+        }
+    }
+    qemu_mutex_unlock(&s->harvest_mutex);
+}
+
 static void *reims_vgpu_pci_drain_thread(void *opaque)
 {
     ReimsVGPUPCIState *s = opaque;
 
+    /*
+     * This thread reads the FlatView under RCU (the dirty tracker's RAM walk,
+     * address-space lookups through HostOps); an unregistered reader is not
+     * waited for by synchronize_rcu() and can see a freed view.
+     */
+    rcu_register_thread();
     for (;;) {
         int rc;
 
@@ -748,6 +950,7 @@ static void *reims_vgpu_pci_drain_thread(void *opaque)
         s->drain_pending = false;
         qemu_mutex_unlock(&s->drain_mutex);
 
+        reims_vgpu_pci_wait_harvest(s);
         rc = reims_vgpu_qemu_device_drain(s->rust_handle);
         if (rc != REIMS_VGPU_QEMU_OK) {
             qemu_log_mask(LOG_GUEST_ERROR, "%s: worker drain failed rc=%d\n",
@@ -755,6 +958,7 @@ static void *reims_vgpu_pci_drain_thread(void *opaque)
         }
         qemu_bh_schedule(s->action_bh);
     }
+    rcu_unregister_thread();
     return NULL;
 }
 
@@ -766,16 +970,28 @@ static void *reims_vgpu_pci_drain_thread(void *opaque)
  * BH; Rust owns pacing and protocol state, while the BH remains the sole
  * HostAction applier.
  */
-#define REIMS_VGPU_PCI_HEARTBEAT_MS 4
+/*
+ * 1 ms, not 4: the limiter's catch-up grid only phase-locks when polls land
+ * well inside the 8.33 ms interval, and a Windows host's 4 ms condvar waits
+ * (plus the poll's own maintenance) drifted past it often enough that CSS
+ * animation sat at ~95 fps median; at 1 ms it reads ~106-112 on the same host.
+ */
+#define REIMS_VGPU_PCI_HEARTBEAT_MS 1
 
 static void *reims_vgpu_pci_heartbeat_thread(void *opaque)
 {
     ReimsVGPUPCIState *s = opaque;
 
+    int period_ms = REIMS_VGPU_PCI_HEARTBEAT_MS;
+    const char *hb = getenv("REIMS_VGPU_HEARTBEAT_MS");   /* lab A/B */
+
+    if (hb && atoi(hb) >= 1 && atoi(hb) <= 16) {
+        period_ms = atoi(hb);
+    }
     qemu_mutex_lock(&s->heartbeat_mutex);
     while (!s->heartbeat_stopping) {
         qemu_cond_timedwait(&s->heartbeat_cond, &s->heartbeat_mutex,
-                            REIMS_VGPU_PCI_HEARTBEAT_MS);
+                            period_ms);
         if (s->heartbeat_stopping) {
             break;
         }
@@ -851,6 +1067,11 @@ static const GraphicHwOps reims_vgpu_pci_fb_ops = {
 
 /* ---------- MMIO (forward only) ---------- */
 
+/*
+ * Runs without the BQL: the region is lockless (see realize), and a read only
+ * asks Rust, whose gfx read path is lock-free for the ISR/spin registers and
+ * try-locks the device otherwise. Nothing here touches QEMU device state.
+ */
 static uint64_t reims_vgpu_pci_gfx_read(void *opaque, hwaddr offset, unsigned size)
 {
     ReimsVGPUPCIState *s = opaque;
@@ -874,10 +1095,49 @@ static void reims_vgpu_pci_gfx_write(void *opaque, hwaddr offset, uint64_t data,
 {
     ReimsVGPUPCIState *s = opaque;
 
+    /*
+     * Writes keep the BQL: the dirty harvest syncs the accelerator's dirty
+     * log and action delivery raises interrupts, both main-loop state. The
+     * region is lockless for the reads' sake, so take it here when the
+     * dispatcher did not.
+     */
+    BQL_LOCK_GUARD();
+
     if (s->rust_handle == 0) {
         return;
     }
     trace_reims_vgpu_pci_gfx_write(offset, data);
+    {
+        /* TEMP lab: which gfx registers the guest writes, one line a second. */
+        static uint64_t off_seen[16], off_n[16];
+        static int64_t last;
+        int64_t now = get_clock();
+        int k;
+
+        /* Child doorbells keyed by channel: 0x1020_00cc. */
+        uint64_t key = offset == 0x1020 ? (0x10200000u | (data & 0xff)) : offset;
+
+        for (k = 0; k < 16; k++) {
+            if (off_n[k] == 0 || off_seen[k] == key) {
+                off_seen[k] = key;
+                off_n[k]++;
+                break;
+            }
+        }
+        if (now - last >= NANOSECONDS_PER_SECOND) {
+            char buf[512];
+            int len = 0;
+
+            for (k = 0; k < 16 && off_n[k]; k++) {
+                len += snprintf(buf + len, sizeof(buf) - len, " 0x%" PRIx64 "=%" PRIu64,
+                                off_seen[k], off_n[k]);
+                off_n[k] = 0;
+            }
+            fprintf(stderr, "reims-gfxw epoch_ms=%" PRId64 "%s\n",
+                    g_get_real_time() / 1000, len ? buf : "");
+            last = now;
+        }
+    }
     /*
      * Before the register write, not after: this is the guest handing the
      * device work, so every guest store ordered before the handoff must be
@@ -889,7 +1149,31 @@ static void reims_vgpu_pci_gfx_write(void *opaque, hwaddr offset, uint64_t data,
      * Cheap when nothing is tracked or when nothing has read a generation
      * since the last harvest, so a burst of register writes costs one sync.
      */
-    reims_vgpu_dirty_harvest(s->dirty);
+    if (s->dirty_ondemand) {
+        /*
+         * Before the register write, as below: the epoch this bumps is what
+         * makes the next generation read of every set sync it first. The
+         * background harvest is asked only while logging is still to be turned
+         * on — its one BQL step — and nothing waits for it.
+         */
+        if (reims_vgpu_dirty_note_doorbell(
+                s->dirty,
+                reims_vgpu_qemu_gfx_write_doorbell_channel(offset, data, size)) &&
+            s->harvest_started) {
+            qemu_mutex_lock(&s->harvest_mutex);
+            s->harvest_asked++;
+            qemu_cond_signal(&s->harvest_cond);
+            qemu_mutex_unlock(&s->harvest_mutex);
+        }
+    } else if (s->harvest_started) {
+        /* Asked before the write, so the drain the write wakes waits for it. */
+        qemu_mutex_lock(&s->harvest_mutex);
+        s->harvest_asked++;
+        qemu_cond_signal(&s->harvest_cond);
+        qemu_mutex_unlock(&s->harvest_mutex);
+    } else {
+        reims_vgpu_dirty_harvest(s->dirty);
+    }
     if (reims_vgpu_qemu_gfx_write(s->rust_handle, offset, data, size) != REIMS_VGPU_QEMU_OK) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: gfx write failed offset=0x%" HWADDR_PRIx
@@ -937,6 +1221,13 @@ static void reims_vgpu_pci_stop_backend(ReimsVGPUPCIState *s)
         qemu_thread_join(&s->heartbeat_thread);
         s->heartbeat_started = false;
     }
+    if (s->harvest_started) {
+        qemu_mutex_lock(&s->harvest_mutex);
+        s->harvest_stopping = true;
+        qemu_cond_broadcast(&s->harvest_cond);
+        qemu_cond_broadcast(&s->harvest_done_cond);
+        qemu_mutex_unlock(&s->harvest_mutex);
+    }
     if (s->drain_started) {
         qemu_mutex_lock(&s->drain_mutex);
         s->drain_stopping = true;
@@ -944,6 +1235,19 @@ static void reims_vgpu_pci_stop_backend(ReimsVGPUPCIState *s)
         qemu_mutex_unlock(&s->drain_mutex);
         qemu_thread_join(&s->drain_thread);
         s->drain_started = false;
+    }
+    if (s->harvest_started) {
+        bool locked = bql_locked();
+
+        /* The thread may be waiting for the BQL this caller holds. */
+        if (locked) {
+            bql_unlock();
+        }
+        qemu_thread_join(&s->harvest_thread);
+        if (locked) {
+            bql_lock();
+        }
+        s->harvest_started = false;
     }
     if (s->action_bh) {
         qemu_bh_delete(s->action_bh);
@@ -994,6 +1298,13 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
     memory_region_init_io(&s->iomem_gfx, OBJECT(s), &reims_vgpu_pci_gfx_ops, s,
                           TYPE_REIMS_VGPU_PCI ".gfx",
                           REIMS_VGPU_GFX_MMIO_SIZE);
+    /*
+     * The guest's interrupt handler polls this BAR (0x102c, 0x100c, 0x1014/
+     * 0x1018) tens of thousands of times a second. Let those reads skip the
+     * BQL, so an accelerator can serve them from the vCPU thread directly;
+     * the write handler takes the BQL itself.
+     */
+    memory_region_enable_lockless_io(&s->iomem_gfx);
     /* 32-bit non-prefetch BAR (16 KiB control window). Live 2026-07-13: 64-bit
      * BAR behind pcie-root-port caused Apple efiboot STOP 0x15; keep 32-bit. */
     pci_register_bar(pdev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->iomem_gfx);
@@ -1066,6 +1377,9 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
          * through unmap_pages after their Vulkan import has retired.
          */
         .map_pages_stable = 1,
+        .harvests_settled = reims_vgpu_pci_harvests_settled,
+        .irq_pulse = reims_vgpu_pci_irq_pulse,
+        .note_work_scope = reims_vgpu_pci_note_work_scope,
         .track_guest_writes = reims_vgpu_pci_track_guest_writes,
         .untrack_guest_writes = reims_vgpu_pci_untrack_guest_writes,
         .guest_write_gen = reims_vgpu_pci_guest_write_gen,
@@ -1078,6 +1392,9 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
     qemu_cond_init(&s->drain_cond);
     qemu_mutex_init(&s->heartbeat_mutex);
     qemu_cond_init(&s->heartbeat_cond);
+    qemu_mutex_init(&s->harvest_mutex);
+    qemu_cond_init(&s->harvest_cond);
+    qemu_cond_init(&s->harvest_done_cond);
     s->action_bh = aio_bh_new(qemu_get_aio_context(), reims_vgpu_pci_bh, s);
 
     info = (ReimsVgpuQemuCreateInfo){
@@ -1102,6 +1419,42 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         return;
     }
     s->rust_handle = out.handle;
+    {
+        const char *d = getenv("REIMS_VGPU_IRQ_DIRECT");   /* lab A/B */
+
+        /*
+         * Opt-in: with the 1 ms heartbeat the direct pulse lost to the action
+         * BH on the same host (vCPUs waited ~70% longer for the BQL in prerun
+         * and the guest's kernel_task doubled), so it stays a lab arm.
+         */
+        s->irq_direct = d && strcmp(d, "on") == 0;
+    }
+    {
+        const char *h = getenv("REIMS_VGPU_ASYNC_HARVEST");   /* lab A/B */
+        const char *hb = getenv("REIMS_VGPU_HARVEST_BQL");     /* lab A/B */
+
+        const char *od = getenv("REIMS_VGPU_DIRTY_ONDEMAND");  /* lab A/B */
+
+        s->harvest_nobql = !(hb && strcmp(hb, "on") == 0);
+        /*
+         * Default (`off` restores the per-doorbell harvest): each generation
+         * read syncs its own set, so the drain stops waiting for a harvest per
+         * doorbell (lab: CSS scroll ~90 -> 115-120 fps, Safari scroll ~66 ->
+         * ~90). The stale tile pages this mode once left on a full-screen page
+         * were lost dirty bits, not ordering: physical_memory_set_dirty_lebitmap
+         * mis-strode unaligned ranges on LLP64 hosts, and the per-set ranges
+         * here are rarely aligned.
+         */
+        s->dirty_ondemand = !(od && strcmp(od, "off") == 0) && s->harvest_nobql;
+        reims_vgpu_dirty_set_ondemand(s->dirty, s->dirty_ondemand);
+
+        if (!(h && strcmp(h, "off") == 0)) {
+            qemu_thread_create(&s->harvest_thread, "reims-vgpu-pci-harvest",
+                               reims_vgpu_pci_harvest_thread, s,
+                               QEMU_THREAD_JOINABLE);
+            s->harvest_started = true;
+        }
+    }
     qemu_thread_create(&s->drain_thread, "reims-vgpu-pci-drain",
                        reims_vgpu_pci_drain_thread, s, QEMU_THREAD_JOINABLE);
     s->drain_started = true;

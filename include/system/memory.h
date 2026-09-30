@@ -1015,6 +1015,16 @@ struct MemoryListener {
     void (*log_sync_global)(MemoryListener *listener, bool last_stage);
 
     /**
+     * @log_sync_ranged:
+     *
+     * @log_sync costs in proportion to the section it is given, so callers
+     * that need a few pages of a large region may pass sub-sections (see
+     * memory_region_sync_dirty_ranges()). Unset, a listener only ever sees
+     * whole flat ranges.
+     */
+    bool log_sync_ranged;
+
+    /**
      * @log_clear:
      *
      * Called before reading the dirty memory bitmap for a
@@ -2091,6 +2101,35 @@ void memory_region_set_log(MemoryRegion *mr, bool log, unsigned client);
  */
 void memory_region_set_dirty(MemoryRegion *mr, hwaddr addr,
                              hwaddr size);
+
+typedef struct MemoryRegionRange {
+    hwaddr start;           /* offset within the region */
+    hwaddr len;
+} MemoryRegionRange;
+
+/*
+ * Optional accelerator hook: make stores the running vCPUs have made visible to
+ * the next dirty-log sync (on WHPX, every vCPU inside WHvRunVirtualProcessor is
+ * made to exit once). NULL when the accelerator's log needs no help.
+ */
+extern void (*memory_dirty_log_flush_hook)(void);
+
+/**
+ * memory_region_sync_dirty_ranges - synchronize the dirty log for ranges
+ *
+ * Like memory_global_dirty_log_sync(), but only guarantees the given ranges
+ * of @mr are synchronized, for callers that read a few pages of a large
+ * region. Listeners with @log_sync_ranged are asked about each range;
+ * others sync @mr's flat ranges once (or everything, for log_sync_global),
+ * so the batch never costs more than one whole-region sync.
+ *
+ * @mr:     the memory region to synchronize
+ * @ranges: offsets within @mr, in any order
+ * @n:      number of @ranges
+ */
+void memory_region_sync_dirty_ranges(MemoryRegion *mr,
+                                     const MemoryRegionRange *ranges,
+                                     size_t n);
 
 /**
  * memory_region_clear_dirty_bitmap - clear dirty bitmap for memory range
