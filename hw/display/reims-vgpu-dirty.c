@@ -74,6 +74,16 @@ typedef struct ReimsVgpuDirtyChunk {
 struct ReimsVgpuDirty {
     QemuMutex lock;
     GHashTable *sets;       /* token -> ReimsVgpuDirtySet* */
+    /*
+     * Guards `sets` membership for the generation fast path, which must not
+     * queue behind `lock`: a prefetch batch holds `lock` through its mark,
+     * consume and eval passes (~0.6 ms, ~220 batches a second at 5K), and every
+     * generation read of an already-synced set used to wait that out on the
+     * drain thread. Membership changes (track/untrack) take `lock` and then
+     * this; the fast path takes only this. Other threads only look sets up
+     * under `lock`, and concurrent lookups are read-only.
+     */
+    QemuMutex sets_lock;
     uint64_t next_token;
     /*
      * Regions this device turned DIRTY_MEMORY_VGA logging on for, referenced
@@ -177,6 +187,10 @@ struct ReimsVgpuDirty {
     guint od_work_next;
     uint64_t od_work_epoch;   /* epoch the list was built for; 0 = none */
     uint64_t read_counter;    /* first reads of a set in an epoch, in order */
+    /* Generation reads may skip `lock` for synced sets (lab A/B
+     * REIMS_VGPU_DIRTY_GEN_FAST=off restores the locked read). */
+    bool gen_fast;
+    uint64_t lab_gen_fast;    /* TEMP lab: fast-path answers since the last report */
     /*
      * The epoch when the drain last read a ring's tail (0 = never, or the lab
      * A/B REIMS_VGPU_DIRTY_WORK_EPOCH=off). The packets it runs were handed over
@@ -244,6 +258,7 @@ ReimsVgpuDirty *reims_vgpu_dirty_new(void)
     ReimsVgpuDirty *d = g_new0(ReimsVgpuDirty, 1);
 
     qemu_mutex_init(&d->lock);
+    qemu_mutex_init(&d->sets_lock);
     d->od_hot = 6;
     qemu_cond_init(&d->synced_cond);
     qemu_cond_init(&d->od_work_cond);
@@ -293,6 +308,7 @@ void reims_vgpu_dirty_free(ReimsVgpuDirty *d)
     if (d->sync_ranges) {
         g_array_free(d->sync_ranges, TRUE);
     }
+    qemu_mutex_destroy(&d->sets_lock);
     qemu_mutex_destroy(&d->lock);
     g_free(d);
 }
@@ -400,7 +416,9 @@ uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
     s->seen_seq = d->global_seq;
     d->next_token++;
     token = d->next_token;
+    qemu_mutex_lock(&d->sets_lock);
     g_hash_table_insert(d->sets, g_memdup2(&token, sizeof(token)), s);
+    qemu_mutex_unlock(&d->sets_lock);
     qemu_mutex_unlock(&d->lock);
     return token;
 }
@@ -411,7 +429,9 @@ void reims_vgpu_dirty_untrack(ReimsVgpuDirty *d, uint64_t token)
         return;
     }
     qemu_mutex_lock(&d->lock);
+    qemu_mutex_lock(&d->sets_lock);
     g_hash_table_remove(d->sets, &token);
+    qemu_mutex_unlock(&d->sets_lock);
     qemu_mutex_unlock(&d->lock);
 }
 
@@ -425,9 +445,9 @@ static uint64_t reims_vgpu_dirty_needed_epoch(ReimsVgpuDirty *d)
 }
 
 /*
- * The drain read a ring's tail for work channel `scope`'s doorbells handed
- * over: generation reads for that work need their sets synced for the epoch
- * of that channel's latest doorbell, not for every newer one.
+ * Lock-free: the drain is the only writer of `work_epoch`, and the epochs it
+ * reads are only ever stored whole. Taking `lock` here queued the drain behind
+ * a prefetch batch's locked passes before every submission.
  */
 void reims_vgpu_dirty_note_work_scope(ReimsVgpuDirty *d, uint32_t scope)
 {
@@ -436,12 +456,53 @@ void reims_vgpu_dirty_note_work_scope(ReimsVgpuDirty *d, uint32_t scope)
     if (!d) {
         return;
     }
-    qemu_mutex_lock(&d->lock);
     if (scope < ARRAY_SIZE(d->chan_epoch)) {
-        e = d->chan_epoch[scope];
+        e = qatomic_read(&d->chan_epoch[scope]);
     }
-    d->work_epoch = e ? e : d->epoch;
-    qemu_mutex_unlock(&d->lock);
+    qatomic_set(&d->work_epoch, e ? e : qatomic_read(&d->epoch));
+}
+
+/*
+ * The generation of a set already synced for the epoch a read needs, without
+ * taking `lock`; false when the set is absent or stale, for the locked path.
+ *
+ * `synced_epoch` is published with release order after the generation it
+ * covers, so a set seen synced here carries a generation at least that fresh.
+ * `work_epoch` is only ever an epoch that has been reached, so reading it and
+ * `epoch` apart cannot ask for more than the locked path would. The read-order
+ * bookkeeping only steers the prefetch; generation reads are serialized by the
+ * device, so it has one writer at a time.
+ */
+static bool reims_vgpu_dirty_gen_synced(ReimsVgpuDirty *d, uint64_t token,
+                                        uint64_t *gen)
+{
+    ReimsVgpuDirtySet *s;
+    uint64_t epoch, work, needed;
+    bool hit = false;
+
+    if (!qatomic_read(&d->ondemand)) {
+        return false;
+    }
+    epoch = qatomic_read(&d->epoch);
+    work = qatomic_read(&d->work_epoch);
+    needed = work && !d->work_epoch_off ? MIN(work, epoch) : epoch;
+    qemu_mutex_lock(&d->sets_lock);
+    s = g_hash_table_lookup(d->sets, &token);
+    if (s && qatomic_load_acquire(&s->synced_epoch) >= needed) {
+        *gen = qatomic_read(&s->gen);
+        qatomic_set(&s->lab_last_read, qatomic_read(&d->harvests) + 1);
+        if (qatomic_read(&s->last_query_epoch) != epoch) {
+            qatomic_set(&s->read_order, qatomic_fetch_inc(&d->read_counter) + 1);
+            qatomic_set(&s->last_query_epoch, epoch);
+        }
+        hit = true;
+    }
+    qemu_mutex_unlock(&d->sets_lock);
+    if (hit) {
+        qatomic_inc(&d->reads_since_harvest);
+        qatomic_inc(&d->lab_gen_fast);
+    }
+    return hit;
 }
 
 uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token)
@@ -453,6 +514,9 @@ uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token)
 
     if (!d || token == 0) {
         return 0;
+    }
+    if (d->gen_fast && reims_vgpu_dirty_gen_synced(d, token, &gen)) {
+        return gen;
     }
     qemu_mutex_lock(&d->lock);
     s = g_hash_table_lookup(d->sets, &token);
@@ -481,11 +545,11 @@ uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token)
         gen = s->gen;
         s->lab_last_read = d->harvests + 1;
         if (s->last_query_epoch != d->epoch) {
-            s->read_order = ++d->read_counter;
+            qatomic_set(&s->read_order, qatomic_fetch_inc(&d->read_counter) + 1);
         }
-        s->last_query_epoch = d->epoch;
+        qatomic_set(&s->last_query_epoch, d->epoch);
     }
-    d->reads_since_harvest++;
+    qatomic_inc(&d->reads_since_harvest);
     qemu_mutex_unlock(&d->lock);
     return gen;
 }
@@ -525,9 +589,9 @@ int64_t reims_vgpu_dirty_written_since(ReimsVgpuDirty *d, uint64_t token,
     }
     if (s) {
         if (s->last_query_epoch != d->epoch) {
-            s->read_order = ++d->read_counter;
+            qatomic_set(&s->read_order, qatomic_fetch_inc(&d->read_counter) + 1);
         }
-        s->last_query_epoch = d->epoch;
+        qatomic_set(&s->last_query_epoch, d->epoch);
     }
     /*
      * `since_gen == 0` is a caller that never recorded a readable observation,
@@ -555,7 +619,7 @@ int64_t reims_vgpu_dirty_written_since(ReimsVgpuDirty *d, uint64_t token,
      * consumer of the report, so the next harvest has something to tell it and
      * must not be skipped.
      */
-    d->reads_since_harvest++;
+    qatomic_inc(&d->reads_since_harvest);
     qemu_mutex_unlock(&d->lock);
     return found;
 }
@@ -836,23 +900,24 @@ static bool reims_vgpu_dirty_eval_set(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
             reims_diag_clean++;
         }
     }
+    /* Stored atomically: the generation fast path reads it without `lock`. */
     if (by_harvest) {
         if (s->gen == 0 && unlogged) {
             s->arm_at = d->harvests + 1;
         }
         if (d->harvests < s->arm_at) {
-            s->gen = 0;
+            qatomic_set(&s->gen, 0);
         } else if (s->gen == 0) {
-            s->gen = 1;
+            qatomic_set(&s->gen, 1);
         } else if (any) {
-            s->gen++;
+            qatomic_set(&s->gen, s->gen + 1);
         }
     } else if (s->gen == 0) {
         if (!unlogged) {
-            s->gen = 1;
+            qatomic_set(&s->gen, 1);
         }
     } else if (any) {
-        s->gen++;
+        qatomic_set(&s->gen, s->gen + 1);
     }
     if (s->gen != 0) {
         guint h;
@@ -1182,7 +1247,7 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
     hit = g_array_new(FALSE, FALSE, sizeof(size_t));
     qemu_mutex_lock(&d->lock);
     d->harvests++;
-    d->reads_since_harvest = 0;
+    qatomic_set(&d->reads_since_harvest, 0);
     /* TEMP diagnostic (Windows/WHPX bring-up): why pages read as written. */
     if ((d->harvests % 256) == 0) {
         GHashTableIter hit_it;
@@ -1296,7 +1361,7 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
             ReimsVgpuDirtySet *set = val;
 
             reims_vgpu_dirty_eval_set(d, set, slices, n, hit, true);
-            set->synced_epoch = MAX(set->synced_epoch, epoch);
+            qatomic_store_release(&set->synced_epoch, MAX(set->synced_epoch, epoch));
         }
     }
     qemu_mutex_unlock(&d->lock);
@@ -1525,7 +1590,7 @@ static bool reims_vgpu_dirty_sync_batch(ReimsVgpuDirty *d, uint64_t token)
             if (reims_vgpu_dirty_eval_set(d, set, slices, n, hit, false)) {
                 d->log_wanted = true;
             }
-            set->synced_epoch = MAX(set->synced_epoch, epoch);
+            qatomic_store_release(&set->synced_epoch, MAX(set->synced_epoch, epoch));
         }
     }
     d->lab_od_n += tokens->len;
@@ -1788,7 +1853,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token)
         if (reims_vgpu_dirty_eval_set(d, s, slices, n, hit, false)) {
             d->log_wanted = true;
         }
-        s->synced_epoch = MAX(s->synced_epoch, epoch);
+        qatomic_store_release(&s->synced_epoch, MAX(s->synced_epoch, epoch));
         if (s->claim_epoch == epoch) {
             s->claim_epoch = 0;
         }
@@ -1808,13 +1873,14 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token)
                     " wait_us=%" PRIu64 " prep_us=%" PRIu64 " query_us=%" PRIu64
                     " settle_us=%" PRIu64 " consume_us=%" PRIu64
                     " fg_ahead=%" PRIu64 " fg_missed=%" PRIu64 " fg_cold=%" PRIu64
-                    "\n",
+                    " gen_fast=%" PRIu64 "\n",
                     g_get_real_time() / 1000, d->lab_od_n, d->lab_od_ns / 1000,
                     d->lab_od_pages, d->lab_od_skipped, d->lab_od_epochs,
                     d->lab_od_fg_n, d->lab_od_fg_ns / 1000, d->lab_ph_wait / 1000,
                     d->lab_ph_prep / 1000, d->lab_ph_query / 1000,
                     d->lab_ph_settle / 1000, d->lab_ph_consume / 1000,
-                    d->lab_fg_ahead, d->lab_fg_missed, d->lab_fg_cold);
+                    d->lab_fg_ahead, d->lab_fg_missed, d->lab_fg_cold,
+                    qatomic_xchg(&d->lab_gen_fast, 0));
             d->lab_fg_ahead = d->lab_fg_missed = d->lab_fg_cold = 0;
             d->lab_ph_wait = d->lab_ph_prep = d->lab_ph_query = 0;
             d->lab_ph_settle = d->lab_ph_consume = 0;
@@ -1886,7 +1952,7 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
         const char *op = getenv("REIMS_VGPU_DIRTY_OD_PREFETCH");   /* lab A/B */
 
         qemu_mutex_lock(&d->lock);
-        d->ondemand = on;
+        qatomic_set(&d->ondemand, on);
         d->od_flush = fl && strcmp(fl, "on") == 0;
         d->od_batch = ob && strcmp(ob, "on") == 0;
         /* On by default (lab: CSS animation ~108 -> ~115, scroll ~88 -> ~100). */
@@ -1907,6 +1973,8 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                           strcmp(getenv("REIMS_VGPU_DIRTY_OD_PTICKET"), "off") == 0;
         d->od_pbatch = !(getenv("REIMS_VGPU_DIRTY_OD_PBATCH") &&      /* lab A/B */
                          strcmp(getenv("REIMS_VGPU_DIRTY_OD_PBATCH"), "off") == 0);
+        d->gen_fast = !(getenv("REIMS_VGPU_DIRTY_GEN_FAST") &&        /* lab A/B */
+                        strcmp(getenv("REIMS_VGPU_DIRTY_GEN_FAST"), "off") == 0);
         d->od_split = !(getenv("REIMS_VGPU_DIRTY_OD_SPLIT") &&        /* lab A/B */
                         strcmp(getenv("REIMS_VGPU_DIRTY_OD_SPLIT"), "off") == 0);
         d->work_epoch_off = getenv("REIMS_VGPU_DIRTY_WORK_EPOCH") &&   /* lab A/B */
@@ -1943,13 +2011,13 @@ bool reims_vgpu_dirty_note_doorbell(ReimsVgpuDirty *d, int channel)
         return false;
     }
     qemu_mutex_lock(&d->lock);
-    d->epoch++;
+    qatomic_set(&d->epoch, d->epoch + 1);
     if (channel >= 0 && channel < (int)ARRAY_SIZE(d->chan_epoch)) {
-        d->chan_epoch[channel] = d->epoch;
+        qatomic_set(&d->chan_epoch[channel], d->epoch);
     } else {
         /* Not a doorbell the device names: binds every channel. */
         for (c = 0; c < ARRAY_SIZE(d->chan_epoch); c++) {
-            d->chan_epoch[c] = d->epoch;
+            qatomic_set(&d->chan_epoch[c], d->epoch);
         }
     }
     d->lab_od_epochs++;
@@ -2211,7 +2279,7 @@ static void reims_vgpu_dirty_prefetch_batch(ReimsVgpuDirty *d, GArray *tokens,
             if (reims_vgpu_dirty_eval_set(d, set, slices, n, hit, false)) {
                 d->log_wanted = true;
             }
-            set->synced_epoch = MAX(set->synced_epoch, epoch);
+            qatomic_store_release(&set->synced_epoch, MAX(set->synced_epoch, epoch));
             if (set->claim_epoch == epoch) {
                 set->claim_epoch = 0;
             }
