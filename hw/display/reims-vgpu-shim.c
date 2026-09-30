@@ -6,6 +6,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/timer.h"
+#include "qemu/rcu.h"
 #include "hw/core/cpu.h"
 #include "exec/cpu-common.h"
 #include "system/address-spaces.h"
@@ -101,6 +102,18 @@ int reims_vgpu_shim_write_gpa(void *ctx, uint64_t gpa, const uint8_t *buf,
         len -= plen;
     }
     return 0;
+}
+
+void reims_vgpu_shim_thread_attach(void *ctx)
+{
+    (void)ctx;
+    rcu_register_thread();
+}
+
+void reims_vgpu_shim_thread_detach(void *ctx)
+{
+    (void)ctx;
+    rcu_unregister_thread();
 }
 
 int reims_vgpu_shim_is_ram_gpa(void *ctx, uint64_t gpa)

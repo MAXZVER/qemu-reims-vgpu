@@ -1019,6 +1019,12 @@ static void reims_vgpu_mmio_realize(DeviceState *dev, Error **errp)
         .untrack_guest_writes = reims_vgpu_mmio_untrack_guest_writes,
         .guest_write_gen = reims_vgpu_mmio_guest_write_gen,
         .guest_written_pages = reims_vgpu_mmio_guest_written_pages,
+        /*
+         * thread_attach / thread_detach stay NULL on purpose: this shim's drain
+         * runs on the vCPU inside its MMIO store, and a second guest-memory
+         * reader is verified on the x86 pathway only. NULL makes the device
+         * start no worker thread here, which is the structural way to say so.
+         */
     };
     s->dirty = reims_vgpu_dirty_new();
 

@@ -63,6 +63,25 @@ int reims_vgpu_shim_guest_ram_regions(void *ctx, ReimsVgpuGuestRamRegion *out,
                                       size_t max);
 
 /*
+ * Register / unregister the calling thread with QEMU's RCU domain, for a worker
+ * thread the Rust device spawns (HostOps.thread_attach / thread_detach).
+ *
+ * A reader of the FlatView that is not registered is not waited for by
+ * synchronize_rcu(), so read_gpa and the dirty tracker's walk can see a view
+ * the memory core has already freed. The C threads (drain, harvest) register
+ * themselves; a Rust thread has no way to call rcu_register_thread(), and this
+ * pair is how it asks. Bus-independent — RCU is per process — so both shims may
+ * point their table at it; the PCI one does and the sysbus one does not (see
+ * there).
+ *
+ * attach must be the thread's first act and detach its last, both on the
+ * thread itself: the registration is thread-local, and QEMU asserts on a
+ * second registration.
+ */
+void reims_vgpu_shim_thread_attach(void *ctx);
+void reims_vgpu_shim_thread_detach(void *ctx);
+
+/*
  * Guest kernel VA -> host buffer, for MappingInternal / page-table walks.
  *
  * MUST run on a vCPU thread with current_cpu set (typically the iosfc

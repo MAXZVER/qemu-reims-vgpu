@@ -1380,6 +1380,13 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         .harvests_settled = reims_vgpu_pci_harvests_settled,
         .irq_pulse = reims_vgpu_pci_irq_pulse,
         .note_work_scope = reims_vgpu_pci_note_work_scope,
+        /*
+         * Lets the device's own worker threads read guest memory: RCU is per
+         * process and the registration touches no device state, so the shared
+         * pair is the whole answer. Without it the device starts no worker.
+         */
+        .thread_attach = reims_vgpu_shim_thread_attach,
+        .thread_detach = reims_vgpu_shim_thread_detach,
         .track_guest_writes = reims_vgpu_pci_track_guest_writes,
         .untrack_guest_writes = reims_vgpu_pci_untrack_guest_writes,
         .guest_write_gen = reims_vgpu_pci_guest_write_gen,
