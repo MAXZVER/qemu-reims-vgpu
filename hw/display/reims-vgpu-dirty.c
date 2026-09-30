@@ -62,6 +62,7 @@ typedef struct ReimsVgpuDirtySet {
     uint64_t seen_seq;
     uint64_t last_query_epoch;  /* epoch of the last generation or page read */
     uint64_t claim_epoch;       /* epoch a sync of this set is running for, or 0 */
+    uint64_t pb_claim;          /* epoch a two-phase batch pre-claimed it for, or 0 */
     uint64_t read_order;        /* read counter at this set's first read in its last epoch */
 } ReimsVgpuDirtySet;
 
@@ -201,6 +202,13 @@ struct ReimsVgpuDirty {
      * only caller is the device's harvest thread; bits are set under `lock`
      * with the claims and read back without it.
      */
+    /*
+     * Two-phase prefetch (lab A/B REIMS_VGPU_DIRTY_PB_SPLIT=on): claim every
+     * hot set, then sync and publish the first third in read order before the
+     * rest. A drain that reaches a set claimed by a running batch waits for the
+     * whole batch; the sets it reads first are the ones worth publishing early.
+     */
+    bool pb_split;
     unsigned long *pb_bits;
     uint64_t pb_nbits;
     uint64_t pb_lo, pb_hi;    /* frames that may hold a set bit: [pb_lo, pb_hi) */
@@ -1987,6 +1995,8 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                           strcmp(getenv("REIMS_VGPU_DIRTY_OD_PTICKET"), "off") == 0;
         d->od_pbatch = !(getenv("REIMS_VGPU_DIRTY_OD_PBATCH") &&      /* lab A/B */
                          strcmp(getenv("REIMS_VGPU_DIRTY_OD_PBATCH"), "off") == 0);
+        d->pb_split = getenv("REIMS_VGPU_DIRTY_PB_SPLIT") &&           /* lab A/B */
+                      strcmp(getenv("REIMS_VGPU_DIRTY_PB_SPLIT"), "on") == 0;
         d->gen_fast = !(getenv("REIMS_VGPU_DIRTY_GEN_FAST") &&        /* lab A/B */
                         strcmp(getenv("REIMS_VGPU_DIRTY_GEN_FAST"), "off") == 0);
         d->od_split = !(getenv("REIMS_VGPU_DIRTY_OD_SPLIT") &&        /* lab A/B */
@@ -2127,8 +2137,14 @@ static void reims_vgpu_dirty_pb_runs(ReimsVgpuDirty *d, int shift, GArray *runs)
     d->pb_lo = d->pb_hi = 0;
 }
 
-static void reims_vgpu_dirty_prefetch_batch(ReimsVgpuDirty *d, GArray *tokens,
-                                            uint64_t epoch)
+/*
+ * One prefetch pass over `tokens`. `preclaimed` is the second phase of a split
+ * batch: its sets were claimed for `epoch` up front, so it runs even if a newer
+ * doorbell has arrived (a claim nobody completes would park a waiting drain),
+ * and it takes the sets it pre-claimed as its own.
+ */
+static void reims_vgpu_dirty_prefetch_phase(ReimsVgpuDirty *d, GArray *tokens,
+                                            uint64_t epoch, bool preclaimed)
 {
     const int shift = qemu_target_page_bits();
     const uint64_t target = 1ULL << shift;
@@ -2146,12 +2162,14 @@ static void reims_vgpu_dirty_prefetch_batch(ReimsVgpuDirty *d, GArray *tokens,
     uint64_t setpages = 0;
 
     qemu_mutex_lock(&d->lock);
-    if (d->epoch != epoch) {
+    if (!preclaimed && d->epoch != epoch) {
         qemu_mutex_unlock(&d->lock);
         return;
     }
-    d->lab_pb_lag += pb0 - d->doorbell_ns;
-    d->lab_pb_epoch = epoch;
+    if (!preclaimed) {
+        d->lab_pb_lag += pb0 - d->doorbell_ns;
+        d->lab_pb_epoch = epoch;
+    }
     /*
      * The union of the claimed sets' pages (GPA). Pages another sync walked
      * this epoch are walked again here: a second query of a page is harmless,
@@ -2161,10 +2179,14 @@ static void reims_vgpu_dirty_prefetch_batch(ReimsVgpuDirty *d, GArray *tokens,
         uint64_t tk = g_array_index(tokens, uint64_t, t);
         ReimsVgpuDirtySet *set = g_hash_table_lookup(d->sets, &tk);
 
-        if (!set || set->synced_epoch >= epoch || set->claim_epoch >= epoch) {
+        if (!set || set->synced_epoch >= epoch) {
+            continue;
+        }
+        if (set->claim_epoch >= epoch && !(preclaimed && set->pb_claim == epoch)) {
             continue;
         }
         set->claim_epoch = epoch;
+        set->pb_claim = 0;
         g_array_append_val(claimed, tk);
         setpages += set->count * (set->page_size / target);
         reims_vgpu_dirty_pb_mark(d, set, shift);
@@ -2366,6 +2388,44 @@ static void reims_vgpu_dirty_prefetch_batch(ReimsVgpuDirty *d, GArray *tokens,
         d->lab_pb_last = pb7;
     }
     qemu_mutex_unlock(&d->lock);
+}
+
+static void reims_vgpu_dirty_prefetch_batch(ReimsVgpuDirty *d, GArray *tokens,
+                                            uint64_t epoch)
+{
+    g_autoptr(GArray) head = NULL;
+    g_autoptr(GArray) tail = NULL;
+    guint first, t;
+
+    first = d->pb_split ? MAX(4u, tokens->len / 3) : tokens->len;
+    if (first >= tokens->len) {
+        reims_vgpu_dirty_prefetch_phase(d, tokens, epoch, false);
+        return;
+    }
+    head = g_array_new(FALSE, FALSE, sizeof(uint64_t));
+    tail = g_array_new(FALSE, FALSE, sizeof(uint64_t));
+    g_array_append_vals(head, tokens->data, first);
+    qemu_mutex_lock(&d->lock);
+    if (d->epoch != epoch) {
+        qemu_mutex_unlock(&d->lock);
+        return;
+    }
+    for (t = first; t < tokens->len; t++) {
+        uint64_t tk = g_array_index(tokens, uint64_t, t);
+        ReimsVgpuDirtySet *set = g_hash_table_lookup(d->sets, &tk);
+
+        if (!set || set->synced_epoch >= epoch || set->claim_epoch >= epoch) {
+            continue;
+        }
+        set->claim_epoch = epoch;
+        set->pb_claim = epoch;
+        g_array_append_val(tail, tk);
+    }
+    qemu_mutex_unlock(&d->lock);
+    reims_vgpu_dirty_prefetch_phase(d, head, epoch, false);
+    if (tail->len) {
+        reims_vgpu_dirty_prefetch_phase(d, tail, epoch, true);
+    }
 }
 
 void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
