@@ -3064,15 +3064,29 @@ int whpx_vcpu_run(CPUState *cpu)
             /* Dynamic depending on XCR0 and XSS, so query DefaultResult */
             if (vcpu->exit_ctx.CpuidAccess.Rax == 0x07
                 && vcpu->exit_ctx.CpuidAccess.Rcx == 0) {
-                if (vcpu->exit_ctx.CpuidAccess.DefaultResultRdx
-                    & CPUID_7_0_EDX_CET_IBT) {
+                /*
+                 * CET only where the CPU model has it, not wherever the host
+                 * does. The hypervisor reports CET on a host that has it, but
+                 * this accelerator's xsave transfer sizes its buffer from
+                 * CPUID[0xD,0].ECX (user states only) and carries no
+                 * supervisor state. A guest that turns shadow stacks on --
+                 * macOS 26 does, on a Raptor Lake host -- grows the compacted
+                 * area by the CET_U/CET_S components (832 -> 872 bytes here);
+                 * every state read then fails with WHV_E_INSUFFICIENT_BUFFER
+                 * and the guest died of an unrecoverable exception minutes
+                 * later. Skylake-class models have no CET.
+                 */
+                if ((vcpu->exit_ctx.CpuidAccess.DefaultResultRdx
+                     & CPUID_7_0_EDX_CET_IBT)
+                    && (env->features[FEAT_7_0_EDX] & CPUID_7_0_EDX_CET_IBT)) {
                     reg_values[3].Reg32 |= CPUID_7_0_EDX_CET_IBT;
                 } else {
                     reg_values[3].Reg32 &= ~CPUID_7_0_EDX_CET_IBT;
                 }
 
-                if (vcpu->exit_ctx.CpuidAccess.DefaultResultRcx
-                    & CPUID_7_0_ECX_CET_SHSTK) {
+                if ((vcpu->exit_ctx.CpuidAccess.DefaultResultRcx
+                     & CPUID_7_0_ECX_CET_SHSTK)
+                    && (env->features[FEAT_7_0_ECX] & CPUID_7_0_ECX_CET_SHSTK)) {
                     reg_values[2].Reg32 |= CPUID_7_0_ECX_CET_SHSTK;
                 } else {
                     reg_values[2].Reg32 &= ~CPUID_7_0_ECX_CET_SHSTK;
