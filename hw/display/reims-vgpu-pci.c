@@ -142,6 +142,10 @@ struct ReimsVGPUPCIState {
     QemuCond harvest_cond;
     QemuCond harvest_done_cond;
     uint64_t harvest_asked;
+    /* Harvest without the BQL (lab A/B: REIMS_VGPU_HARVEST_BQL=on restores it). */
+    bool harvest_nobql;
+    /* On-demand dirty sync (default; REIMS_VGPU_DIRTY_ONDEMAND=off restores the harvest). */
+    bool dirty_ondemand;
     /* TEMP lab diagnostic: harvest cost and the drain's wait on it, per second. */
     uint64_t lab_hv_n, lab_hv_ns, lab_hv_max_ns, lab_wait_n, lab_wait_ns, lab_wait_max_ns;
     int64_t lab_hv_last;
@@ -785,9 +789,18 @@ static void *reims_vgpu_pci_harvest_thread(void *opaque)
         {
             int64_t t0 = get_clock(), dt;
 
-            bql_lock();
-            reims_vgpu_dirty_harvest(s->dirty);
-            bql_unlock();
+            if (s->harvest_nobql) {
+                /* RCU and atomic bitmap operations only; the dirty tracker takes
+                 * the BQL itself for the one MemoryRegion transaction it may
+                 * need. Held for the whole walk, the BQL stalled every vCPU exit
+                 * that needed it for ~6 ms a harvest, ~75 harvests a second.
+                 * In on-demand mode this is the prefetch of the hot sets. */
+                reims_vgpu_dirty_background(s->dirty);
+            } else {
+                bql_lock();
+                reims_vgpu_dirty_harvest(s->dirty);
+                bql_unlock();
+            }
             dt = get_clock() - t0;
             qemu_mutex_lock(&s->harvest_mutex);
             s->lab_hv_n++;
@@ -825,6 +838,16 @@ static void *reims_vgpu_pci_harvest_thread(void *opaque)
  * No per-vector masking is advertised (msi_init above), so msi_notify never
  * touches pending bits here.
  */
+/* HostOps.note_work_scope: which doorbells bind the reads that follow. */
+static void reims_vgpu_pci_note_work_scope(void *ctx, uint32_t scope)
+{
+    ReimsVGPUPCIState *s = ctx;
+
+    if (s->dirty_ondemand) {
+        reims_vgpu_dirty_note_work_scope(s->dirty, scope);
+    }
+}
+
 static int reims_vgpu_pci_irq_pulse(void *ctx, uint32_t kind)
 {
     ReimsVGPUPCIState *s = ctx;
@@ -848,7 +871,8 @@ static int reims_vgpu_pci_harvests_settled(void *ctx)
     ReimsVGPUPCIState *s = ctx;
     int settled;
 
-    if (!s->harvest_started) {
+    if (!s->harvest_started || s->dirty_ondemand) {
+        /* On demand, every generation read syncs its own set: nothing to wait for. */
         return 1;
     }
     qemu_mutex_lock(&s->harvest_mutex);
@@ -867,7 +891,7 @@ static void reims_vgpu_pci_wait_harvest(ReimsVGPUPCIState *s)
 {
     uint64_t target;
 
-    if (!s->harvest_started) {
+    if (!s->harvest_started || s->dirty_ondemand) {
         return;
     }
     qemu_mutex_lock(&s->harvest_mutex);
@@ -890,9 +914,10 @@ static void reims_vgpu_pci_wait_harvest(ReimsVGPUPCIState *s)
             fprintf(stderr, "reims-harvest epoch_ms=%" PRId64 " harvests=%" PRIu64
                     " harvest_us=%" PRIu64 " harvest_max_us=%" PRIu64
                     " waits=%" PRIu64 " wait_us=%" PRIu64 " wait_max_us=%" PRIu64
-                    "\n", g_get_real_time() / 1000, s->lab_hv_n,
+                    " nobql=%d\n", g_get_real_time() / 1000, s->lab_hv_n,
                     s->lab_hv_ns / 1000, s->lab_hv_max_ns / 1000, s->lab_wait_n,
-                    s->lab_wait_ns / 1000, s->lab_wait_max_ns / 1000);
+                    s->lab_wait_ns / 1000, s->lab_wait_max_ns / 1000,
+                    s->harvest_nobql);
             s->lab_hv_n = s->lab_hv_ns = s->lab_hv_max_ns = 0;
             s->lab_wait_n = s->lab_wait_ns = s->lab_wait_max_ns = 0;
             s->lab_hv_last = now;
@@ -1124,7 +1149,23 @@ static void reims_vgpu_pci_gfx_write(void *opaque, hwaddr offset, uint64_t data,
      * Cheap when nothing is tracked or when nothing has read a generation
      * since the last harvest, so a burst of register writes costs one sync.
      */
-    if (s->harvest_started) {
+    if (s->dirty_ondemand) {
+        /*
+         * Before the register write, as below: the epoch this bumps is what
+         * makes the next generation read of every set sync it first. The
+         * background harvest is asked only while logging is still to be turned
+         * on — its one BQL step — and nothing waits for it.
+         */
+        if (reims_vgpu_dirty_note_doorbell(
+                s->dirty,
+                reims_vgpu_qemu_gfx_write_doorbell_channel(offset, data, size)) &&
+            s->harvest_started) {
+            qemu_mutex_lock(&s->harvest_mutex);
+            s->harvest_asked++;
+            qemu_cond_signal(&s->harvest_cond);
+            qemu_mutex_unlock(&s->harvest_mutex);
+        }
+    } else if (s->harvest_started) {
         /* Asked before the write, so the drain the write wakes waits for it. */
         qemu_mutex_lock(&s->harvest_mutex);
         s->harvest_asked++;
@@ -1338,6 +1379,7 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         .map_pages_stable = 1,
         .harvests_settled = reims_vgpu_pci_harvests_settled,
         .irq_pulse = reims_vgpu_pci_irq_pulse,
+        .note_work_scope = reims_vgpu_pci_note_work_scope,
         .track_guest_writes = reims_vgpu_pci_track_guest_writes,
         .untrack_guest_writes = reims_vgpu_pci_untrack_guest_writes,
         .guest_write_gen = reims_vgpu_pci_guest_write_gen,
@@ -1389,6 +1431,22 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
     }
     {
         const char *h = getenv("REIMS_VGPU_ASYNC_HARVEST");   /* lab A/B */
+        const char *hb = getenv("REIMS_VGPU_HARVEST_BQL");     /* lab A/B */
+
+        const char *od = getenv("REIMS_VGPU_DIRTY_ONDEMAND");  /* lab A/B */
+
+        s->harvest_nobql = !(hb && strcmp(hb, "on") == 0);
+        /*
+         * Default (`off` restores the per-doorbell harvest): each generation
+         * read syncs its own set, so the drain stops waiting for a harvest per
+         * doorbell (lab: CSS scroll ~90 -> 115-120 fps, Safari scroll ~66 ->
+         * ~90). The stale tile pages this mode once left on a full-screen page
+         * were lost dirty bits, not ordering: physical_memory_set_dirty_lebitmap
+         * mis-strode unaligned ranges on LLP64 hosts, and the per-set ranges
+         * here are rarely aligned.
+         */
+        s->dirty_ondemand = !(od && strcmp(od, "off") == 0) && s->harvest_nobql;
+        reims_vgpu_dirty_set_ondemand(s->dirty, s->dirty_ondemand);
 
         if (!(h && strcmp(h, "off") == 0)) {
             qemu_thread_create(&s->harvest_thread, "reims-vgpu-pci-harvest",
