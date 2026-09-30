@@ -2107,6 +2107,13 @@ typedef struct MemoryRegionRange {
     hwaddr len;
 } MemoryRegionRange;
 
+/*
+ * Optional accelerator hook: make stores the running vCPUs have made visible to
+ * the next dirty-log sync (on WHPX, every vCPU inside WHvRunVirtualProcessor is
+ * made to exit once). NULL when the accelerator's log needs no help.
+ */
+extern void (*memory_dirty_log_flush_hook)(void);
+
 /**
  * memory_region_sync_dirty_ranges - synchronize the dirty log for ranges
  *

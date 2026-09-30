@@ -2260,6 +2260,8 @@ static void memory_region_sync_dirty_bitmap(MemoryRegion *mr, bool last_stage)
     }
 }
 
+void (*memory_dirty_log_flush_hook)(void);
+
 void memory_region_sync_dirty_ranges(MemoryRegion *mr,
                                      const MemoryRegionRange *ranges,
                                      size_t n)

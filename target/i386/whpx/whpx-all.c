@@ -47,6 +47,7 @@
 #include "emulate/x86_flags.h"
 #include "emulate/x86_mmu.h"
 #include "trace.h"
+#include "qemu/timer.h"
 
 #include <winhvplatform.h>
 
@@ -2023,6 +2024,56 @@ static void whpx_vcpu_kick_out_of_hlt(CPUState *cpu)
     }
 }
 
+/*
+ * Which vCPUs are inside WHvRunVirtualProcessor, and how many times each has
+ * come out. Read by whpx_flush_dirty_log from a device thread.
+ */
+#define WHPX_RUN_STATE_MAX 256
+static struct {
+    int in_run;
+    uint64_t exits;
+} whpx_run_state[WHPX_RUN_STATE_MAX];
+
+/*
+ * memory_dirty_log_flush_hook: make every vCPU that is running guest code exit
+ * once, and wait (bounded) until it has. A store a running vCPU made may sit in
+ * the hypervisor's per-processor log until that processor exits; a dirty-bitmap
+ * query from another thread in the meantime does not report it. A vCPU outside
+ * WHvRunVirtualProcessor has already exited since its last store.
+ */
+static void whpx_flush_dirty_log(void)
+{
+    uint64_t seq[WHPX_RUN_STATE_MAX];
+    bool wait[WHPX_RUN_STATE_MAX];
+    int max = 0, i;
+    int64_t deadline;
+    CPUState *cpu;
+
+    WITH_RCU_READ_LOCK_GUARD() {
+        CPU_FOREACH(cpu) {
+            i = cpu->cpu_index;
+            if (i < 0 || i >= WHPX_RUN_STATE_MAX) {
+                continue;
+            }
+            max = MAX(max, i + 1);
+            seq[i] = qatomic_read(&whpx_run_state[i].exits);
+            wait[i] = qatomic_read(&whpx_run_state[i].in_run) != 0;
+            if (wait[i]) {
+                whp_dispatch.WHvCancelRunVirtualProcessor(whpx_global.partition,
+                                                          i, 0);
+            }
+        }
+    }
+    deadline = get_clock() + 200 * SCALE_US;
+    for (i = 0; i < max; i++) {
+        while (wait[i] && qatomic_read(&whpx_run_state[i].exits) == seq[i] &&
+               qatomic_read(&whpx_run_state[i].in_run) &&
+               get_clock() < deadline) {
+            /* spin: exits take microseconds */
+        }
+    }
+}
+
 static void whpx_vcpu_pre_run(CPUState *cpu)
 {
     HRESULT hr;
@@ -2352,9 +2403,16 @@ int whpx_vcpu_run(CPUState *cpu)
 
         whpx_inject_exceptions(cpu);
 
+        if (cpu->cpu_index < WHPX_RUN_STATE_MAX) {
+            qatomic_set(&whpx_run_state[cpu->cpu_index].in_run, 1);
+        }
         hr = whp_dispatch.WHvRunVirtualProcessor(
             whpx->partition, cpu->cpu_index,
             &vcpu->exit_ctx, sizeof(vcpu->exit_ctx));
+        if (cpu->cpu_index < WHPX_RUN_STATE_MAX) {
+            qatomic_inc(&whpx_run_state[cpu->cpu_index].exits);
+            qatomic_set(&whpx_run_state[cpu->cpu_index].in_run, 0);
+        }
 
         if (FAILED(hr)) {
             error_report("WHPX: Failed to exec a virtual processor,"
@@ -3484,6 +3542,7 @@ int whpx_accel_init(AccelState *as, MachineState *ms)
         goto error;
     }
 
+    memory_dirty_log_flush_hook = whpx_flush_dirty_log;
     hr = whp_dispatch.WHvSetupPartition(whpx->partition);
     if (FAILED(hr)) {
         error_report("WHPX: Failed to setup partition, hr=%08lx", hr);
