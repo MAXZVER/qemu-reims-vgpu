@@ -47,12 +47,46 @@ static void os_undo_timer_resolution(void)
     timeEndPeriod(mm_tc.wPeriodMin);
 }
 
+/*
+ * Keep the timer resolution asked for above, and full execution speed, when
+ * our windows are hidden.
+ *
+ * Since Windows 11 the system stops honouring a process's timeBeginPeriod()
+ * once none of its windows is visible (occluded, minimised) and falls back to
+ * the 15.6 ms default tick, and may run the process under EcoQoS. Every
+ * sub-tick wait in QEMU then rounds up to 15.6 ms: a device thread polling
+ * every 4 ms runs at 64 Hz. With reims-vgpu that is the display VBL, and a
+ * macOS guest whose display comes up while the QEMU window is covered latches
+ * its compositor to ~60 Hz for the whole boot (measured: 64.3 Hz delivered
+ * against 120 Hz on boots where the window happened to be visible).
+ *
+ * Opting out is per process and needs no privilege; on older Windows the call
+ * fails harmlessly.
+ */
+static void os_keep_timer_resolution(void)
+{
+    const char *off = getenv("QEMU_WIN_TIMER_THROTTLE_OK");   /* lab A/B */
+    PROCESS_POWER_THROTTLING_STATE state = {
+        .Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        .ControlMask = PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION |
+                       PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        .StateMask = 0,     /* honour timer requests; no EcoQoS */
+    };
+
+    if (off && strcmp(off, "1") == 0) {
+        return;
+    }
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
+                          &state, sizeof(state));
+}
+
 void os_setup_early_signal_handling(void)
 {
     SetConsoleCtrlHandler(qemu_ctrl_handler, TRUE);
     timeGetDevCaps(&mm_tc, sizeof(mm_tc));
     timeBeginPeriod(mm_tc.wPeriodMin);
     atexit(os_undo_timer_resolution);
+    os_keep_timer_resolution();
 }
 
 void os_set_line_buffering(void)
