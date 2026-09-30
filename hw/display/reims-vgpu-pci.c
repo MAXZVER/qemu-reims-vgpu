@@ -912,16 +912,28 @@ static void *reims_vgpu_pci_drain_thread(void *opaque)
  * BH; Rust owns pacing and protocol state, while the BH remains the sole
  * HostAction applier.
  */
-#define REIMS_VGPU_PCI_HEARTBEAT_MS 4
+/*
+ * 1 ms, not 4: the limiter's catch-up grid only phase-locks when polls land
+ * well inside the 8.33 ms interval, and a Windows host's 4 ms condvar waits
+ * (plus the poll's own maintenance) drifted past it often enough that CSS
+ * animation sat at ~95 fps median; at 1 ms it reads ~106-112 on the same host.
+ */
+#define REIMS_VGPU_PCI_HEARTBEAT_MS 1
 
 static void *reims_vgpu_pci_heartbeat_thread(void *opaque)
 {
     ReimsVGPUPCIState *s = opaque;
 
+    int period_ms = REIMS_VGPU_PCI_HEARTBEAT_MS;
+    const char *hb = getenv("REIMS_VGPU_HEARTBEAT_MS");   /* lab A/B */
+
+    if (hb && atoi(hb) >= 1 && atoi(hb) <= 16) {
+        period_ms = atoi(hb);
+    }
     qemu_mutex_lock(&s->heartbeat_mutex);
     while (!s->heartbeat_stopping) {
         qemu_cond_timedwait(&s->heartbeat_cond, &s->heartbeat_mutex,
-                            REIMS_VGPU_PCI_HEARTBEAT_MS);
+                            period_ms);
         if (s->heartbeat_stopping) {
             break;
         }
