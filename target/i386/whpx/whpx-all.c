@@ -1049,10 +1049,261 @@ static int emulate_msr_instruction(CPUState *cpu,
     return 0;
 }
 
+/*
+ * Exit statistics, enabled with QEMU_WHPX_STATS=1: per exit-reason counts and
+ * handling time, time spent waiting for the BQL on the MMIO and pre-run paths,
+ * and the hottest MMIO pages. One line a second on stderr, emitted by whichever
+ * vCPU thread notices the second has passed. The counters race benignly; they
+ * are for attribution, not accounting.
+ */
+enum {
+    WS_MMIO, WS_MMIOF, WS_PIO, WS_IRQWIN, WS_EOI, WS_HALT, WS_CANCEL, WS_MSR,
+    WS_CPUID, WS_EXC, WS_OTHER, WS_NR
+};
+static const char *const whpx_stats_names[WS_NR] = {
+    "mmio", "mmiof", "pio", "irqwin", "eoi", "halt", "cancel", "msr", "cpuid",
+    "exc", "other"
+};
+#define WHPX_STATS_PAGES 64
+static struct {
+    int enabled;                          /* -1 unknown, 0 off, 1 on */
+    uint64_t count[WS_NR], ns[WS_NR];
+    uint64_t mmio_bql_ns, prerun_bql_ns, prerun_n, run_ns;
+    uint64_t page[WHPX_STATS_PAGES], hits[WHPX_STATS_PAGES];
+    int64_t last_print;
+    QemuMutex lock;
+} whpx_stats = { .enabled = -1 };
+
+static bool whpx_stats_on(void)
+{
+    if (qatomic_read(&whpx_stats.enabled) < 0) {
+        const char *v = g_getenv("QEMU_WHPX_STATS");
+        qemu_mutex_init(&whpx_stats.lock);
+        whpx_stats.last_print = get_clock();
+        qatomic_set(&whpx_stats.enabled, v && *v && strcmp(v, "0") != 0);
+    }
+    return qatomic_read(&whpx_stats.enabled) > 0;
+}
+
+/* QEMU_WHPX_MMIO_FAST=0 turns whpx_mmio_fast_load off, for A/B runs. */
+static bool whpx_mmio_fast_path(void)
+{
+    static int on = -1;
+
+    if (qatomic_read(&on) < 0) {
+        const char *v = g_getenv("QEMU_WHPX_MMIO_FAST");
+        qatomic_set(&on, !(v && strcmp(v, "0") == 0));
+    }
+    return qatomic_read(&on) > 0;
+}
+
+/*
+ * QEMU_WHPX_PRERUN_FAST=1 lets a pre-run with nothing pending skip the BQL.
+ * Opt-in: no frame-rate gain has been measured through the guest's bimodal
+ * 60/120 Hz latch yet, and one of four boots with it on hung in OpenCore
+ * (cause not established).
+ */
+static bool whpx_prerun_fast_path(void)
+{
+    static int on = -1;
+
+    if (qatomic_read(&on) < 0) {
+        const char *v = g_getenv("QEMU_WHPX_PRERUN_FAST");
+        qatomic_set(&on, v && strcmp(v, "1") == 0);
+    }
+    return qatomic_read(&on) > 0;
+}
+
+static int whpx_stats_bucket(WHV_RUN_VP_EXIT_REASON reason)
+{
+    switch (reason) {
+    case WHvRunVpExitReasonMemoryAccess: return WS_MMIO;
+    case WHvRunVpExitReasonX64IoPortAccess: return WS_PIO;
+    case WHvRunVpExitReasonX64InterruptWindow: return WS_IRQWIN;
+    case WHvRunVpExitReasonX64ApicEoi: return WS_EOI;
+    case WHvRunVpExitReasonX64Halt: return WS_HALT;
+    case WHvRunVpExitReasonCanceled: return WS_CANCEL;
+    case WHvRunVpExitReasonX64MsrAccess: return WS_MSR;
+    case WHvRunVpExitReasonX64Cpuid: return WS_CPUID;
+    case WHvRunVpExitReasonException: return WS_EXC;
+    default: return WS_OTHER;
+    }
+}
+
+static void whpx_stats_mmio_page(uint64_t gpa)
+{
+    /* exact register address: the hot set is a handful of registers */
+    uint64_t pg = gpa;
+    unsigned i, slot = (unsigned)(pg * 0x9E3779B97F4A7C15ULL >> 58);
+
+    qemu_mutex_lock(&whpx_stats.lock);
+    for (i = 0; i < WHPX_STATS_PAGES; i++) {
+        unsigned s = (slot + i) % WHPX_STATS_PAGES;
+        if (whpx_stats.hits[s] == 0 || whpx_stats.page[s] == pg) {
+            whpx_stats.page[s] = pg;
+            whpx_stats.hits[s]++;
+            break;
+        }
+    }
+    qemu_mutex_unlock(&whpx_stats.lock);
+}
+
+static void whpx_stats_maybe_print(void)
+{
+    int64_t now = get_clock(), last = qatomic_read(&whpx_stats.last_print);
+    GString *s;
+    unsigned i, top[5] = {0};
+    uint64_t best[5] = {0};
+
+    if (now - last < NANOSECONDS_PER_SECOND ||
+        qatomic_cmpxchg(&whpx_stats.last_print, last, now) != last) {
+        return;
+    }
+    s = g_string_new("whpx-stats");
+    g_string_append_printf(s, " epoch_ms=%" PRId64 " win_ms=%" PRId64,
+                           g_get_real_time() / 1000, (now - last) / 1000000);
+    qemu_mutex_lock(&whpx_stats.lock);
+    for (i = 0; i < WS_NR; i++) {
+        if (whpx_stats.count[i]) {
+            g_string_append_printf(s, " %s=%" PRIu64 "/%" PRIu64 "us", whpx_stats_names[i],
+                                   whpx_stats.count[i], whpx_stats.ns[i] / 1000);
+        }
+        whpx_stats.count[i] = whpx_stats.ns[i] = 0;
+    }
+    g_string_append_printf(s, " run_ms=%" PRIu64 " mmio_bql_us=%" PRIu64
+                           " prerun_bql_us=%" PRIu64 " prerun_n=%" PRIu64,
+                           whpx_stats.run_ns / 1000000, whpx_stats.mmio_bql_ns / 1000,
+                           whpx_stats.prerun_bql_ns / 1000, whpx_stats.prerun_n);
+    whpx_stats.run_ns = whpx_stats.mmio_bql_ns = whpx_stats.prerun_bql_ns = 0;
+    whpx_stats.prerun_n = 0;
+    for (i = 0; i < WHPX_STATS_PAGES; i++) {
+        unsigned k, j;
+        for (k = 0; k < 5 && whpx_stats.hits[i] <= best[k]; k++) {
+        }
+        if (k < 5) {
+            for (j = 4; j > k; j--) {
+                best[j] = best[j - 1];
+                top[j] = top[j - 1];
+            }
+            best[k] = whpx_stats.hits[i];
+            top[k] = i;
+        }
+    }
+    g_string_append(s, " mmio_addrs=");
+    for (i = 0; i < 5 && best[i]; i++) {
+        g_string_append_printf(s, "%s0x%" PRIx64 ":%" PRIu64, i ? "," : "",
+                               whpx_stats.page[top[i]], best[i]);
+    }
+    memset(whpx_stats.hits, 0, sizeof(whpx_stats.hits));
+    qemu_mutex_unlock(&whpx_stats.lock);
+    fprintf(stderr, "%s\n", s->str);
+    g_string_free(s, true);
+}
+
+/*
+ * Fast path for the MMIO shape that dominates a busy guest: a plain register
+ * load, mov r32/r64 <- [mem], from a region that declared lockless I/O. The
+ * generic path fetches all GPRs, re-derives the linear address from the ModRM
+ * operand (segment and control-register reads plus a guest page walk, each a
+ * hypercall or several) and writes the GPRs back, about 8 us per exit here --
+ * for an address the exit context already carries as a GPA. This path makes
+ * one hypercall: the store of the loaded value and the advanced RIP.
+ *
+ * Deliberately narrow: 64-bit code, opcode 8B with at most a REX prefix, so
+ * the destination write is a whole-register (zero-extending) store and the
+ * instruction length follows from ModRM/SIB/displacement alone. Anything else,
+ * and every region that still needs the BQL, takes the generic path.
+ */
+static bool whpx_mmio_fast_load(CPUState *cpu,
+                                const WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
+{
+    const WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
+    const WHV_VP_EXIT_CONTEXT *vp = &exit_ctx->VpContext;
+    const uint8_t *b = ctx->InstructionBytes;
+    unsigned n = ctx->InstructionByteCount, i = 0, rex = 0, disp;
+    unsigned modrm, mod, rm, size;
+    MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+    WHV_REGISTER_NAME names[2];
+    WHV_REGISTER_VALUE values[2] = {};
+    MemoryRegion *mr;
+    hwaddr xlat, len;
+    uint64_t val = 0;
+    HRESULT hr;
+
+    if (ctx->AccessInfo.AccessType != WHvMemoryAccessRead ||
+        !vp->ExecutionState.EferLma || !vp->Cs.Long ||
+        vp->ExecutionState.InterruptionPending || (vp->Rflags & TF_MASK)) {
+        return false;
+    }
+    if (i < n && (b[i] & 0xf0) == 0x40) {
+        rex = b[i++];
+    }
+    if (i + 2 > n || b[i] != 0x8b) {
+        return false;
+    }
+    modrm = b[i + 1];
+    i += 2;
+    mod = modrm >> 6;
+    rm = modrm & 7;
+    if (mod == 3) {
+        return false;
+    }
+    disp = mod == 1 ? 1 : mod == 2 ? 4 : 0;
+    if (rm == 4) {
+        if (i >= n) {
+            return false;
+        }
+        if (mod == 0 && (b[i] & 7) == 5) {
+            disp = 4;                   /* SIB, no base: disp32 */
+        }
+        i++;
+    } else if (mod == 0 && rm == 5) {
+        disp = 4;                       /* RIP-relative */
+    }
+    i += disp;
+    if (i > n) {
+        return false;
+    }
+    size = (rex & 8) ? 8 : 4;
+
+    RCU_READ_LOCK_GUARD();
+    len = size;
+    mr = address_space_translate(&address_space_memory, ctx->Gpa, &xlat, &len,
+                                 false, attrs);
+    if (!mr->lockless_io || len < size ||
+        memory_access_is_direct(mr, false, attrs)) {
+        return false;
+    }
+    /* Past here the device has seen the read; the access must complete. */
+    memory_region_dispatch_read(mr, xlat, &val, size_memop(size), attrs);
+
+    names[0] = (WHV_REGISTER_NAME)(WHvX64RegisterRax +
+                                   (((modrm >> 3) & 7) | ((rex & 4) << 1)));
+    values[0].Reg64 = size == 4 ? (uint32_t)val : val;
+    names[1] = WHvX64RegisterRip;
+    values[1].Reg64 = vp->Rip + i;
+    hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
+        whpx_global.partition, cpu->cpu_index, names, 2, values);
+    if (FAILED(hr)) {
+        error_report("WHPX: fast MMIO load: failed to set registers, "
+                     "hr=%08lx", hr);
+    }
+    return true;
+}
+
 static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
 {
     WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
     int ret;
+
+    cpu->accel->mmio_fast = whpx_mmio_fast_path() &&
+                            whpx_mmio_fast_load(cpu, exit_ctx);
+    if (cpu->accel->mmio_fast) {
+        if (whpx_stats_on()) {
+            whpx_stats_mmio_page(ctx->Gpa);
+        }
+        return 0;
+    }
 
     /*
      * Device MMIO handlers run under the BQL in every other accelerator
@@ -1063,7 +1314,14 @@ static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
      * takes the BQL itself, so this cannot recurse, and every caller is a
      * vCPU thread outside the BQL.
      */
-    bql_lock();
+    if (whpx_stats_on()) {
+        int64_t t0 = get_clock();
+        bql_lock();
+        qatomic_add(&whpx_stats.mmio_bql_ns, get_clock() - t0);
+        whpx_stats_mmio_page(ctx->Gpa);
+    } else {
+        bql_lock();
+    }
     ret = emulate_instruction(cpu, ctx->InstructionBytes, ctx->InstructionByteCount);
     bql_unlock();
     if (ret < 0) {
@@ -2092,7 +2350,30 @@ static void whpx_vcpu_pre_run(CPUState *cpu)
     memset(&new_int, 0, sizeof(new_int));
     memset(reg_values, 0, sizeof(reg_values));
 
-    bql_lock();
+    /*
+     * With the APIC in the hypervisor, every step below acts on a pending
+     * interrupt_request bit (NMI/SMI, INIT/TPR, HARD) and does nothing without
+     * one, yet it took the BQL on every exit to find that out -- so a device
+     * handler holding the BQL for milliseconds (a dirty-log sync) stalled
+     * every vCPU at its next exit. With no bit pending there is nothing to
+     * inject and no register to set. A bit raised after this read is
+     * followed by a kick, which cancels the run this returns to, exactly as
+     * one raised after the unlock below always could be.
+     */
+    if (whpx_prerun_fast_path() && whpx_irqchip_in_kernel() &&
+        !cpu_test_interrupt(cpu, ~0)) {
+        vcpu->ready_for_pic_interrupt = false;
+        return;
+    }
+
+    if (whpx_stats_on()) {
+        int64_t t0 = get_clock();
+        bql_lock();
+        qatomic_add(&whpx_stats.prerun_bql_ns, get_clock() - t0);
+        qatomic_inc(&whpx_stats.prerun_n);
+    } else {
+        bql_lock();
+    }
 
     /* Inject NMI */
     if (!vcpu->interruption_pending &&
@@ -2403,6 +2684,7 @@ int whpx_vcpu_run(CPUState *cpu)
 
         whpx_inject_exceptions(cpu);
 
+        int64_t stats_t_run = whpx_stats_on() ? get_clock() : 0;
         if (cpu->cpu_index < WHPX_RUN_STATE_MAX) {
             qatomic_set(&whpx_run_state[cpu->cpu_index].in_run, 1);
         }
@@ -2412,6 +2694,10 @@ int whpx_vcpu_run(CPUState *cpu)
         if (cpu->cpu_index < WHPX_RUN_STATE_MAX) {
             qatomic_inc(&whpx_run_state[cpu->cpu_index].exits);
             qatomic_set(&whpx_run_state[cpu->cpu_index].in_run, 0);
+        }
+        int64_t stats_t_exit = stats_t_run ? get_clock() : 0;
+        if (stats_t_run) {
+            qatomic_add(&whpx_stats.run_ns, stats_t_exit - stats_t_run);
         }
 
         if (FAILED(hr)) {
@@ -2890,6 +3176,15 @@ int whpx_vcpu_run(CPUState *cpu)
             break;
         }
 
+        if (stats_t_exit) {
+            int b = whpx_stats_bucket(vcpu->exit_ctx.ExitReason);
+            if (b == WS_MMIO && vcpu->mmio_fast) {
+                b = WS_MMIOF;
+            }
+            qatomic_inc(&whpx_stats.count[b]);
+            qatomic_add(&whpx_stats.ns[b], get_clock() - stats_t_exit);
+            whpx_stats_maybe_print();
+        }
     } while (!ret);
 
     if (stepped_over_bp) {
