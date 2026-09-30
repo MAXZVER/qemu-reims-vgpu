@@ -331,6 +331,13 @@ static void whpx_apic_realize(DeviceState *dev, Error **errp)
 
     memory_region_init_io(&s->io_memory, OBJECT(s), &whpx_apic_io_ops, s,
                           "whpx-apic-msi", APIC_SPACE_SIZE);
+    /*
+     * A write here is an MSI, and delivering it is one WHvRequestInterrupt
+     * built from the written address and data alone — no APIC state lives in
+     * QEMU for it to race on. So a device thread may raise an MSI without the
+     * BQL, which is what lets it signal completion without a main-loop hop.
+     */
+    memory_region_enable_lockless_io(&s->io_memory);
 
     msi_nonbroken = true;
 }

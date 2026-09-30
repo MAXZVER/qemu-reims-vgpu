@@ -29,6 +29,7 @@
 #include "system/memory.h"
 #include "system/ramblock.h"
 #include "system/runstate.h"
+#include "system/whpx.h"
 #include "ui/console.h"
 #include "ui/surface.h"
 #include "trace.h"
@@ -149,6 +150,8 @@ struct ReimsVGPUPCIState {
     bool harvest_started;
     /* The drain was told "not settled" and left work; wake it on catch-up. */
     bool harvest_rearm;
+    /* HostOps.irq_pulse may raise MSIs off the BQL (lab A/B: REIMS_VGPU_IRQ_DIRECT=on). */
+    bool irq_direct;
     Notifier shutdown_notifier;
     bool shutdown_notifier_registered;
 };
@@ -809,6 +812,36 @@ static void *reims_vgpu_pci_harvest_thread(void *opaque)
     return NULL;
 }
 
+/*
+ * HostOps.irq_pulse: raise the device's MSI from the calling thread, which may
+ * be the drain holding the device lock without the BQL.
+ *
+ * Only where the delivery takes no lock at all. Under WHPX with the in-kernel
+ * irqchip, msi_notify ends in a write to the WHPX APIC's MSI region, which is
+ * lockless and injects with WHvRequestInterrupt; anywhere else the MMIO
+ * dispatch would take the BQL inside this call, and a caller holding the device
+ * lock would then deadlock against a vCPU that holds the BQL and waits for it.
+ * Those hosts answer 0 and the pulse is queued for the action BH as before.
+ * No per-vector masking is advertised (msi_init above), so msi_notify never
+ * touches pending bits here.
+ */
+static int reims_vgpu_pci_irq_pulse(void *ctx, uint32_t kind)
+{
+    ReimsVGPUPCIState *s = ctx;
+    PCIDevice *pdev = PCI_DEVICE(s);
+
+    if (!s->irq_direct || !whpx_enabled() || !whpx_irqchip_in_kernel() ||
+        !msi_enabled(pdev)) {
+        return 0;
+    }
+    if (kind != REIMS_VGPU_HOST_ACTION_IRQ_GFX &&
+        kind != REIMS_VGPU_HOST_ACTION_IRQ_IOSFC) {
+        return 0;
+    }
+    msi_notify(pdev, 0);
+    return 1;
+}
+
 /* HostOps.harvests_settled: never blocks; the harvest mutex is a leaf lock. */
 static int reims_vgpu_pci_harvests_settled(void *ctx)
 {
@@ -1304,6 +1337,7 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
          */
         .map_pages_stable = 1,
         .harvests_settled = reims_vgpu_pci_harvests_settled,
+        .irq_pulse = reims_vgpu_pci_irq_pulse,
         .track_guest_writes = reims_vgpu_pci_track_guest_writes,
         .untrack_guest_writes = reims_vgpu_pci_untrack_guest_writes,
         .guest_write_gen = reims_vgpu_pci_guest_write_gen,
@@ -1343,6 +1377,16 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         return;
     }
     s->rust_handle = out.handle;
+    {
+        const char *d = getenv("REIMS_VGPU_IRQ_DIRECT");   /* lab A/B */
+
+        /*
+         * Opt-in: with the 1 ms heartbeat the direct pulse lost to the action
+         * BH on the same host (vCPUs waited ~70% longer for the BQL in prerun
+         * and the guest's kernel_task doubled), so it stays a lab arm.
+         */
+        s->irq_direct = d && strcmp(d, "on") == 0;
+    }
     {
         const char *h = getenv("REIMS_VGPU_ASYNC_HARVEST");   /* lab A/B */
 
