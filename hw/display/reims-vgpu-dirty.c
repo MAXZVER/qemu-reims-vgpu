@@ -775,7 +775,15 @@ ReimsVgpuDirty *reims_vgpu_dirty_new(void)
 
     qemu_mutex_init(&d->lock);
     qemu_mutex_init(&d->sets_lock);
-    d->od_hot = 6;
+    /*
+     * 24 (was 6): a set read once a frame spans ~5.5 doorbell epochs at 5K
+     * drag, so 6 left 97 % of the foreground syncs cold — chiefly the GVA
+     * store witness of every layer Store (gva_store_witness::note_store,
+     * ~2300 hypervisor queries/s on the drain at ~23 us each). At 24 the
+     * prefetch workers sync them ahead: fg 2250 -> 660/s, drag 99.1/99.0 ->
+     * 101.8/102.0 Hz (ftc*, 2026-10-02). REIMS_VGPU_DIRTY_OD_HOT overrides.
+     */
+    d->od_hot = 24;
     qemu_cond_init(&d->synced_cond);
     qemu_cond_init(&d->od_work_cond);
     qemu_cond_init(&d->q_cond);
@@ -4132,7 +4140,7 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
          * a lab switch that turns it back off.
          */
         d->od_hot = getenv("REIMS_VGPU_DIRTY_OD_HOT") ?                /* lab A/B */
-                    MAX(1, atoi(getenv("REIMS_VGPU_DIRTY_OD_HOT"))) : 6;
+                    MAX(1, atoi(getenv("REIMS_VGPU_DIRTY_OD_HOT"))) : 24;
         d->od_splitwait = !(getenv("REIMS_VGPU_DIRTY_OD_SPLITWAIT") && /* lab A/B */
                             strcmp(getenv("REIMS_VGPU_DIRTY_OD_SPLITWAIT"), "off") == 0);
         d->od_nopticket = getenv("REIMS_VGPU_DIRTY_OD_PTICKET") &&    /* lab A/B */
