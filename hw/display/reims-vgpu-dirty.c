@@ -444,6 +444,21 @@ struct ReimsVgpuDirty {
      */
     uint32_t bigsplit_mode;
     uint64_t lab_bigsplit_sets;
+    /*
+     * REIMS_VGPU_LAB_DIRTY_BIGPHASE=on: the batch walks its sets in read order
+     * as phases instead of one union: every set of at least `period_big` pages
+     * is a phase of its own (split across the pool like any batch, published as
+     * soon as its pieces are in), and the small sets between two big ones form
+     * one phase. A big set's phase claims it without `bclaim`, so a drain that
+     * reaches it mid-phase waits for (and helps with) that one set rather than
+     * querying the same pages beside it; a set a later phase has not reached yet
+     * is unclaimed, and a drain that needs it first syncs it itself, which that
+     * phase then skips. The single union published ~1.9 ms after its doorbell
+     * (5K light scene, median) while the drain reached the full-screen sets
+     * after ~1.5 ms (a quarter of them before 0.6 ms).
+     */
+    uint32_t bigphase_mode;
+    uint64_t lab_bigphase_big, lab_bigphase_groups;
     uint64_t lab_period_skipped, lab_period_taken;
     uint64_t lab_hole_closed;
     /*
@@ -3160,7 +3175,8 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                     " gen_fast=%" PRIu64 " db_coalesced=%" PRIu64 " gen_lagged=%" PRIu64
                     " period=%u period_skipped=%" PRIu64 " period_taken=%" PRIu64
                     " bigsplit=%u bigsplit_sets=%" PRIu64 " rsettle=%u rs_waits=%" PRIu64
-                    " rs_skipped=%" PRIu64 "\n",
+                    " rs_skipped=%" PRIu64 " bigphase=%u bp_big=%" PRIu64
+                    " bp_groups=%" PRIu64 "\n",
                     g_get_real_time() / 1000, d->lab_od_n, d->lab_od_ns / 1000,
                     d->lab_od_pages, d->lab_od_skipped, d->lab_od_epochs,
                     d->lab_od_fg_n, d->lab_od_fg_ns / 1000, d->lab_ph_wait / 1000,
@@ -3171,8 +3187,10 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                     qatomic_xchg(&d->lab_gen_lagged, 0), d->period_mode,
                     d->lab_period_skipped, d->lab_period_taken,
                     d->bigsplit_mode, d->lab_bigsplit_sets, d->rsettle_mode,
-                    d->lab_rs_waits, d->lab_rs_skipped);
+                    d->lab_rs_waits, d->lab_rs_skipped, d->bigphase_mode,
+                    d->lab_bigphase_big, d->lab_bigphase_groups);
             d->lab_rs_waits = d->lab_rs_skipped = 0;
+            d->lab_bigphase_big = d->lab_bigphase_groups = 0;
             d->lab_period_skipped = d->lab_period_taken = 0;
             d->lab_bigsplit_sets = 0;
             d->lab_db_coalesced = 0;
@@ -3379,6 +3397,9 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                          strcmp(getenv("REIMS_VGPU_LAB_DIRTY_PERIOD"), "on") == 0;
         d->rsettle_mode = getenv("REIMS_VGPU_LAB_DIRTY_RSETTLE") &&     /* lab A/B */
                           strcmp(getenv("REIMS_VGPU_LAB_DIRTY_RSETTLE"), "on") == 0;
+        /* On by default (2026-10-01, 5K light: drain busy 915/982 -> 786/801 ms/s). */
+        d->bigphase_mode = !(getenv("REIMS_VGPU_LAB_DIRTY_BIGPHASE") &&   /* lab A/B */
+                             strcmp(getenv("REIMS_VGPU_LAB_DIRTY_BIGPHASE"), "off") == 0);
         d->bigsplit_mode = getenv("REIMS_VGPU_LAB_DIRTY_BIGSPLIT") &&   /* lab A/B */
                            strcmp(getenv("REIMS_VGPU_LAB_DIRTY_BIGSPLIT"), "on") == 0;
         d->period_big = getenv("REIMS_VGPU_LAB_DIRTY_PERIOD_BIG") ?
@@ -3554,7 +3575,8 @@ static void reims_vgpu_dirty_pb_runs(ReimsVgpuDirty *d, int shift, GArray *runs)
  * and it takes the sets it pre-claimed as its own.
  */
 static void reims_vgpu_dirty_prefetch_phase(ReimsVgpuDirty *d, GArray *tokens,
-                                            uint64_t epoch, bool preclaimed)
+                                            uint64_t epoch, bool preclaimed,
+                                            bool no_steal)
 {
     const int shift = qemu_target_page_bits();
     const uint64_t target = 1ULL << shift;
@@ -3596,7 +3618,7 @@ static void reims_vgpu_dirty_prefetch_phase(ReimsVgpuDirty *d, GArray *tokens,
             continue;
         }
         set->claim_epoch = epoch;
-        set->bclaim = epoch;
+        set->bclaim = no_steal ? 0 : epoch;   /* lab BIGPHASE: a big set's own phase is waited for */
         set->pb_claim = 0;
         d->epoch_queried = true;
         g_array_append_val(claimed, tk);
@@ -3840,7 +3862,7 @@ static void reims_vgpu_dirty_prefetch_batch(ReimsVgpuDirty *d, GArray *tokens,
 
     first = d->pb_split ? MAX(4u, tokens->len / 3) : tokens->len;
     if (first >= tokens->len) {
-        reims_vgpu_dirty_prefetch_phase(d, tokens, epoch, false);
+        reims_vgpu_dirty_prefetch_phase(d, tokens, epoch, false, false);
         return;
     }
     head = g_array_new(FALSE, FALSE, sizeof(uint64_t));
@@ -3865,9 +3887,53 @@ static void reims_vgpu_dirty_prefetch_batch(ReimsVgpuDirty *d, GArray *tokens,
         g_array_append_val(tail, tk);
     }
     qemu_mutex_unlock(&d->lock);
-    reims_vgpu_dirty_prefetch_phase(d, head, epoch, false);
+    reims_vgpu_dirty_prefetch_phase(d, head, epoch, false, false);
     if (tail->len) {
-        reims_vgpu_dirty_prefetch_phase(d, tail, epoch, true);
+        reims_vgpu_dirty_prefetch_phase(d, tail, epoch, true, false);
+    }
+}
+
+/* Lab BIGPHASE: the batch as read-ordered phases (see `bigphase_mode`). */
+static void reims_vgpu_dirty_prefetch_phased(ReimsVgpuDirty *d, GArray *tokens,
+                                             uint64_t epoch)
+{
+    g_autoptr(GArray) group = g_array_new(FALSE, FALSE, sizeof(uint64_t));
+    g_autoptr(GArray) one = g_array_new(FALSE, FALSE, sizeof(uint64_t));
+    g_autofree bool *big = g_new0(bool, MAX(tokens->len, 1));
+    guint t;
+
+    qemu_mutex_lock(&d->lock);
+    for (t = 0; t < tokens->len; t++) {
+        uint64_t tk = g_array_index(tokens, uint64_t, t);
+        ReimsVgpuDirtySet *set = g_hash_table_lookup(d->sets, &tk);
+
+        big[t] = set && set->count * (set->page_size >> qemu_target_page_bits()) >=
+                        d->period_big;
+    }
+    qemu_mutex_unlock(&d->lock);
+    for (t = 0; t < tokens->len; t++) {
+        uint64_t tk = g_array_index(tokens, uint64_t, t);
+
+        if (qatomic_read(&d->epoch) != epoch) {
+            return;   /* a newer doorbell's prefetch takes over */
+        }
+        if (!big[t]) {
+            g_array_append_val(group, tk);
+            continue;
+        }
+        if (group->len) {
+            reims_vgpu_dirty_prefetch_phase(d, group, epoch, false, false);
+            g_array_set_size(group, 0);
+            d->lab_bigphase_groups++;
+        }
+        g_array_set_size(one, 0);
+        g_array_append_val(one, tk);
+        reims_vgpu_dirty_prefetch_phase(d, one, epoch, false, true);
+        d->lab_bigphase_big++;
+    }
+    if (group->len && qatomic_read(&d->epoch) == epoch) {
+        reims_vgpu_dirty_prefetch_phase(d, group, epoch, false, false);
+        d->lab_bigphase_groups++;
     }
 }
 
@@ -3951,6 +4017,11 @@ void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
         if (small->len) {
             reims_vgpu_dirty_prefetch_batch(d, small, epoch);
         }
+        return;
+    }
+    if (d->od_pbatch && d->bigphase_mode) {
+        qemu_mutex_unlock(&d->lock);
+        reims_vgpu_dirty_prefetch_phased(d, tokens, epoch);
         return;
     }
     if (d->od_pbatch) {
