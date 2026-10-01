@@ -1070,10 +1070,66 @@ static struct {
     int enabled;                          /* -1 unknown, 0 off, 1 on */
     uint64_t count[WS_NR], ns[WS_NR];
     uint64_t mmio_bql_ns, prerun_bql_ns, prerun_n, run_ns;
+    uint64_t run_ecore_ns;                /* TEMP lab: guest run time ending on an efficiency core */
     uint64_t page[WHPX_STATS_PAGES], hits[WHPX_STATS_PAGES];
     int64_t last_print;
     QemuMutex lock;
 } whpx_stats = { .enabled = -1 };
+
+/*
+ * TEMP lab: whether the calling thread is on an efficiency core of a hybrid CPU
+ * (i7-14700K: 8 performance cores with two threads each, 12 efficiency cores).
+ * From the OS CPU-set table, once: EfficiencyClass below the highest is efficiency.
+ */
+#if _WIN32_WINNT < 0x0A00   /* declared only for Windows 10 targets; present since Windows 10 */
+WINBASEAPI WINBOOL WINAPI GetSystemCpuSetInformation(PSYSTEM_CPU_SET_INFORMATION Information,
+                                                     ULONG BufferLength, PULONG ReturnedLength,
+                                                     HANDLE Process, ULONG Flags);
+#endif
+
+static bool whpx_on_ecore(void)
+{
+    static uint8_t ecore[256];
+    static int built;   /* 0 no, 1 building, 2 yes */
+
+    if (qatomic_read(&built) != 2) {
+        if (qatomic_cmpxchg(&built, 0, 1) == 0) {
+            ULONG need = 0;
+            uint8_t *buf;
+            uint8_t maxc = 0;
+            size_t off;
+
+            GetSystemCpuSetInformation(NULL, 0, &need, NULL, 0);
+            buf = need ? g_malloc0(need) : NULL;
+            if (buf && GetSystemCpuSetInformation((PSYSTEM_CPU_SET_INFORMATION)buf, need, &need,
+                                                  NULL, 0)) {
+                for (off = 0; off + 19 <= need;) {
+                    PSYSTEM_CPU_SET_INFORMATION r = (PSYSTEM_CPU_SET_INFORMATION)(buf + off);
+                    if (!r->Size) {
+                        break;
+                    }
+                    maxc = MAX(maxc, r->CpuSet.EfficiencyClass);
+                    off += r->Size;
+                }
+                for (off = 0; off + 19 <= need;) {
+                    PSYSTEM_CPU_SET_INFORMATION r = (PSYSTEM_CPU_SET_INFORMATION)(buf + off);
+                    if (!r->Size) {
+                        break;
+                    }
+                    if (r->CpuSet.Group == 0) {
+                        ecore[r->CpuSet.LogicalProcessorIndex] = r->CpuSet.EfficiencyClass < maxc;
+                    }
+                    off += r->Size;
+                }
+            }
+            g_free(buf);
+            qatomic_set(&built, 2);
+        } else {
+            return false;
+        }
+    }
+    return ecore[GetCurrentProcessorNumber() & 255];
+}
 
 static bool whpx_stats_on(void)
 {
@@ -1171,11 +1227,13 @@ static void whpx_stats_maybe_print(void)
         }
         whpx_stats.count[i] = whpx_stats.ns[i] = 0;
     }
-    g_string_append_printf(s, " run_ms=%" PRIu64 " mmio_bql_us=%" PRIu64
+    g_string_append_printf(s, " run_ms=%" PRIu64 " run_ecore_ms=%" PRIu64 " mmio_bql_us=%" PRIu64
                            " prerun_bql_us=%" PRIu64 " prerun_n=%" PRIu64,
-                           whpx_stats.run_ns / 1000000, whpx_stats.mmio_bql_ns / 1000,
+                           whpx_stats.run_ns / 1000000, whpx_stats.run_ecore_ns / 1000000,
+                           whpx_stats.mmio_bql_ns / 1000,
                            whpx_stats.prerun_bql_ns / 1000, whpx_stats.prerun_n);
     whpx_stats.run_ns = whpx_stats.mmio_bql_ns = whpx_stats.prerun_bql_ns = 0;
+    whpx_stats.run_ecore_ns = 0;
     whpx_stats.prerun_n = 0;
     for (i = 0; i < WHPX_STATS_PAGES; i++) {
         unsigned k, j;
@@ -2720,6 +2778,9 @@ int whpx_vcpu_run(CPUState *cpu)
         int64_t stats_t_exit = stats_t_run ? get_clock() : 0;
         if (stats_t_run) {
             qatomic_add(&whpx_stats.run_ns, stats_t_exit - stats_t_run);
+            if (whpx_on_ecore()) {
+                qatomic_add(&whpx_stats.run_ecore_ns, stats_t_exit - stats_t_run);
+            }
         }
 
         if (FAILED(hr)) {
