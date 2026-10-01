@@ -94,5 +94,10 @@ bool reims_vgpu_dirty_note_doorbell(ReimsVgpuDirty *d, int channel);
 /* The harvest thread's job: a full harvest, or the on-demand prefetch. */
 void reims_vgpu_dirty_background(ReimsVgpuDirty *d);
 void reims_vgpu_dirty_note_work_scope(ReimsVgpuDirty *d, uint32_t scope);
+/* Lab DIRTY_HOLE=tail: the child-ring tail a doorbell read before it opened its epoch. */
+void reims_vgpu_dirty_note_child_tail(ReimsVgpuDirty *d, int channel, uint32_t tail,
+                                      bool valid);
+/* Lab DIRTY_HOLE=tail: the drain read this child-ring tail; open an epoch unless one covers it. */
+void reims_vgpu_dirty_note_ring_tail(ReimsVgpuDirty *d, uint32_t channel, uint32_t tail);
 
 #endif /* REIMS_VGPU_DIRTY_H */

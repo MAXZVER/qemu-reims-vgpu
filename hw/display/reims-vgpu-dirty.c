@@ -398,8 +398,17 @@ struct ReimsVgpuDirty {
      * fresh epoch (the packet has been read by then, so any sync that begins
      * after it is exact in the strict sense) and its reads need that epoch.
      */
-    uint32_t hole_mode;           /* 0 off, 1 census, 2 close */
+    uint32_t hole_mode;           /* 0 off, 1 census, 2 close, 3 tail */
     uint64_t lab_hole_closed;
+    /*
+     * DIRTY_HOLE=tail. Per channel, a child-ring tail every packet up to which
+     * an epoch no newer than the current one already covers: either a tail a
+     * doorbell read before it opened (or coalesced into) its epoch, or a tail
+     * the drain read before it opened one itself. See
+     * reims_vgpu_dirty_note_ring_tail. Under `lock`.
+     */
+    uint32_t ring_tail[64];
+    bool ring_tail_valid[64];
     uint64_t lab_db[64], lab_pk[64], lab_dr[64], lab_em[64], lab_unnamed;
     /*
      * A run is the drain's visit to a ring from its first packet to the moment it
@@ -879,6 +888,70 @@ static void reims_vgpu_dirty_open_epoch_from_drain(ReimsVgpuDirty *d)
     }
     qatomic_set(&d->work_epoch, d->epoch);
     d->lab_hole_closed++;
+    qemu_mutex_unlock(&d->lock);
+}
+
+/*
+ * DIRTY_HOLE=tail, the shim's half: a doorbell for child channel `channel`
+ * read `tail` from the guest's ring registers *before* it called
+ * reims_vgpu_dirty_note_doorbell. Every packet up to that tail was published
+ * before the tail was read, so before the doorbell's epoch opened (or before
+ * any sync of the epoch it coalesced into began): that epoch covers them.
+ * `valid` false is a doorbell that could not read the tail; the drain's next
+ * read then opens its own epoch.
+ */
+void reims_vgpu_dirty_note_child_tail(ReimsVgpuDirty *d, int channel, uint32_t tail,
+                                      bool valid)
+{
+    if (!d || d->hole_mode != 3 || channel < 0 ||
+        channel >= (int)ARRAY_SIZE(d->ring_tail)) {
+        return;
+    }
+    qemu_mutex_lock(&d->lock);
+    d->ring_tail[channel] = tail;
+    d->ring_tail_valid[channel] = valid;
+    qemu_mutex_unlock(&d->lock);
+}
+
+/*
+ * DIRTY_HOLE=tail, the drain's half: it has just read `tail` from child ring
+ * `channel`'s registers in guest memory, and will run the packets up to it.
+ *
+ * The guest publishes a packet by storing the tail after the packet and every
+ * buffer it names, so a packet the drain sees was complete before this read.
+ * What the drain does not know is whether an epoch it can need was opened
+ * after that: the doorbell for these packets may not have been noted yet (the
+ * tail is read from memory, not from the doorbell), or may have been noted for
+ * an earlier, shorter tail while more packets were appended behind it. In
+ * both cases a sync begun before the packets were published could vouch for
+ * them, which is the hole.
+ *
+ * So: if this tail is the one an epoch is already known to cover (a doorbell's
+ * snapshot, or this drain's own earlier read), nothing changes. Otherwise open
+ * an epoch now, after the read, so that every sync the following reads can
+ * accept began after these packets were published, and remember the tail.
+ * Called before note_work_scope, which then makes the reads need that epoch.
+ * Exact without any assumption about how many doorbells a batch rings.
+ */
+void reims_vgpu_dirty_note_ring_tail(ReimsVgpuDirty *d, uint32_t channel, uint32_t tail)
+{
+    if (!d || d->hole_mode != 3 || channel >= ARRAY_SIZE(d->ring_tail)) {
+        return;
+    }
+    qemu_mutex_lock(&d->lock);
+    if (!d->ring_tail_valid[channel] || d->ring_tail[channel] != tail) {
+        qatomic_set(&d->epoch, d->epoch + 1);
+        d->epoch_queried = false;
+        qatomic_set(&d->chan_epoch[channel], d->epoch);
+        d->lab_od_epochs++;
+        d->doorbell_ns = get_clock();
+        if (d->lab_tr) {
+            qatomic_set(&d->lab_epoch_ns[d->epoch & 4095], d->doorbell_ns);
+        }
+        d->ring_tail[channel] = tail;
+        d->ring_tail_valid[channel] = true;
+        d->lab_hole_closed++;
+    }
     qemu_mutex_unlock(&d->lock);
 }
 
@@ -3086,7 +3159,8 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
         d->lf_mode = reims_vgpu_dirty_lab_mode("REIMS_VGPU_LAB_GEN_LOCKFREE");
         d->hole_mode = !getenv("REIMS_VGPU_LAB_DIRTY_HOLE") ? 0 :
                        strcmp(getenv("REIMS_VGPU_LAB_DIRTY_HOLE"), "census") == 0 ? 1 :
-                       strcmp(getenv("REIMS_VGPU_LAB_DIRTY_HOLE"), "close") == 0 ? 2 : 0;
+                       strcmp(getenv("REIMS_VGPU_LAB_DIRTY_HOLE"), "close") == 0 ? 2 :
+                       strcmp(getenv("REIMS_VGPU_LAB_DIRTY_HOLE"), "tail") == 0 ? 3 : 0;
         qemu_mutex_unlock(&d->lock);
         if (on && d->od_prefetch && d->od_nworkers == 0) {
             const char *nt = getenv("REIMS_VGPU_DIRTY_OD_THREADS");   /* lab A/B */

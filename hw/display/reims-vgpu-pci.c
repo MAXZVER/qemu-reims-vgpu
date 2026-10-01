@@ -838,6 +838,16 @@ static void *reims_vgpu_pci_harvest_thread(void *opaque)
  * No per-vector masking is advertised (msi_init above), so msi_notify never
  * touches pending bits here.
  */
+/* HostOps.note_ring_tail: the drain read a child ring's tail (DIRTY_HOLE=tail). */
+static void reims_vgpu_pci_note_ring_tail(void *ctx, uint32_t channel, uint32_t tail)
+{
+    ReimsVGPUPCIState *s = ctx;
+
+    if (s->dirty_ondemand) {
+        reims_vgpu_dirty_note_ring_tail(s->dirty, channel, tail);
+    }
+}
+
 /* HostOps.note_work_scope: which doorbells bind the reads that follow. */
 static void reims_vgpu_pci_note_work_scope(void *ctx, uint32_t scope)
 {
@@ -1156,10 +1166,34 @@ static void reims_vgpu_pci_gfx_write(void *opaque, hwaddr offset, uint64_t data,
          * background harvest is asked only while logging is still to be turned
          * on — its one BQL step — and nothing waits for it.
          */
-        if (reims_vgpu_dirty_note_doorbell(
-                s->dirty,
-                reims_vgpu_qemu_gfx_write_doorbell_channel(offset, data, size)) &&
-            s->harvest_started) {
+        int db_channel = reims_vgpu_qemu_gfx_write_doorbell_channel(offset, data, size);
+        uint32_t db_tail = 0;
+        bool db_tail_ok = false;
+
+        /*
+         * A child ring's tail lives in guest memory, so the drain can read
+         * packets a doorbell has not been noted for. Read the tail *before*
+         * the doorbell opens its epoch: every packet up to it was published
+         * before that, so the epoch covers them (DIRTY_HOLE=tail). Rust names
+         * the register; 0 is a ring it has not set up yet.
+         */
+        if (db_channel > 0) {
+            uint64_t tail_gpa = reims_vgpu_qemu_child_tail_gpa(s->rust_handle,
+                                                               (uint32_t)db_channel);
+
+            if (tail_gpa &&
+                address_space_read(&address_space_memory, tail_gpa,
+                                   MEMTXATTRS_UNSPECIFIED, &db_tail, 4) == MEMTX_OK) {
+                db_tail = le32_to_cpu(db_tail);
+                db_tail_ok = true;
+            }
+        }
+        bool db_want = reims_vgpu_dirty_note_doorbell(s->dirty, db_channel);
+
+        if (db_channel > 0) {
+            reims_vgpu_dirty_note_child_tail(s->dirty, db_channel, db_tail, db_tail_ok);
+        }
+        if (db_want && s->harvest_started) {
             qemu_mutex_lock(&s->harvest_mutex);
             s->harvest_asked++;
             qemu_cond_signal(&s->harvest_cond);
@@ -1387,6 +1421,7 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
          */
         .thread_attach = reims_vgpu_shim_thread_attach,
         .thread_detach = reims_vgpu_shim_thread_detach,
+        .note_ring_tail = reims_vgpu_pci_note_ring_tail,
         .track_guest_writes = reims_vgpu_pci_track_guest_writes,
         .untrack_guest_writes = reims_vgpu_pci_untrack_guest_writes,
         .guest_write_gen = reims_vgpu_pci_guest_write_gen,
