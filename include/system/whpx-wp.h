@@ -1,0 +1,12 @@
+/*
+ * Lab REIMS DIRTY_WP: write-protected guest pages (hw/display/reims-vgpu-dirty.c,
+ * accel/whpx/whpx-common.c, target/i386/whpx/whpx-all.c).
+ */
+#ifndef QEMU_WHPX_WP_H
+#define QEMU_WHPX_WP_H
+
+extern bool (*whpx_wp_fault_hook)(uint64_t gpa);
+extern void (*whpx_wp_invalidate_hook)(void);
+int whpx_wp_remap(uint64_t gpa, uint64_t size, bool writable);
+
+#endif

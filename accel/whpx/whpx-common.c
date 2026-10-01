@@ -6,6 +6,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "system/whpx-wp.h"
 #include "cpu.h"
 #include "system/address-spaces.h"
 #include "system/ioport.h"
@@ -311,6 +312,65 @@ static void whpx_dirty_tracking_disable(const char *why, HRESULT hr)
     whpx_dirty_tracking = false;
 }
 
+/*
+ * Lab REIMS_VGPU_LAB_DIRTY_WP (hw/display/reims-vgpu-dirty.c): the display
+ * device write-protects guest pages it has proven clean, so that reading them
+ * needs no dirty-bitmap query; the guest's first store into one exits here as
+ * a memory access and `whpx_wp_fault_hook` makes the page writable again.
+ * `whpx_wp_invalidate_hook` runs before QEMU itself remaps writable RAM.
+ * `whpx_wp_busy` / `whpx_wp_gen` let a dirty query that failed because it
+ * met a range between its unmap and its map tell that apart and retry.
+ */
+bool (*whpx_wp_fault_hook)(uint64_t gpa);
+void (*whpx_wp_invalidate_hook)(void);
+static int whpx_wp_busy;
+static unsigned whpx_wp_gen;
+
+int whpx_wp_remap(uint64_t gpa, uint64_t size, bool writable)
+{
+    struct whpx_state *whpx = &whpx_global;
+    MemoryRegionSection sec = memory_region_find(get_system_memory(), gpa, size);
+    HRESULT hr;
+    void *mem;
+    int rc = 0;
+
+    if (!sec.mr) {
+        return -1;
+    }
+    if (!memory_region_is_ram(sec.mr) || sec.mr->readonly || sec.mr->rom_device ||
+        int128_get64(sec.size) < size) {
+        memory_region_unref(sec.mr);
+        return -1;
+    }
+    mem = memory_region_get_ram_ptr(sec.mr) + sec.offset_within_region;
+    memory_region_unref(sec.mr);
+    qatomic_inc(&whpx_wp_busy);
+    hr = whp_dispatch.WHvUnmapGpaRange(whpx->partition, gpa, size);
+    if (FAILED(hr)) {
+        rc = -2;
+    } else {
+        hr = whp_dispatch.WHvMapGpaRange(whpx->partition, mem, gpa, size,
+                                         WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagExecute |
+                                         (writable ? WHvMapGpaRangeFlagWrite : 0) |
+                                         WHvMapGpaRangeFlagTrackDirtyPages);
+        if (FAILED(hr)) {
+            /* Put the writable tracked mapping back, whatever was asked. */
+            hr = whp_dispatch.WHvMapGpaRange(whpx->partition, mem, gpa, size,
+                                             WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagExecute |
+                                             WHvMapGpaRangeFlagWrite |
+                                             WHvMapGpaRangeFlagTrackDirtyPages);
+            if (FAILED(hr)) {
+                error_report("WHPX: write-protect remap could not restore 0x%" PRIx64, gpa);
+                abort();
+            }
+            rc = -3;
+        }
+    }
+    qatomic_inc(&whpx_wp_gen);
+    qatomic_dec(&whpx_wp_busy);
+    return rc;
+}
+
 static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
 {
     struct whpx_state *whpx = &whpx_global;
@@ -335,6 +395,10 @@ static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
         !QEMU_IS_ALIGNED(gva, page_size)) {
         /* Not page aligned, so we can not map as RAM */
         add = false;
+    }
+
+    if (whpx_wp_invalidate_hook && writable && memory_region_is_ram(area)) {
+        whpx_wp_invalidate_hook();   /* lab DIRTY_WP: no protection outlives a remap */
     }
 
     if (!add) {
@@ -443,9 +507,23 @@ static void whpx_log_sync(MemoryListener *listener,
         if (relock) {
             bql_unlock();
         }
+        unsigned wp_gen0 = qatomic_read(&whpx_wp_gen);
+        int wp_tries = 0;
+
         hr = whp_dispatch.WHvQueryGpaRangeDirtyBitmap(whpx->partition, gpa,
                                                       size, bitmap,
                                                       words * sizeof(uint64_t));
+        /* Lab DIRTY_WP: a query that met a range mid-remap is asked again. */
+        while (FAILED(hr) && wp_tries++ < 1000 &&
+               (qatomic_read(&whpx_wp_busy) || qatomic_read(&whpx_wp_gen) != wp_gen0)) {
+            while (qatomic_read(&whpx_wp_busy)) {
+                g_usleep(20);
+            }
+            wp_gen0 = qatomic_read(&whpx_wp_gen);
+            hr = whp_dispatch.WHvQueryGpaRangeDirtyBitmap(whpx->partition, gpa,
+                                                          size, bitmap,
+                                                          words * sizeof(uint64_t));
+        }
         if (relock) {
             bql_lock();
         }

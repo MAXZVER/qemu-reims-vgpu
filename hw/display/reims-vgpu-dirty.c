@@ -15,6 +15,8 @@
 #include "system/physmem.h"
 #include "system/ram_addr.h"
 #include "system/ramlist.h"
+#include "system/cpus.h"
+#include "system/whpx-wp.h"
 
 #include "reims-vgpu-dirty.h"
 
@@ -98,6 +100,16 @@ typedef struct ReimsVgpuDirtySet {
      */
     uint64_t rd_epoch;
     uint32_t rd_gaps;
+    /*
+     * Lab DIRTY_WP: this set's token (the protect queue and the fault hook name
+     * sets by it), whether its pages are write-protected now, how many syncs
+     * in a row found it clean, and how often a protection was lost (each loss
+     * doubles the clean run the next protection needs).
+     */
+    uint64_t token;
+    bool wp_on;
+    uint32_t wp_streak;
+    uint32_t wp_lost;
 } ReimsVgpuDirtySet;
 
 /*
@@ -437,6 +449,34 @@ struct ReimsVgpuDirty {
     bool cover_valid;
     /* REIMS_VGPU_LAB_DIRTY_TAILWAKE=on: an epoch the drain opens wakes the prefetch. */
     uint32_t tailwake_mode;
+    /*
+     * REIMS_VGPU_LAB_DIRTY_WP=on: a set of at least `wp_min_pages` target pages
+     * whose last `wp_streak_need` syncs all found it clean is write-protected
+     * in the hypervisor (accel/whpx: unmapped and mapped again read-only, still
+     * tracked) and gets `synced_epoch` = REIMS_VGPU_DIRTY_WP_EPOCH: every read
+     * finds it synced and the prefetch skips it, so it costs no query at all.
+     * The guest's first store into any of its pages exits to
+     * reims_vgpu_dirty_wp_fault on that vCPU *before* the store happens; the
+     * set is made writable again there (claimed while its mapping changes,
+     * `synced_epoch` 0) and the vCPU re-runs the store against the tracked
+     * mapping, so the next sync finds it by query exactly as without WP.
+     * Protecting happens in a main-loop BH with every vCPU paused: a fresh
+     * query of the set, then the read-only remap, with no store possible in
+     * between (a remap may drop the bits a range had collected). The 5K
+     * surfaces this is for are ~10 800 pages, re-queried ~once a frame for
+     * ~0.3 ms each and never written.
+     */
+    uint32_t wp_mode;
+    uint32_t wp_streak_need;
+    uint64_t wp_min_pages;
+    QemuMutex wp_mutex;           /* remaps and `wp_list`; taken before `lock` */
+    GArray *wp_queue;             /* tokens for the protect BH (under `lock`) */
+    GArray *wp_list;              /* tokens of protected sets (under `wp_mutex`) */
+    QEMUBH *wp_bh;
+    unsigned long *wp_bits;       /* pfns of protected sets (they never overlap); under `wp_mutex` */
+    uint64_t wp_bits_n;
+    uint64_t lab_wp_protects, lab_wp_faults, lab_wp_stale, lab_wp_refused;
+    uint64_t lab_wp_dirty_at_pause, lab_wp_remap_ns, lab_wp_pause_ns;
     /*
      * REIMS_VGPU_LAB_DIRTY_PERIOD=on: a set of at least `period_big` pages joins
      * a prefetch batch only when the batch's epoch is at least its shortest
@@ -882,6 +922,7 @@ uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
     s->lab_created_epoch = d->epoch;   /* TEMP lab (FGTRACE) */
     d->next_token++;
     token = d->next_token;
+    s->token = token;   /* lab DIRTY_WP */
     d->lab_ntrack++;
     if (d->lab_tr) {
         ReimsVgpuLabRec r = { .t_ns = get_clock() - d->lab_t0, .token = token,
@@ -900,10 +941,301 @@ uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
     return token;
 }
 
+/* Lab DIRTY_WP ---------------------------------------------------------- */
+/* A protected set reads as synced for every epoch (far above any real one). */
+#define REIMS_VGPU_DIRTY_WP_EPOCH (UINT64_MAX >> 2)
+
+static ReimsVgpuDirty *reims_vgpu_dirty_wp_dev;
+#ifdef REIMS_DIRTY_STRESS   /* scripts/dirty-stress: its own main loop runs the BH */
+QEMUBH *reims_stress_bh_new(QEMUBHFunc *cb, void *opaque);
+void reims_stress_bh_schedule(QEMUBH *bh);
+#define REIMS_WP_BH_NEW(cb, op) reims_stress_bh_new(cb, op)
+#define REIMS_WP_BH_SCHEDULE(bh) reims_stress_bh_schedule(bh)
+#else
+#define REIMS_WP_BH_NEW(cb, op) qemu_bh_new(cb, op)
+#define REIMS_WP_BH_SCHEDULE(bh) qemu_bh_schedule(bh)
+#endif
+static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg,
+                                      int64_t *lab_wait, int64_t *lab_query);
+
+/* Remap every run of `s`'s pages; `wp_mutex` held, `s` cannot be untracked. */
+static int reims_vgpu_dirty_wp_remap_set(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
+                                         bool writable)
+{
+    int64_t t0 = get_clock();
+    size_t p = 0;
+    int rc = 0;
+
+    while (p < s->count) {
+        uint64_t start = s->pages[p], end = start + s->page_size;
+        size_t q = p + 1;
+        int r;
+
+        while (q < s->count && s->pages[q] == end) {
+            end += s->page_size;
+            q++;
+        }
+        r = whpx_wp_remap(start, end - start, writable);
+        if (r != 0) {
+            rc = r;
+            if (!writable) {
+                break;
+            }
+        }
+        p = q;
+    }
+    d->lab_wp_remap_ns += get_clock() - t0;
+    return rc;
+}
+
+static bool reims_vgpu_dirty_wp_has(const ReimsVgpuDirtySet *s, uint64_t gpa)
+{
+    size_t lo = 0, hi = s->count;
+
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+
+        if (s->pages[mid] + s->page_size <= gpa) {
+            lo = mid + 1;
+        } else if (s->pages[mid] > gpa) {
+            hi = mid;
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Set, clear or test (any set) `s`'s pfns in `wp_bits`. */
+static bool reims_vgpu_dirty_wp_bits(ReimsVgpuDirty *d, const ReimsVgpuDirtySet *s, int op)
+{
+    const int shift = qemu_target_page_bits();
+    size_t p;
+
+    for (p = 0; p < s->count; p++) {
+        uint64_t a;
+
+        for (a = s->pages[p]; a < s->pages[p] + s->page_size; a += 1ULL << shift) {
+            uint64_t pfn = a >> shift;
+
+            if (op == 0 && test_bit(pfn, d->wp_bits)) {
+                return true;
+            } else if (op == 1) {
+                set_bit_atomic(pfn, d->wp_bits);
+            } else if (op == 2) {
+                clear_bit_atomic(pfn, d->wp_bits);
+            }
+        }
+    }
+    return false;
+}
+
+/*
+ * Make protected set `token` writable again and forget its protection.
+ * `wp_mutex` held, `lock` not. Returns whether it was protected.
+ */
+static bool reims_vgpu_dirty_wp_drop(ReimsVgpuDirty *d, uint64_t token, guint at)
+{
+    ReimsVgpuDirtySet *s;
+
+    qemu_mutex_lock(&d->lock);
+    s = g_hash_table_lookup(d->sets, &token);
+    if (!s || !s->wp_on) {
+        qemu_mutex_unlock(&d->lock);
+        g_array_remove_index_fast(d->wp_list, at);
+        return false;
+    }
+    /* No sync may query it while its mapping changes; reads stop trusting it now. */
+    s->wp_on = false;
+    s->claim_epoch = UINT64_MAX;
+    qatomic_store_release(&s->synced_epoch, 0);
+    qemu_mutex_unlock(&d->lock);
+    reims_vgpu_dirty_wp_remap_set(d, s, true);
+    reims_vgpu_dirty_wp_bits(d, s, 2);   /* writable now: a store exit here is ordinary again */
+    qemu_mutex_lock(&d->lock);
+    s->claim_epoch = 0;
+    s->wp_streak = 0;
+    s->wp_lost++;
+    qemu_cond_broadcast(&d->synced_cond);
+    qemu_mutex_unlock(&d->lock);
+    g_array_remove_index_fast(d->wp_list, at);
+    return true;
+}
+
+/* vCPU thread, a store exit at `gpa` (see whpx_handle_mmio). */
+static bool reims_vgpu_dirty_wp_fault(uint64_t gpa)
+{
+    ReimsVgpuDirty *d = reims_vgpu_dirty_wp_dev;
+    uint64_t pfn = gpa >> qemu_target_page_bits();
+    bool found = false;
+    guint i;
+
+    if (!d || !qatomic_read(&d->wp_bits) || pfn >= d->wp_bits_n ||
+        !test_bit(pfn, d->wp_bits)) {
+        return false;
+    }
+    qemu_mutex_lock(&d->wp_mutex);
+    if (!test_bit(pfn, d->wp_bits)) {
+        /* Another vCPU's fault or an untrack made it writable meanwhile: run the store again. */
+        d->lab_wp_faults++;
+        qemu_mutex_unlock(&d->wp_mutex);
+        return true;
+    }
+    for (i = 0; i < d->wp_list->len;) {
+        uint64_t token = g_array_index(d->wp_list, uint64_t, i);
+        ReimsVgpuDirtySet *s;
+        bool hit;
+
+        qemu_mutex_lock(&d->lock);
+        s = g_hash_table_lookup(d->sets, &token);
+        hit = s && s->wp_on && reims_vgpu_dirty_wp_has(s, gpa);
+        qemu_mutex_unlock(&d->lock);
+        if (hit && reims_vgpu_dirty_wp_drop(d, token, i)) {
+            found = true;
+            continue;   /* the list moved its last entry into slot i */
+        }
+        i++;
+    }
+    if (!found) {
+        /* A protected pfn no protected set holds: cannot happen; never let the store exit forever. */
+        whpx_wp_remap(gpa & ~(uint64_t)4095, 4096, true);
+        clear_bit_atomic(pfn, d->wp_bits);
+        d->lab_wp_stale++;
+    }
+    d->lab_wp_faults++;
+    qemu_mutex_unlock(&d->wp_mutex);
+    return true;
+}
+
+/* QEMU is about to remap writable RAM: no protection may outlive it. */
+static void reims_vgpu_dirty_wp_invalidate(void)
+{
+    ReimsVgpuDirty *d = reims_vgpu_dirty_wp_dev;
+
+    if (!d) {
+        return;
+    }
+    qemu_mutex_lock(&d->wp_mutex);
+    while (d->wp_list->len) {
+        reims_vgpu_dirty_wp_drop(d, g_array_index(d->wp_list, uint64_t, d->wp_list->len - 1),
+                                 d->wp_list->len - 1);
+    }
+    if (d->wp_bits) {
+        bitmap_zero(d->wp_bits, d->wp_bits_n);
+    }
+    qemu_mutex_unlock(&d->wp_mutex);
+}
+
+/* Main loop, BQL held: protect the queued sets with every vCPU paused. */
+static void reims_vgpu_dirty_wp_bh(void *opaque)
+{
+    ReimsVgpuDirty *d = opaque;
+    g_autoptr(GArray) todo = g_array_new(FALSE, FALSE, sizeof(uint64_t));
+    const int shift = qemu_target_page_bits();
+    int64_t t0;
+    guint i;
+
+    qemu_mutex_lock(&d->lock);
+    g_array_append_vals(todo, d->wp_queue->data, d->wp_queue->len);
+    g_array_set_size(d->wp_queue, 0);
+    qemu_mutex_unlock(&d->lock);
+    if (!todo->len || !d->wp_mode) {
+        return;
+    }
+    if (!d->wp_bits) {
+        d->wp_bits_n = d->page_seq_n;
+        qatomic_set(&d->wp_bits, bitmap_new(d->wp_bits_n));
+    }
+    t0 = get_clock();
+    pause_all_vcpus();
+    for (i = 0; i < todo->len && d->wp_mode; i++) {
+        uint64_t token = g_array_index(todo, uint64_t, i);
+        ReimsVgpuDirtySet *s;
+        uint64_t gen0 = 0, last, wp_epoch = 0;
+        bool ok;
+        int rc;
+
+        qemu_mutex_lock(&d->lock);
+        s = g_hash_table_lookup(d->sets, &token);
+        ok = s && !s->wp_on && s->claim_epoch == 0 && s->gen != 0;
+        if (ok) {
+            gen0 = s->gen;
+            /*
+             * A new epoch, opened with every vCPU paused: the sync below (or any
+             * other thread's sync of this set for it) queries after the last store,
+             * so what it finds is all there is. Readers still need `work_epoch`,
+             * so this costs them nothing; an in-flight prefetch batch stops.
+             */
+            qatomic_set(&d->epoch, d->epoch + 1);
+            d->epoch_queried = false;
+            wp_epoch = d->epoch;
+        }
+        qemu_mutex_unlock(&d->lock);
+        if (!ok) {
+            continue;
+        }
+        reims_vgpu_dirty_sync_one(d, token, true, NULL, NULL);
+        qemu_mutex_lock(&d->wp_mutex);
+        qemu_mutex_lock(&d->lock);
+        s = g_hash_table_lookup(d->sets, &token);
+        last = s && s->count ? (s->pages[s->count - 1] + s->page_size - 1) >> shift : 0;
+        ok = s && !s->wp_on && s->claim_epoch == 0 && last < d->wp_bits_n &&
+             s->synced_epoch >= wp_epoch && !reims_vgpu_dirty_wp_bits(d, s, 0);
+        if (ok && s->gen != gen0) {
+            d->lab_wp_dirty_at_pause++;
+            s->wp_streak = 0;
+            ok = false;
+        }
+        if (ok) {
+            s->claim_epoch = UINT64_MAX;
+        }
+        qemu_mutex_unlock(&d->lock);
+        if (!ok) {
+            qemu_mutex_unlock(&d->wp_mutex);
+            continue;
+        }
+        reims_vgpu_dirty_wp_bits(d, s, 1);
+        rc = reims_vgpu_dirty_wp_remap_set(d, s, false);
+        if (rc) {
+            reims_vgpu_dirty_wp_remap_set(d, s, true);
+            reims_vgpu_dirty_wp_bits(d, s, 2);
+            d->lab_wp_refused++;
+            d->wp_mode = 0;
+            fprintf(stderr, "reims-dirty-wp: read-only remap refused (rc=%d), DIRTY_WP off\n", rc);
+        } else {
+            g_array_append_val(d->wp_list, token);
+        }
+        qemu_mutex_lock(&d->lock);
+        s->claim_epoch = 0;
+        if (!rc) {
+            s->wp_on = true;
+            qatomic_store_release(&s->synced_epoch, REIMS_VGPU_DIRTY_WP_EPOCH);
+            d->lab_wp_protects++;
+        }
+        qemu_cond_broadcast(&d->synced_cond);
+        qemu_mutex_unlock(&d->lock);
+        qemu_mutex_unlock(&d->wp_mutex);
+    }
+    resume_all_vcpus();
+    d->lab_wp_pause_ns += get_clock() - t0;
+}
+
 void reims_vgpu_dirty_untrack(ReimsVgpuDirty *d, uint64_t token)
 {
     if (!d || token == 0) {
         return;
+    }
+    if (d->wp_list) {   /* lab DIRTY_WP: a protected set leaves writable */
+        guint i;
+
+        qemu_mutex_lock(&d->wp_mutex);
+        for (i = 0; i < d->wp_list->len; i++) {
+            if (g_array_index(d->wp_list, uint64_t, i) == token) {
+                reims_vgpu_dirty_wp_drop(d, token, i);
+                break;
+            }
+        }
+        qemu_mutex_unlock(&d->wp_mutex);
     }
     qemu_mutex_lock(&d->lock);
     d->lab_nuntrack++;
@@ -939,8 +1271,6 @@ void reims_vgpu_dirty_untrack(ReimsVgpuDirty *d, uint64_t token)
     qemu_mutex_unlock(&d->lock);
 }
 
-static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg,
-                                      int64_t *lab_wait, int64_t *lab_query);
 
 /* The epoch a generation read must be synced for. d->lock held. */
 static uint64_t reims_vgpu_dirty_needed_epoch(ReimsVgpuDirty *d)
@@ -2119,6 +2449,14 @@ static bool reims_vgpu_dirty_eval_set(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
     smp_wmb();
     qatomic_set(&s->eval_seq, s->eval_seq + 1);   /* even again */
     s->seen_seq = d->global_seq;
+    if (d->wp_mode && !by_harvest && !s->wp_on && s->gen != 0 &&
+        s->count * (s->page_size >> shift) >= d->wp_min_pages) {   /* lab DIRTY_WP */
+        s->wp_streak = any ? 0 : s->wp_streak + 1;
+        if (s->wp_streak == (d->wp_streak_need << MIN(s->wp_lost, 6))) {
+            g_array_append_val(d->wp_queue, s->token);
+            REIMS_WP_BH_SCHEDULE(d->wp_bh);
+        }
+    }
     return unlogged;
 }
 
@@ -3240,6 +3578,17 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                     d->lab_bigphase_big, d->lab_bigphase_groups, d->frontier_mode,
                     d->lab_frontier_child);
             d->lab_frontier_child = 0;
+            if (d->wp_mode || d->lab_wp_refused) {   /* lab DIRTY_WP */
+                fprintf(stderr, "reims-dirty-wp on=%u protected=%u protects=%" PRIu64
+                        " faults=%" PRIu64 " stale=%" PRIu64 " dirty_at_pause=%" PRIu64
+                        " refused=%" PRIu64 " remap_us=%" PRId64 " pause_us=%" PRId64 "\n",
+                        d->wp_mode, d->wp_list ? d->wp_list->len : 0, d->lab_wp_protects,
+                        d->lab_wp_faults, d->lab_wp_stale, d->lab_wp_dirty_at_pause,
+                        d->lab_wp_refused, (int64_t)d->lab_wp_remap_ns / 1000,
+                        (int64_t)d->lab_wp_pause_ns / 1000);
+                d->lab_wp_protects = d->lab_wp_faults = d->lab_wp_stale = 0;
+                d->lab_wp_dirty_at_pause = d->lab_wp_remap_ns = d->lab_wp_pause_ns = 0;
+            }
             d->lab_rs_waits = d->lab_rs_skipped = 0;
             d->lab_bigphase_big = d->lab_bigphase_groups = 0;
             d->lab_period_skipped = d->lab_period_taken = 0;
@@ -3467,6 +3816,24 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                        strcmp(getenv("REIMS_VGPU_LAB_DIRTY_HOLE"), "tail") == 0 ? 3 : 0;
         if (d->hole_mode != 3) {
             d->frontier_mode = 0;   /* the cover of a read is only known under tail */
+        }
+        if (!d->wp_list) {   /* lab DIRTY_WP */
+            const char *w = getenv("REIMS_VGPU_LAB_DIRTY_WP");
+
+            d->wp_mode = w && strcmp(w, "on") == 0;
+            d->wp_streak_need = getenv("REIMS_VGPU_LAB_DIRTY_WP_STREAK") ?
+                                MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_STREAK"))) : 16;
+            d->wp_min_pages = getenv("REIMS_VGPU_LAB_DIRTY_WP_MIN") ?
+                              MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_MIN"))) : 2048;
+            qemu_mutex_init(&d->wp_mutex);
+            d->wp_queue = g_array_new(FALSE, FALSE, sizeof(uint64_t));
+            d->wp_list = g_array_new(FALSE, FALSE, sizeof(uint64_t));
+            if (d->wp_mode) {
+                d->wp_bh = REIMS_WP_BH_NEW(reims_vgpu_dirty_wp_bh, d);
+                reims_vgpu_dirty_wp_dev = d;
+                whpx_wp_invalidate_hook = reims_vgpu_dirty_wp_invalidate;
+                whpx_wp_fault_hook = reims_vgpu_dirty_wp_fault;
+            }
         }
         qemu_mutex_unlock(&d->lock);
         if (on && d->od_prefetch && d->od_nworkers == 0) {

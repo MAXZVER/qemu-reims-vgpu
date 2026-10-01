@@ -9,6 +9,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "system/whpx-wp.h"
 #include "cpu.h"
 #include "qemu/typedefs.h"
 #include "system/address-spaces.h"
@@ -1295,6 +1296,16 @@ static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
 {
     WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
     int ret;
+
+    /*
+     * Lab REIMS DIRTY_WP: a store into a page the display device write-protected.
+     * The hook makes it writable again; the store is not emulated, the vCPU
+     * simply runs it again, now against a tracked writable mapping.
+     */
+    if (whpx_wp_fault_hook && ctx->AccessInfo.AccessType == WHvMemoryAccessWrite &&
+        whpx_wp_fault_hook(ctx->Gpa)) {
+        return 0;
+    }
 
     cpu->accel->mmio_fast = whpx_mmio_fast_path() &&
                             whpx_mmio_fast_load(cpu, exit_ctx);
