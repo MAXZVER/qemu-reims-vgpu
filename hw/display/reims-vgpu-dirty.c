@@ -485,6 +485,13 @@ struct ReimsVgpuDirty {
     uint32_t wp_chunk;            /* runs per step (DIRTY_WP_CHUNK, 24) */
     uint32_t wp_pace_ms;          /* between steps (DIRTY_WP_PACE_MS, 4) */
     uint32_t wp_duty;             /* max % of time the guest is paused (DIRTY_WP_DUTY, 10) */
+    /*
+     * DIRTY_WP_NOPAUSE=on: protect without pausing the vCPUs. The remap runs under a query ticket and
+     * every remapped page is marked written in the VGA bitmap before the ticket ends: whatever a store
+     * before the remap left in the hypervisor bitmap (the remap may drop it) is covered by the marks,
+     * and a sync that settles after the ticket began waits for them. The set's pages are re-read once.
+     */
+    bool wp_nopause;
     uint64_t wp_delay_ms;         /* the next step's wait after a chunk's pause */
     QEMUTimer *wp_timer;
     QEMUBH *wp_bh;
@@ -1246,6 +1253,30 @@ static void reims_vgpu_dirty_wp_finish(ReimsVgpuDirty *d, uint64_t token, ReimsV
 }
 
 /*
+ * DIRTY_WP_NOPAUSE: mark the target pages of [gpa, end) written in the VGA bitmap, as a query that
+ * found them written would have. A page outside every RAM slice reads as written without a bit.
+ */
+static void reims_vgpu_dirty_wp_mark(const ReimsVgpuDirtySlice *slices, int n, uint64_t gpa,
+                                     uint64_t end)
+{
+    const int shift = qemu_target_page_bits();
+    DirtyMemoryBlocks *blocks;
+
+    RCU_READ_LOCK_GUARD();
+    blocks = qatomic_rcu_read(&ram_list.dirty_memory[DIRTY_MEMORY_VGA]);
+    for (; gpa < end; gpa += 1ULL << shift) {
+        int si = reims_vgpu_dirty_slice_of(slices, n, gpa);
+        unsigned long pg;
+
+        if (si < 0) {
+            continue;
+        }
+        pg = (slices[si].ram_addr + (gpa - slices[si].gpa)) >> shift;
+        set_bit_atomic(pg % DIRTY_MEMORY_BLOCK_SIZE, blocks->blocks[pg / DIRTY_MEMORY_BLOCK_SIZE]);
+    }
+}
+
+/*
  * Protect the next chunk of runs of set `token` (WP_PROTECTING) with every vCPU paused. Called
  * with neither lock: the pause comes first, because a vCPU inside the fault hook waits for
  * `wp_mutex` and could not stop while this held it.
@@ -1256,10 +1287,23 @@ static int64_t reims_vgpu_dirty_wp_protect_chunk(ReimsVgpuDirty *d, uint64_t tok
     size_t p0, p, p_end;
     int64_t t0;
     int n, runs, rc = 0;
+#ifndef REIMS_DIRTY_STRESS
+    bool relock = false;
+#endif
 
     n = reims_vgpu_dirty_ram_slices_into(&d->wp_slices, &d->wp_slices_cap);
     t0 = get_clock();
-    pause_all_vcpus();
+    if (d->wp_nopause) {
+#ifndef REIMS_DIRTY_STRESS
+        /* Nothing here needs the BQL; a vCPU's MMIO exit would wait through the remaps for it. */
+        relock = bql_locked();
+        if (relock) {
+            bql_unlock();
+        }
+#endif
+    } else {
+        pause_all_vcpus();
+    }
     qemu_mutex_lock(&d->wp_mutex);
   next_set:
     /* Every store before the pause, into the VGA bitmap; the set's next sync consumes it. */
@@ -1270,6 +1314,25 @@ static int64_t reims_vgpu_dirty_wp_protect_chunk(ReimsVgpuDirty *d, uint64_t tok
         goto done;
     }
     p0 = s->wp_next;
+    if (d->wp_nopause) {
+        /* The ticket is taken before the first remap and returned after the last mark. */
+        uint64_t pt = reims_vgpu_dirty_query_begin(d);
+
+        qemu_mutex_unlock(&d->lock);
+        for (p = p0, runs = 0; p < s->count && runs < budget && !rc; runs++) {
+            uint64_t end;
+            size_t q = reims_vgpu_dirty_wp_run(s, p, &end);
+
+            rc = reims_vgpu_dirty_wp_remap(d, s->pages[p], end - s->pages[p], false);
+            reims_vgpu_dirty_wp_mark(d->wp_slices, n, s->pages[p], end);
+            p = q;
+        }
+        p_end = p;
+        qemu_mutex_lock(&d->lock);
+        reims_vgpu_dirty_query_end(d, pt);
+        qemu_mutex_unlock(&d->lock);
+        goto remapped;
+    }
     for (p = p0, runs = 0; p < s->count && runs < budget; runs++) {
         uint64_t end;
         size_t q = reims_vgpu_dirty_wp_run(s, p, &end);
@@ -1299,6 +1362,7 @@ static int64_t reims_vgpu_dirty_wp_protect_chunk(ReimsVgpuDirty *d, uint64_t tok
         rc = reims_vgpu_dirty_wp_remap(d, s->pages[p], end - s->pages[p], false);
         p = q;
     }
+  remapped:
     budget -= runs;
     d->lab_wp_chunks++;
     qemu_mutex_lock(&d->lock);
@@ -1331,6 +1395,19 @@ static int64_t reims_vgpu_dirty_wp_protect_chunk(ReimsVgpuDirty *d, uint64_t tok
         qemu_mutex_unlock(&d->lock);
     }
   done:
+    if (d->wp_nopause) {
+        /* Not a pause: the step's time is reported in the same fields, nothing paces by it. */
+        t0 = get_clock() - t0;
+        d->lab_wp_pause_ns += t0;
+        d->lab_wp_pause_max_ns = MAX(d->lab_wp_pause_max_ns, (uint64_t)t0);
+        qemu_mutex_unlock(&d->wp_mutex);
+#ifndef REIMS_DIRTY_STRESS
+        if (relock) {
+            bql_lock();
+        }
+#endif
+        return 0;
+    }
     resume_all_vcpus();
     t0 = get_clock() - t0;
     d->lab_wp_pause_ns += t0;
@@ -4134,6 +4211,8 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                          MIN(100, MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_DUTY")))) : 10;
             d->wp_pace_ms = getenv("REIMS_VGPU_LAB_DIRTY_WP_PACE_MS") ?
                             MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_PACE_MS"))) : 4;
+            d->wp_nopause = getenv("REIMS_VGPU_LAB_DIRTY_WP_NOPAUSE") &&
+                            strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_NOPAUSE"), "on") == 0;
             qemu_mutex_init(&d->wp_mutex);
             d->wp_queue = g_array_new(FALSE, FALSE, sizeof(uint64_t));
             d->wp_list = g_array_new(FALSE, FALSE, sizeof(uint64_t));
