@@ -3154,18 +3154,20 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
         d->work_epoch_off = getenv("REIMS_VGPU_DIRTY_WORK_EPOCH") &&   /* lab A/B */
                             strcmp(getenv("REIMS_VGPU_DIRTY_WORK_EPOCH"), "off") == 0;
         /*
-         * On by default (2026-10-01): STEAL, GEN_LOCKFREE, EPOCH_NAMED and
-         * DIRTY_HOLE=tail; each `=off` restores the earlier path. GEN_MEMO stays
+         * On by default (2026-10-01): STEAL and GEN_LOCKFREE; `=off` restores the
+         * earlier path. EPOCH_NAMED and DIRTY_HOLE stay opt-in: with them the 5K
+         * light scene fell from 116.7 to 91-95 Hz (fzl0/fzl1/fzl2), the drain's
+         * hole epochs turning every target currency check into a foreground sync
+         * of a full-screen set; without them it ran 118.4 (fzl3). GEN_MEMO stays
          * opt-in (exact, no measurable effect).
          */
         d->steal_mode = getenv("REIMS_VGPU_LAB_DIRTY_STEAL")
                         ? reims_vgpu_dirty_lab_mode("REIMS_VGPU_LAB_DIRTY_STEAL") : 1;
         d->gen_memo_mode = reims_vgpu_dirty_lab_mode("REIMS_VGPU_LAB_GEN_MEMO");
-        d->epoch_named = !getenv("REIMS_VGPU_LAB_EPOCH_NAMED") ||
-                         reims_vgpu_dirty_lab_mode("REIMS_VGPU_LAB_EPOCH_NAMED") == 1;
+        d->epoch_named = reims_vgpu_dirty_lab_mode("REIMS_VGPU_LAB_EPOCH_NAMED") == 1;
         d->lf_mode = getenv("REIMS_VGPU_LAB_GEN_LOCKFREE")
                      ? reims_vgpu_dirty_lab_mode("REIMS_VGPU_LAB_GEN_LOCKFREE") : 1;
-        d->hole_mode = !getenv("REIMS_VGPU_LAB_DIRTY_HOLE") ? 3 :
+        d->hole_mode = !getenv("REIMS_VGPU_LAB_DIRTY_HOLE") ? 0 :
                        strcmp(getenv("REIMS_VGPU_LAB_DIRTY_HOLE"), "census") == 0 ? 1 :
                        strcmp(getenv("REIMS_VGPU_LAB_DIRTY_HOLE"), "close") == 0 ? 2 :
                        strcmp(getenv("REIMS_VGPU_LAB_DIRTY_HOLE"), "tail") == 0 ? 3 : 0;
