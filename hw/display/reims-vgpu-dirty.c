@@ -419,6 +419,25 @@ struct ReimsVgpuDirty {
      */
     uint32_t hole_mode;           /* 0 off, 1 census, 2 close, 3 tail */
     /*
+     * REIMS_VGPU_LAB_DIRTY_FRONTIER=on (effective with DIRTY_HOLE=tail): the
+     * epoch a read needs is the newest epoch that covers a packet the drain has
+     * read so far, not the newest epoch of any channel. A packet's guest stores
+     * are ordered before its own publication (covered by its channel's doorbell
+     * epoch or by the epoch the drain opened for an uncovered tail), and any
+     * store another channel's packet made it depend on (an event it waits for)
+     * reached the device through a packet the drain read first, whose cover the
+     * frontier already holds. A doorbell for packets not read yet (the next
+     * frame of another channel) therefore no longer makes every set stale for
+     * the packets being run. Root-ring reads keep the newest epoch (their tail
+     * is the doorbell write itself; conservative). `cover_pending` is the cover
+     * note_ring_tail computed for the read that note_work_scope(All) follows.
+     */
+    uint32_t frontier_mode;
+    uint64_t cover_pending;
+    bool cover_valid;
+    /* REIMS_VGPU_LAB_DIRTY_TAILWAKE=on: an epoch the drain opens wakes the prefetch. */
+    uint32_t tailwake_mode;
+    /*
      * REIMS_VGPU_LAB_DIRTY_PERIOD=on: a set of at least `period_big` pages joins
      * a prefetch batch only when the batch's epoch is at least its shortest
      * recent read gap past its last read. A set read once a frame spans ~3
@@ -460,6 +479,7 @@ struct ReimsVgpuDirty {
     uint32_t bigphase_mode;
     uint64_t bigphase_big;   /* pages from which a set is a phase of its own (DIRTY_BIGPHASE_BIG, 2048) */
     uint64_t lab_bigphase_big, lab_bigphase_groups;
+    uint64_t lab_frontier_child;
     uint64_t lab_period_skipped, lab_period_taken;
     uint64_t lab_hole_closed;
     /*
@@ -995,13 +1015,16 @@ void reims_vgpu_dirty_note_child_tail(ReimsVgpuDirty *d, int channel, uint32_t t
  * Called before note_work_scope, which then makes the reads need that epoch.
  * Exact without any assumption about how many doorbells a batch rings.
  */
-void reims_vgpu_dirty_note_ring_tail(ReimsVgpuDirty *d, uint32_t channel, uint32_t tail)
+bool reims_vgpu_dirty_note_ring_tail(ReimsVgpuDirty *d, uint32_t channel, uint32_t tail)
 {
+    bool opened = false;
+
     if (!d || d->hole_mode != 3 || channel >= ARRAY_SIZE(d->ring_tail)) {
-        return;
+        return false;
     }
     qemu_mutex_lock(&d->lock);
     if (!d->ring_tail_valid[channel] || d->ring_tail[channel] != tail) {
+        opened = true;
         qatomic_set(&d->epoch, d->epoch + 1);
         d->epoch_queried = false;
         qatomic_set(&d->chan_epoch[channel], d->epoch);
@@ -1014,7 +1037,17 @@ void reims_vgpu_dirty_note_ring_tail(ReimsVgpuDirty *d, uint32_t channel, uint32
         d->ring_tail_valid[channel] = true;
         d->lab_hole_closed++;
     }
+    if (d->frontier_mode) {
+        /*
+         * The epoch covering every packet up to `tail`: the doorbell epoch whose
+         * snapshot this tail is (chan_epoch only grows, so a newer doorbell of
+         * this channel only asks for more), or the one just opened above.
+         */
+        qatomic_set(&d->cover_pending, qatomic_read(&d->chan_epoch[channel]));
+        qatomic_set(&d->cover_valid, true);
+    }
     qemu_mutex_unlock(&d->lock);
+    return opened && d->tailwake_mode && (qatomic_read(&d->log_wanted) || d->od_prefetch);
 }
 
 /*
@@ -1067,6 +1100,21 @@ void reims_vgpu_dirty_note_work_scope(ReimsVgpuDirty *d, uint32_t scope)
     }
     if (scope < ARRAY_SIZE(d->chan_epoch)) {
         e = qatomic_read(&d->chan_epoch[scope]);
+    }
+    if (scope == 0xffffffffu && d->frontier_mode) {
+        uint64_t cover;
+        bool child;
+
+        /* The drain thread's own words (note_ring_tail runs on it too): no lock. */
+        child = qatomic_read(&d->cover_valid);
+        cover = qatomic_read(&d->cover_pending);
+        qatomic_set(&d->cover_valid, false);
+        /* A child ring's cover; a root read (no tail noted) needs the newest. */
+        e = child ? cover : qatomic_read(&d->epoch);
+        e = MAX(e, qatomic_read(&d->work_epoch));   /* the frontier never recedes */
+        if (child) {
+            d->lab_frontier_child++;
+        }
     }
     e = e ? e : qatomic_read(&d->epoch);
     if (d->lab_tr && qatomic_read(&d->work_epoch) != e) {   /* TEMP lab (FGTRACE) */
@@ -3177,7 +3225,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                     " period=%u period_skipped=%" PRIu64 " period_taken=%" PRIu64
                     " bigsplit=%u bigsplit_sets=%" PRIu64 " rsettle=%u rs_waits=%" PRIu64
                     " rs_skipped=%" PRIu64 " bigphase=%u bp_big=%" PRIu64
-                    " bp_groups=%" PRIu64 "\n",
+                    " bp_groups=%" PRIu64 " frontier=%u fr_child=%" PRIu64 "\n",
                     g_get_real_time() / 1000, d->lab_od_n, d->lab_od_ns / 1000,
                     d->lab_od_pages, d->lab_od_skipped, d->lab_od_epochs,
                     d->lab_od_fg_n, d->lab_od_fg_ns / 1000, d->lab_ph_wait / 1000,
@@ -3189,7 +3237,9 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                     d->lab_period_skipped, d->lab_period_taken,
                     d->bigsplit_mode, d->lab_bigsplit_sets, d->rsettle_mode,
                     d->lab_rs_waits, d->lab_rs_skipped, d->bigphase_mode,
-                    d->lab_bigphase_big, d->lab_bigphase_groups);
+                    d->lab_bigphase_big, d->lab_bigphase_groups, d->frontier_mode,
+                    d->lab_frontier_child);
+            d->lab_frontier_child = 0;
             d->lab_rs_waits = d->lab_rs_skipped = 0;
             d->lab_bigphase_big = d->lab_bigphase_groups = 0;
             d->lab_period_skipped = d->lab_period_taken = 0;
@@ -3407,10 +3457,17 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                           MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_BIGPHASE_BIG"))) : 2048;
         d->period_big = getenv("REIMS_VGPU_LAB_DIRTY_PERIOD_BIG") ?
                         MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_PERIOD_BIG"))) : 2048;
+        d->frontier_mode = getenv("REIMS_VGPU_LAB_DIRTY_FRONTIER") &&    /* lab A/B */
+                           strcmp(getenv("REIMS_VGPU_LAB_DIRTY_FRONTIER"), "on") == 0;
+        d->tailwake_mode = getenv("REIMS_VGPU_LAB_DIRTY_TAILWAKE") &&    /* lab A/B */
+                           strcmp(getenv("REIMS_VGPU_LAB_DIRTY_TAILWAKE"), "on") == 0;
         d->hole_mode = !getenv("REIMS_VGPU_LAB_DIRTY_HOLE") ? 0 :
                        strcmp(getenv("REIMS_VGPU_LAB_DIRTY_HOLE"), "census") == 0 ? 1 :
                        strcmp(getenv("REIMS_VGPU_LAB_DIRTY_HOLE"), "close") == 0 ? 2 :
                        strcmp(getenv("REIMS_VGPU_LAB_DIRTY_HOLE"), "tail") == 0 ? 3 : 0;
+        if (d->hole_mode != 3) {
+            d->frontier_mode = 0;   /* the cover of a read is only known under tail */
+        }
         qemu_mutex_unlock(&d->lock);
         if (on && d->od_prefetch && d->od_nworkers == 0) {
             const char *nt = getenv("REIMS_VGPU_DIRTY_OD_THREADS");   /* lab A/B */
