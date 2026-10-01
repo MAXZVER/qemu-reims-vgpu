@@ -483,6 +483,8 @@ struct ReimsVgpuDirty {
     int wp_slices_cap;
     uint32_t wp_chunk;            /* runs per step (DIRTY_WP_CHUNK, 24) */
     uint32_t wp_pace_ms;          /* between steps (DIRTY_WP_PACE_MS, 4) */
+    uint32_t wp_duty;             /* max % of time the guest is paused (DIRTY_WP_DUTY, 10) */
+    uint64_t wp_delay_ms;         /* the next step's wait after a chunk's pause */
     QEMUTimer *wp_timer;
     QEMUBH *wp_bh;
     unsigned long *wp_bits;       /* pfns of protected sets (they never overlap); under `wp_mutex` */
@@ -987,7 +989,8 @@ typedef struct ReimsVgpuDirtyRun {
 #define REIMS_WP_PACE(d) REIMS_WP_BH_SCHEDULE((d)->wp_bh)
 #else
 #define REIMS_WP_PACE(d) \
-    timer_mod((d)->wp_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + (d)->wp_pace_ms)
+    timer_mod((d)->wp_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + \
+              MAX((uint64_t)(d)->wp_pace_ms, (d)->wp_delay_ms))
 #endif
 
 static inline bool reims_vgpu_dirty_wp_ro(ReimsVgpuDirty *d, uint64_t gpa)
@@ -1199,7 +1202,7 @@ static void reims_vgpu_dirty_wp_invalidate(void)
  * with neither lock: the pause comes first, because a vCPU inside the fault hook waits for
  * `wp_mutex` and could not stop while this held it.
  */
-static void reims_vgpu_dirty_wp_protect_chunk(ReimsVgpuDirty *d, uint64_t token, int budget)
+static int64_t reims_vgpu_dirty_wp_protect_chunk(ReimsVgpuDirty *d, uint64_t token, int budget)
 {
     ReimsVgpuDirtySet *s;
     size_t p0, p, p_end;
@@ -1217,7 +1220,7 @@ static void reims_vgpu_dirty_wp_protect_chunk(ReimsVgpuDirty *d, uint64_t token,
         qemu_mutex_unlock(&d->lock);
         resume_all_vcpus();
         qemu_mutex_unlock(&d->wp_mutex);
-        return;
+        return get_clock() - t0;
     }
     p0 = s->wp_next;
     for (p = p0, runs = 0; p < s->count && runs < budget; runs++) {
@@ -1267,6 +1270,7 @@ static void reims_vgpu_dirty_wp_protect_chunk(ReimsVgpuDirty *d, uint64_t token,
     }
     qemu_mutex_unlock(&d->lock);
     qemu_mutex_unlock(&d->wp_mutex);
+    return t0;
 }
 
 /*
@@ -1281,6 +1285,7 @@ static void reims_vgpu_dirty_wp_bh(void *opaque)
     bool more = false;
     guint i;
 
+    d->wp_delay_ms = 0;
     if (qatomic_xchg(&d->wp_drop_all, false)) {
         reims_vgpu_dirty_wp_invalidate();
     }
@@ -1374,7 +1379,10 @@ static void reims_vgpu_dirty_wp_bh(void *opaque)
             uint64_t token = d->wp_cur;
 
             qemu_mutex_unlock(&d->wp_mutex);
-            reims_vgpu_dirty_wp_protect_chunk(d, token, budget);
+            int64_t paused = reims_vgpu_dirty_wp_protect_chunk(d, token, budget);
+
+            /* Keep the guest paused at most `wp_duty` percent of the time. */
+            d->wp_delay_ms = (uint64_t)(paused / 1000000) * (100 - d->wp_duty) / d->wp_duty;
             qemu_mutex_lock(&d->wp_mutex);
         } else if (s) {
             uint64_t token = d->wp_cur;
@@ -4050,6 +4058,8 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                               MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_MIN"))) : 2048;
             d->wp_chunk = getenv("REIMS_VGPU_LAB_DIRTY_WP_CHUNK") ?
                           MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_CHUNK"))) : 24;
+            d->wp_duty = getenv("REIMS_VGPU_LAB_DIRTY_WP_DUTY") ?
+                         MIN(100, MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_DUTY")))) : 10;
             d->wp_pace_ms = getenv("REIMS_VGPU_LAB_DIRTY_WP_PACE_MS") ?
                             MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_PACE_MS"))) : 4;
             qemu_mutex_init(&d->wp_mutex);

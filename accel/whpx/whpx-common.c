@@ -345,8 +345,20 @@ int whpx_wp_remap(uint64_t gpa, uint64_t size, bool writable)
     mem = memory_region_get_ram_ptr(sec.mr) + sec.offset_within_region;
     memory_region_unref(sec.mr);
     qatomic_inc(&whpx_wp_busy);
-    hr = whp_dispatch.WHvUnmapGpaRange(whpx->partition, gpa, size);
-    if (FAILED(hr)) {
+    /*
+     * Mapped over the live mapping: one call, and no moment where the range is
+     * unmapped (a dirty query meeting it then fails). The hypervisor takes it
+     * and changes the protection; it drops the range's bits on RW->RO exactly
+     * as an unmap+map pair does (scratchpad whpover.c). Only if it refuses does
+     * the pair run.
+     */
+    hr = whp_dispatch.WHvMapGpaRange(whpx->partition, mem, gpa, size,
+                                     WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagExecute |
+                                     (writable ? WHvMapGpaRangeFlagWrite : 0) |
+                                     WHvMapGpaRangeFlagTrackDirtyPages);
+    if (SUCCEEDED(hr)) {
+        /* done */
+    } else if (FAILED(whp_dispatch.WHvUnmapGpaRange(whpx->partition, gpa, size))) {
         rc = -2;
     } else {
         hr = whp_dispatch.WHvMapGpaRange(whpx->partition, mem, gpa, size,
