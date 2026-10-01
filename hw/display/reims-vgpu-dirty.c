@@ -1285,8 +1285,14 @@ static void reims_vgpu_dirty_wp_bh(void *opaque)
         reims_vgpu_dirty_wp_invalidate();
     }
     if (!d->wp_bits) {
-        d->wp_bits_n = d->page_seq_n;
-        qatomic_set(&d->wp_bits, bitmap_new(MAX(d->wp_bits_n, 1)));
+        /*
+         * Every pfn below 64 GiB of guest physical address space (2 MiB). Not
+         * `page_seq_n`: that grows with the pages seen so far, and the BH first
+         * runs early in boot (an invalidate from QEMU's own remaps schedules it),
+         * when it covered almost nothing and no set would ever have fitted.
+         */
+        d->wp_bits_n = 1ULL << (36 - qemu_target_page_bits());
+        qatomic_set(&d->wp_bits, bitmap_new(d->wp_bits_n));
     }
     qemu_mutex_lock(&d->wp_mutex);
     while (budget > 0 && d->wp_orphans->len) {
