@@ -933,10 +933,12 @@ void reims_vgpu_dirty_note_child_tail(ReimsVgpuDirty *d, int channel, uint32_t t
  * Called before note_work_scope, which then makes the reads need that epoch.
  * Exact without any assumption about how many doorbells a batch rings.
  */
-void reims_vgpu_dirty_note_ring_tail(ReimsVgpuDirty *d, uint32_t channel, uint32_t tail)
+bool reims_vgpu_dirty_note_ring_tail(ReimsVgpuDirty *d, uint32_t channel, uint32_t tail)
 {
+    bool opened = false;
+
     if (!d || d->hole_mode != 3 || channel >= ARRAY_SIZE(d->ring_tail)) {
-        return;
+        return false;
     }
     qemu_mutex_lock(&d->lock);
     if (!d->ring_tail_valid[channel] || d->ring_tail[channel] != tail) {
@@ -951,8 +953,11 @@ void reims_vgpu_dirty_note_ring_tail(ReimsVgpuDirty *d, uint32_t channel, uint32
         d->ring_tail[channel] = tail;
         d->ring_tail_valid[channel] = true;
         d->lab_hole_closed++;
+        opened = true;
     }
     qemu_mutex_unlock(&d->lock);
+    /* Like a doorbell's epoch: worth the prefetch, which syncs hot sets beside the drain. */
+    return opened && (qatomic_read(&d->log_wanted) || d->od_prefetch);
 }
 
 /*

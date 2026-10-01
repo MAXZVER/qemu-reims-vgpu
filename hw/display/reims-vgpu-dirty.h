@@ -98,6 +98,7 @@ void reims_vgpu_dirty_note_work_scope(ReimsVgpuDirty *d, uint32_t scope);
 void reims_vgpu_dirty_note_child_tail(ReimsVgpuDirty *d, int channel, uint32_t tail,
                                       bool valid);
 /* Lab DIRTY_HOLE=tail: the drain read this child-ring tail; open an epoch unless one covers it. */
-void reims_vgpu_dirty_note_ring_tail(ReimsVgpuDirty *d, uint32_t channel, uint32_t tail);
+/* Returns true when it opened an epoch worth waking the prefetch for, as note_doorbell does. */
+bool reims_vgpu_dirty_note_ring_tail(ReimsVgpuDirty *d, uint32_t channel, uint32_t tail);
 
 #endif /* REIMS_VGPU_DIRTY_H */

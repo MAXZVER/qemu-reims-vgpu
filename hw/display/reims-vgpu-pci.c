@@ -843,8 +843,13 @@ static void reims_vgpu_pci_note_ring_tail(void *ctx, uint32_t channel, uint32_t 
 {
     ReimsVGPUPCIState *s = ctx;
 
-    if (s->dirty_ondemand) {
-        reims_vgpu_dirty_note_ring_tail(s->dirty, channel, tail);
+    if (s->dirty_ondemand && reims_vgpu_dirty_note_ring_tail(s->dirty, channel, tail) &&
+        s->harvest_started) {
+        /* The epoch the drain just opened, prefetched beside it (as at a doorbell). */
+        qemu_mutex_lock(&s->harvest_mutex);
+        s->harvest_asked++;
+        qemu_cond_signal(&s->harvest_cond);
+        qemu_mutex_unlock(&s->harvest_mutex);
     }
 }
 
