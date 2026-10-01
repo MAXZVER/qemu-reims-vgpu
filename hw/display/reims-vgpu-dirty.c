@@ -112,6 +112,7 @@ typedef struct ReimsVgpuDirtySet {
     size_t wp_next;         /* protecting: next page to protect; dropping: next page to look at */
     uint32_t wp_streak;
     uint32_t wp_lost;
+    uint32_t lab_fg_n;      /* TEMP lab: foreground syncs since the last fgtop line */
 } ReimsVgpuDirtySet;
 
 /*
@@ -2033,6 +2034,7 @@ uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token)
     stale = s && d->ondemand && s->synced_epoch < reims_vgpu_dirty_needed_epoch(d);
     needed_pre = reims_vgpu_dirty_needed_epoch(d);
     if (stale) {   /* TEMP lab */
+        s->lab_fg_n++;
         if (s->last_query_epoch + d->od_hot < d->epoch) {
             d->lab_fg_cold++;
             l_cls = 0;
@@ -2224,6 +2226,7 @@ int64_t reims_vgpu_dirty_written_since(ReimsVgpuDirty *d, uint64_t token,
          * miss what the guest wrote since; bring the set up to date first. */
         int64_t fg0 = get_clock();
 
+        s->lab_fg_n++;   /* TEMP lab */
         if (s->last_query_epoch + d->od_hot < d->epoch) {   /* TEMP lab */
             d->lab_fg_cold++;
         } else if (d->lab_pb_epoch >= reims_vgpu_dirty_needed_epoch(d)) {
@@ -3814,6 +3817,39 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                 d->lab_wp_protects = d->lab_wp_chunks = d->lab_wp_faults = d->lab_wp_lost = 0;
                 d->lab_wp_dropped = d->lab_wp_remaps = d->lab_wp_remap_ns = 0;
                 d->lab_wp_pause_ns = d->lab_wp_pause_max_ns = 0;
+            }
+            {   /* TEMP lab: the sets the foreground syncs most, and why WP leaves them */
+                GHashTableIter it;
+                gpointer k, v;
+                ReimsVgpuDirtySet *top[5] = { 0 };
+                GString *line = g_string_new("reims-dirty-fgtop");
+                int ti;
+
+                g_hash_table_iter_init(&it, d->sets);
+                while (g_hash_table_iter_next(&it, &k, &v)) {
+                    ReimsVgpuDirtySet *ts = v;
+
+                    for (ti = 0; ti < 5; ti++) {
+                        if (!top[ti] || ts->lab_fg_n > top[ti]->lab_fg_n) {
+                            memmove(&top[ti + 1], &top[ti], (4 - ti) * sizeof(top[0]));
+                            top[ti] = ts;
+                            break;
+                        }
+                    }
+                }
+                for (ti = 0; ti < 5 && top[ti] && top[ti]->lab_fg_n; ti++) {
+                    g_string_append_printf(line, " [n=%u pages=%" PRIu64 " wp=%u streak=%u lost=%u gen=%" PRIu64 "]",
+                                           top[ti]->lab_fg_n,
+                                           (uint64_t)(top[ti]->count * (top[ti]->page_size >> qemu_target_page_bits())),
+                                           top[ti]->wp_state, top[ti]->wp_streak, top[ti]->wp_lost,
+                                           top[ti]->gen);
+                }
+                fprintf(stderr, "%s\n", line->str);
+                g_string_free(line, TRUE);
+                g_hash_table_iter_init(&it, d->sets);
+                while (g_hash_table_iter_next(&it, &k, &v)) {
+                    ((ReimsVgpuDirtySet *)v)->lab_fg_n = 0;
+                }
             }
             d->lab_rs_waits = d->lab_rs_skipped = 0;
             d->lab_bigphase_big = d->lab_bigphase_groups = 0;
