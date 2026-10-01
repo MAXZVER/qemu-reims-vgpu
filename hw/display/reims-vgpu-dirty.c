@@ -452,7 +452,7 @@ struct ReimsVgpuDirty {
     /* REIMS_VGPU_LAB_DIRTY_TAILWAKE=on: an epoch the drain opens wakes the prefetch. */
     uint32_t tailwake_mode;
     /*
-     * REIMS_VGPU_LAB_DIRTY_WP=on: a set of at least `wp_min_pages` target pages
+     * REIMS_VGPU_LAB_DIRTY_WP (on by default, =off disables): a set of at least `wp_min_pages` target pages
      * whose last `wp_streak_need` syncs all found it clean is write-protected
      * in the hypervisor (accel/whpx: unmapped and mapped again read-only, still
      * tracked) and gets `synced_epoch` = REIMS_VGPU_DIRTY_WP_EPOCH: every read
@@ -4046,7 +4046,12 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
         if (!d->wp_list) {   /* lab DIRTY_WP */
             const char *w = getenv("REIMS_VGPU_LAB_DIRTY_WP");
 
-            d->wp_mode = w && (strcmp(w, "on") == 0 || strncmp(w, "toggle:", 7) == 0);
+            /*
+             * On by default (5K, VM B idle: drag 88.4/88.3 Hz against 63.2, light
+             * drain busy 457 against ~780 ms/s, verification tour clean);
+             * REIMS_VGPU_LAB_DIRTY_WP=off is the query-every-sync path.
+             */
+            d->wp_mode = !(w && strcmp(w, "off") == 0);
             d->wp_active = true;
             if (w && strncmp(w, "toggle:", 7) == 0) {
                 d->wp_toggle = g_strdup(w + 7);
