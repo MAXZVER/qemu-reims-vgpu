@@ -458,6 +458,7 @@ struct ReimsVgpuDirty {
      * after ~1.5 ms (a quarter of them before 0.6 ms).
      */
     uint32_t bigphase_mode;
+    uint64_t bigphase_big;   /* pages from which a set is a phase of its own (DIRTY_BIGPHASE_BIG, 2048) */
     uint64_t lab_bigphase_big, lab_bigphase_groups;
     uint64_t lab_period_skipped, lab_period_taken;
     uint64_t lab_hole_closed;
@@ -3402,6 +3403,8 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                              strcmp(getenv("REIMS_VGPU_LAB_DIRTY_BIGPHASE"), "off") == 0);
         d->bigsplit_mode = getenv("REIMS_VGPU_LAB_DIRTY_BIGSPLIT") &&   /* lab A/B */
                            strcmp(getenv("REIMS_VGPU_LAB_DIRTY_BIGSPLIT"), "on") == 0;
+        d->bigphase_big = getenv("REIMS_VGPU_LAB_DIRTY_BIGPHASE_BIG") ?
+                          MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_BIGPHASE_BIG"))) : 2048;
         d->period_big = getenv("REIMS_VGPU_LAB_DIRTY_PERIOD_BIG") ?
                         MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_PERIOD_BIG"))) : 2048;
         d->hole_mode = !getenv("REIMS_VGPU_LAB_DIRTY_HOLE") ? 0 :
@@ -3908,7 +3911,7 @@ static void reims_vgpu_dirty_prefetch_phased(ReimsVgpuDirty *d, GArray *tokens,
         ReimsVgpuDirtySet *set = g_hash_table_lookup(d->sets, &tk);
 
         big[t] = set && set->count * (set->page_size >> qemu_target_page_bits()) >=
-                        d->period_big;
+                        d->bigphase_big;
     }
     qemu_mutex_unlock(&d->lock);
     for (t = 0; t < tokens->len; t++) {
