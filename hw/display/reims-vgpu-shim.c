@@ -38,40 +38,56 @@ static const MemTxAttrs reims_vgpu_shim_ram_attrs = {
 };
 
 /*
- * TEMP lab REIMS_VGPU_LAB_READ_FAST=on (opt-in): the drain reads guest RAM
- * mostly a word at a time (page-table walks, object lists), and a 5K drag
- * profile put address_space_read's translation (RCU, flatview lookup, dispatch)
- * at ~8 % of the drain thread. Each thread remembers the last plain-RAM section
- * it read from — its GPA bounds and host pointer, valid for one FlatView — so a
- * read inside it is a memcpy. Only RAM sections of at least 1 MiB are kept
- * (the guest's main memory); everything else, and any read crossing the
- * section's end, takes address_space_read exactly as before.
+ * TEMP lab REIMS_VGPU_LAB_READ_FAST (v3, on by default; =off is the old path):
+ * the drain reads guest RAM mostly a word at a time (page-table walks, object
+ * lists, command records), and address_space_read's translation (RCU,
+ * flatview lookup, dispatch) was ~10 % of the drain thread on the 5K drag.
+ * Each thread keeps the plain-RAM ranges of the current FlatView — GPA bounds
+ * and host pointer, as flatview_for_each_range reports them — and a read
+ * inside one is a memcpy. Rebuilt when the FlatView changes. Anything else,
+ * and any read crossing a range's end, takes address_space_read as before.
+ *
+ * v1/v2 cached the section memory_region_find(mr, gpa, 1) returned, which is
+ * the 1-byte intersection with the request, not the region: every later read
+ * missed, paid memory_region_find, and then address_space_read anyway (the
+ * ~10 % slowdown the frf and fa3 runs measured).
  */
 static int reims_vgpu_shim_read_fast_mode = -1;
 
-typedef struct ReimsVgpuReadCache {
+#define REIMS_VGPU_READ_RANGES 8
+typedef struct ReimsVgpuReadRanges {
     FlatView *fv;
-    uint64_t lo, hi;        /* [lo, hi) of guest physical address space */
-    uint8_t *host;          /* host address of `lo` */
-    bool ok;                /* false: a section to read through address_space_read */
-} ReimsVgpuReadCache;
+    int n;
+    uint64_t lo[REIMS_VGPU_READ_RANGES], hi[REIMS_VGPU_READ_RANGES];
+    uint8_t *host[REIMS_VGPU_READ_RANGES];
+} ReimsVgpuReadRanges;
 
-/*
- * Four sections per thread: main memory is two (below and above 4 GiB) and the
- * drain's reads alternate between them (page tables vs. data). One entry
- * missed on nearly every read and paid memory_region_find each time, which
- * made the drag 10 % slower than the uncached path (frf*, 2026-10-01).
- */
-#define REIMS_VGPU_READ_CACHE_N 4
-static __thread ReimsVgpuReadCache reims_vgpu_read_cache[REIMS_VGPU_READ_CACHE_N];
-static __thread unsigned reims_vgpu_read_cache_next;
+static __thread ReimsVgpuReadRanges reims_vgpu_read_ranges;
+
+static bool reims_vgpu_shim_read_range_cb(Int128 start, Int128 len, const MemoryRegion *mr,
+                                          hwaddr offset_in_region, void *opaque)
+{
+    ReimsVgpuReadRanges *r = opaque;
+
+    if (r->n == REIMS_VGPU_READ_RANGES) {
+        return true;    /* stop: the main RAM ranges come first and are what matters */
+    }
+    if (!memory_region_is_ram((MemoryRegion *)mr) ||
+        memory_region_is_ram_device((MemoryRegion *)mr) || mr->rom_device ||
+        int128_get64(len) < (1u << 20)) {
+        return false;
+    }
+    r->lo[r->n] = int128_get64(start);
+    r->hi[r->n] = r->lo[r->n] + int128_get64(len);
+    r->host[r->n] = (uint8_t *)memory_region_get_ram_ptr((MemoryRegion *)mr) + offset_in_region;
+    r->n++;
+    return false;
+}
 
 static bool reims_vgpu_shim_read_cached(uint64_t gpa, uint8_t *buf, size_t len)
 {
-    ReimsVgpuReadCache *c;
-    MemoryRegionSection sec;
+    ReimsVgpuReadRanges *r = &reims_vgpu_read_ranges;
     FlatView *fv;
-    uint64_t size;
     int i;
 
     if (gpa + len < gpa) {
@@ -79,35 +95,18 @@ static bool reims_vgpu_shim_read_cached(uint64_t gpa, uint8_t *buf, size_t len)
     }
     RCU_READ_LOCK_GUARD();
     fv = address_space_to_flatview(&address_space_memory);
-    for (i = 0; i < REIMS_VGPU_READ_CACHE_N; i++) {
-        c = &reims_vgpu_read_cache[i];
-        if (c->fv == fv && gpa >= c->lo && gpa + len <= c->hi) {
-            if (!c->ok) {
-                return false;
-            }
-            memcpy(buf, c->host + (gpa - c->lo), len);
+    if (r->fv != fv) {
+        r->n = 0;
+        flatview_for_each_range(fv, reims_vgpu_shim_read_range_cb, r);
+        r->fv = fv;
+    }
+    for (i = 0; i < r->n; i++) {
+        if (gpa >= r->lo[i] && gpa + len <= r->hi[i]) {
+            memcpy(buf, r->host[i] + (gpa - r->lo[i]), len);
             return true;
         }
     }
-    sec = memory_region_find(get_system_memory(), gpa, 1);
-    if (!sec.mr) {
-        return false;
-    }
-    size = int128_get64(sec.size);
-    c = &reims_vgpu_read_cache[reims_vgpu_read_cache_next++ % REIMS_VGPU_READ_CACHE_N];
-    c->lo = sec.offset_within_address_space;
-    c->hi = c->lo + size;
-    c->ok = memory_region_is_ram(sec.mr) && !memory_region_is_ram_device(sec.mr) &&
-            !sec.mr->rom_device && size >= (1u << 20);
-    c->host = c->ok ? (uint8_t *)memory_region_get_ram_ptr(sec.mr) + sec.offset_within_region
-                    : NULL;
-    c->fv = fv;
-    memory_region_unref(sec.mr);
-    if (!c->ok || gpa < c->lo || gpa + len > c->hi) {
-        return false;
-    }
-    memcpy(buf, c->host + (gpa - c->lo), len);
-    return true;
+    return false;
 }
 
 int reims_vgpu_shim_read_gpa(void *ctx, uint64_t gpa, uint8_t *buf, size_t len)
@@ -121,8 +120,7 @@ int reims_vgpu_shim_read_gpa(void *ctx, uint64_t gpa, uint8_t *buf, size_t len)
     if (reims_vgpu_shim_read_fast_mode < 0) {
         const char *e = getenv("REIMS_VGPU_LAB_READ_FAST");
 
-        /* Opt-in: on, the 5K drag ran ~10 % slower in two A/Bs (frf*, fa3*). */
-        reims_vgpu_shim_read_fast_mode = e && strcmp(e, "on") == 0;
+        reims_vgpu_shim_read_fast_mode = !(e && strcmp(e, "off") == 0);
     }
     if (reims_vgpu_shim_read_fast_mode && reims_vgpu_shim_read_cached(gpa, buf, len)) {
         return 0;
