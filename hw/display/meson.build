@@ -141,7 +141,7 @@ if config_all_devices.has_key('CONFIG_REIMS_VGPU')
     # host-window adds the Rust-owned winit + VkSurfaceKHR presentation window
     # (kb host-window), opt-in at runtime behind REIMS_VGPU_WINDOW. Always built into
     # the vulkan binary; reims_vgpu_qemu_window_start returns ERR_STATE if unused.
-    reims_vgpu_cargo_features = '--no-default-features --features backend-vulkan,host-window'
+    reims_vgpu_cargo_features = '--no-default-features --features backend-vulkan,host-window,lab-tcache'
     # ash loads the Vulkan loader at runtime; no link-time Vulkan dep.
     if host_os == 'darwin'
       # winit/raw-window-metal link against the native macOS windowing stack even
