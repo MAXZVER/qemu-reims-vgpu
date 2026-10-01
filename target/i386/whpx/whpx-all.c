@@ -1154,6 +1154,18 @@ static bool whpx_mmio_fast_path(void)
     return qatomic_read(&on) > 0;
 }
 
+/* TEMP lab: QEMU_WHPX_MMIO_FAST_STORE=1 turns on whpx_mmio_fast_store. */
+static bool whpx_mmio_fast_store_path(void)
+{
+    static int on = -1;
+
+    if (qatomic_read(&on) < 0) {
+        const char *v = g_getenv("QEMU_WHPX_MMIO_FAST_STORE");
+        qatomic_set(&on, v && strcmp(v, "1") == 0);
+    }
+    return qatomic_read(&on) > 0;
+}
+
 /*
  * QEMU_WHPX_PRERUN_FAST=1 lets a pre-run with nothing pending skip the BQL.
  * Opt-in: no frame-rate gain has been measured through the guest's bimodal
@@ -1199,6 +1211,41 @@ static void whpx_stats_mmio_page(uint64_t gpa)
         if (whpx_stats.hits[s] == 0 || whpx_stats.page[s] == pg) {
             whpx_stats.page[s] = pg;
             whpx_stats.hits[s]++;
+            break;
+        }
+    }
+    qemu_mutex_unlock(&whpx_stats.lock);
+}
+
+/*
+ * TEMP lab: the MMIO exits that took the generic (emulated) path, by register
+ * address, access type and leading instruction bytes, so the instruction forms
+ * a fast path would have to cover are named rather than guessed.
+ */
+#define WHPX_SLOW_N 32
+static struct {
+    uint64_t gpa[WHPX_SLOW_N], hits[WHPX_SLOW_N];
+    uint8_t ib[WHPX_SLOW_N][6], nib[WHPX_SLOW_N], type[WHPX_SLOW_N];
+} whpx_slow;
+
+static void whpx_stats_mmio_slow(const WHV_MEMORY_ACCESS_CONTEXT *ctx)
+{
+    unsigned i, n = MIN(ctx->InstructionByteCount, 6u);
+    unsigned slot = (unsigned)((ctx->Gpa ^ ((uint64_t)ctx->InstructionBytes[0] << 40)) *
+                               0x9E3779B97F4A7C15ULL >> 59);
+
+    qemu_mutex_lock(&whpx_stats.lock);
+    for (i = 0; i < WHPX_SLOW_N; i++) {
+        unsigned s = (slot + i) % WHPX_SLOW_N;
+        if (whpx_slow.hits[s] == 0) {
+            whpx_slow.gpa[s] = ctx->Gpa;
+            whpx_slow.type[s] = ctx->AccessInfo.AccessType;
+            whpx_slow.nib[s] = n;
+            memcpy(whpx_slow.ib[s], ctx->InstructionBytes, n);
+        }
+        if (whpx_slow.gpa[s] == ctx->Gpa && whpx_slow.type[s] == ctx->AccessInfo.AccessType &&
+            whpx_slow.nib[s] == n && memcmp(whpx_slow.ib[s], ctx->InstructionBytes, n) == 0) {
+            whpx_slow.hits[s]++;
             break;
         }
     }
@@ -1254,6 +1301,27 @@ static void whpx_stats_maybe_print(void)
                                whpx_stats.page[top[i]], best[i]);
     }
     memset(whpx_stats.hits, 0, sizeof(whpx_stats.hits));
+    g_string_append(s, " mmio_slow=");
+    for (unsigned j = 0; j < 4; j++) {
+        unsigned b = WHPX_SLOW_N, k;
+        for (i = 0; i < WHPX_SLOW_N; i++) {
+            if (whpx_slow.hits[i] && (b == WHPX_SLOW_N || whpx_slow.hits[i] > whpx_slow.hits[b])) {
+                b = i;
+            }
+        }
+        if (b == WHPX_SLOW_N) {
+            break;
+        }
+        g_string_append_printf(s, "%s0x%" PRIx64 ":%c:", j ? "," : "", whpx_slow.gpa[b],
+                               whpx_slow.type[b] == WHvMemoryAccessWrite ? 'w' : 'r');
+        for (k = 0; k < whpx_slow.nib[b]; k++) {
+            g_string_append_printf(s, "%02x", whpx_slow.ib[b][k]);
+        }
+        g_string_append_printf(s, ":%" PRIu64, whpx_slow.hits[b]);
+        whpx_slow.hits[b] = 0;   /* taken; the rest are cleared below */
+        whpx_slow.gpa[b] = ~0ULL;
+    }
+    memset(&whpx_slow, 0, sizeof(whpx_slow));
     qemu_mutex_unlock(&whpx_stats.lock);
     fprintf(stderr, "%s\n", s->str);
     g_string_free(s, true);
@@ -1350,6 +1418,109 @@ static bool whpx_mmio_fast_load(CPUState *cpu,
     return true;
 }
 
+/*
+ * TEMP lab (QEMU_WHPX_MMIO_FAST_STORE=1): the store twin of
+ * whpx_mmio_fast_load, for the register writes a busy guest makes to a region
+ * that declared lockless I/O (the display device's doorbells and acks; its
+ * write handler takes the BQL itself). Shapes: mov [mem], r32/r64 (89 /r) and
+ * mov [mem], imm32 (C7 /0, sign-extended under REX.W), 64-bit code, at most a
+ * REX prefix. The generic path fetches and writes back every GPR and walks the
+ * guest page tables for the linear address (~8 us an exit); this one reads at
+ * most the one source register and writes RIP.
+ */
+static bool whpx_mmio_fast_store(CPUState *cpu,
+                                 const WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
+{
+    const WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
+    const WHV_VP_EXIT_CONTEXT *vp = &exit_ctx->VpContext;
+    const uint8_t *b = ctx->InstructionBytes;
+    unsigned n = ctx->InstructionByteCount, i = 0, rex = 0, disp, imm = 0;
+    unsigned op, modrm, mod, rm, size;
+    MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+    WHV_REGISTER_NAME name;
+    WHV_REGISTER_VALUE value = {};
+    MemoryRegion *mr;
+    hwaddr xlat, len;
+    uint64_t val = 0;
+    HRESULT hr;
+
+    if (ctx->AccessInfo.AccessType != WHvMemoryAccessWrite ||
+        !vp->ExecutionState.EferLma || !vp->Cs.Long ||
+        vp->ExecutionState.InterruptionPending || (vp->Rflags & TF_MASK)) {
+        return false;
+    }
+    if (i < n && (b[i] & 0xf0) == 0x40) {
+        rex = b[i++];
+    }
+    if (i + 2 > n || (b[i] != 0x89 && b[i] != 0xc7)) {
+        return false;
+    }
+    op = b[i];
+    modrm = b[i + 1];
+    i += 2;
+    mod = modrm >> 6;
+    rm = modrm & 7;
+    if (mod == 3 || (op == 0xc7 && ((modrm >> 3) & 7) != 0)) {
+        return false;
+    }
+    disp = mod == 1 ? 1 : mod == 2 ? 4 : 0;
+    if (rm == 4) {
+        if (i >= n) {
+            return false;
+        }
+        if (mod == 0 && (b[i] & 7) == 5) {
+            disp = 4;                   /* SIB, no base: disp32 */
+        }
+        i++;
+    } else if (mod == 0 && rm == 5) {
+        disp = 4;                       /* RIP-relative */
+    }
+    i += disp;
+    if (op == 0xc7) {
+        if (i + 4 > n) {
+            return false;
+        }
+        imm = (uint32_t)b[i] | (uint32_t)b[i + 1] << 8 | (uint32_t)b[i + 2] << 16 |
+              (uint32_t)b[i + 3] << 24;
+        i += 4;
+    }
+    if (i > n) {
+        return false;
+    }
+    size = (rex & 8) ? 8 : 4;
+
+    RCU_READ_LOCK_GUARD();
+    len = size;
+    mr = address_space_translate(&address_space_memory, ctx->Gpa, &xlat, &len,
+                                 true, attrs);
+    if (!mr->lockless_io || len < size ||
+        memory_access_is_direct(mr, true, attrs)) {
+        return false;
+    }
+    if (op == 0xc7) {
+        val = size == 8 ? (uint64_t)(int64_t)(int32_t)imm : imm;
+    } else {
+        name = (WHV_REGISTER_NAME)(WHvX64RegisterRax +
+                                   (((modrm >> 3) & 7) | ((rex & 4) << 1)));
+        hr = whp_dispatch.WHvGetVirtualProcessorRegisters(
+            whpx_global.partition, cpu->cpu_index, &name, 1, &value);
+        if (FAILED(hr)) {
+            return false;
+        }
+        val = size == 4 ? (uint32_t)value.Reg64 : value.Reg64;
+    }
+    /* Past here the device sees the store; the instruction must retire. */
+    memory_region_dispatch_write(mr, xlat, val, size_memop(size), attrs);
+    name = WHvX64RegisterRip;
+    value.Reg64 = vp->Rip + i;
+    hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
+        whpx_global.partition, cpu->cpu_index, &name, 1, &value);
+    if (FAILED(hr)) {
+        error_report("WHPX: fast MMIO store: failed to set RIP, hr=%08lx", hr);
+    }
+    return true;
+}
+
 static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
 {
     WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
@@ -1366,7 +1537,9 @@ static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
     }
 
     cpu->accel->mmio_fast = whpx_mmio_fast_path() &&
-                            whpx_mmio_fast_load(cpu, exit_ctx);
+                            (whpx_mmio_fast_load(cpu, exit_ctx) ||
+                             (whpx_mmio_fast_store_path() &&
+                              whpx_mmio_fast_store(cpu, exit_ctx)));
     if (cpu->accel->mmio_fast) {
         if (whpx_stats_on()) {
             whpx_stats_mmio_page(ctx->Gpa);
@@ -1388,6 +1561,7 @@ static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
         bql_lock();
         qatomic_add(&whpx_stats.mmio_bql_ns, get_clock() - t0);
         whpx_stats_mmio_page(ctx->Gpa);
+        whpx_stats_mmio_slow(ctx);
     } else {
         bql_lock();
     }
