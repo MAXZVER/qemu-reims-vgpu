@@ -53,37 +53,58 @@ typedef struct ReimsVgpuReadCache {
     FlatView *fv;
     uint64_t lo, hi;        /* [lo, hi) of guest physical address space */
     uint8_t *host;          /* host address of `lo` */
+    bool ok;                /* false: a section to read through address_space_read */
 } ReimsVgpuReadCache;
 
-static __thread ReimsVgpuReadCache reims_vgpu_read_cache;
+/*
+ * Four sections per thread: main memory is two (below and above 4 GiB) and the
+ * drain's reads alternate between them (page tables vs. data). One entry
+ * missed on nearly every read and paid memory_region_find each time, which
+ * made the drag 10 % slower than the uncached path (frf*, 2026-10-01).
+ */
+#define REIMS_VGPU_READ_CACHE_N 4
+static __thread ReimsVgpuReadCache reims_vgpu_read_cache[REIMS_VGPU_READ_CACHE_N];
+static __thread unsigned reims_vgpu_read_cache_next;
 
 static bool reims_vgpu_shim_read_cached(uint64_t gpa, uint8_t *buf, size_t len)
 {
-    ReimsVgpuReadCache *c = &reims_vgpu_read_cache;
+    ReimsVgpuReadCache *c;
+    MemoryRegionSection sec;
     FlatView *fv;
+    uint64_t size;
+    int i;
 
+    if (gpa + len < gpa) {
+        return false;
+    }
     RCU_READ_LOCK_GUARD();
     fv = address_space_to_flatview(&address_space_memory);
-    if (c->fv != fv || gpa < c->lo || gpa + len > c->hi || gpa + len < gpa) {
-        MemoryRegionSection sec = memory_region_find(get_system_memory(), gpa, 1);
-        uint64_t size;
-
-        c->fv = NULL;
-        if (!sec.mr) {
-            return false;
+    for (i = 0; i < REIMS_VGPU_READ_CACHE_N; i++) {
+        c = &reims_vgpu_read_cache[i];
+        if (c->fv == fv && gpa >= c->lo && gpa + len <= c->hi) {
+            if (!c->ok) {
+                return false;
+            }
+            memcpy(buf, c->host + (gpa - c->lo), len);
+            return true;
         }
-        size = int128_get64(sec.size);
-        if (memory_region_is_ram(sec.mr) && !memory_region_is_ram_device(sec.mr) &&
-            !sec.mr->rom_device && size >= (1u << 20)) {
-            c->lo = sec.offset_within_address_space;
-            c->hi = c->lo + size;
-            c->host = (uint8_t *)memory_region_get_ram_ptr(sec.mr) + sec.offset_within_region;
-            c->fv = fv;
-        }
-        memory_region_unref(sec.mr);
-        if (!c->fv || gpa < c->lo || gpa + len > c->hi) {
-            return false;
-        }
+    }
+    sec = memory_region_find(get_system_memory(), gpa, 1);
+    if (!sec.mr) {
+        return false;
+    }
+    size = int128_get64(sec.size);
+    c = &reims_vgpu_read_cache[reims_vgpu_read_cache_next++ % REIMS_VGPU_READ_CACHE_N];
+    c->lo = sec.offset_within_address_space;
+    c->hi = c->lo + size;
+    c->ok = memory_region_is_ram(sec.mr) && !memory_region_is_ram_device(sec.mr) &&
+            !sec.mr->rom_device && size >= (1u << 20);
+    c->host = c->ok ? (uint8_t *)memory_region_get_ram_ptr(sec.mr) + sec.offset_within_region
+                    : NULL;
+    c->fv = fv;
+    memory_region_unref(sec.mr);
+    if (!c->ok || gpa < c->lo || gpa + len > c->hi) {
+        return false;
     }
     memcpy(buf, c->host + (gpa - c->lo), len);
     return true;
