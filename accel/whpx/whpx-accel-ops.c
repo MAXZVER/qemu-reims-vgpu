@@ -19,6 +19,7 @@
 #include "system/whpx-internal.h"
 #include "system/whpx-all.h"
 #include "system/whpx-accel-ops.h"
+#include "system/whpx-wp.h"
 
 static void *whpx_cpu_thread_fn(void *arg)
 {
@@ -32,6 +33,7 @@ static void *whpx_cpu_thread_fn(void *arg)
     cpu->thread_id = qemu_get_thread_id();
     current_cpu = cpu;
 
+    whpx_lab_pin_pcores("vcpu");
     r = whpx_init_vcpu(cpu);
     if (r < 0) {
         fprintf(stderr, "whpx_init_vcpu failed: %s\n", strerror(-r));

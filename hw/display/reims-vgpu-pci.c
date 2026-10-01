@@ -13,6 +13,9 @@
  */
 
 #include "qemu/osdep.h"
+#if defined(_WIN32)
+#include "system/whpx-wp.h"
+#endif
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/main-loop.h"
@@ -1000,6 +1003,7 @@ static void *reims_vgpu_pci_drain_thread(void *opaque)
 
 #if defined(_WIN32)
     reims_vgpu_hiqos_apply(false);
+    whpx_lab_pin_pcores("drain");
 #endif
 
     /*

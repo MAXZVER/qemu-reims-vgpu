@@ -322,6 +322,67 @@ static void whpx_dirty_tracking_disable(const char *why, HRESULT hr)
  * met a range between its unmap and its map tell that apart and retry.
  */
 bool (*whpx_wp_fault_hook)(uint64_t gpa);
+
+#if _WIN32_WINNT < 0x0A00   /* declared only for Windows 10 targets; present since Windows 10 */
+WINBASEAPI WINBOOL WINAPI GetSystemCpuSetInformation(PSYSTEM_CPU_SET_INFORMATION Information,
+                                                     ULONG BufferLength, PULONG ReturnedLength,
+                                                     HANDLE Process, ULONG Flags);
+WINBASEAPI WINBOOL WINAPI SetThreadSelectedCpuSets(HANDLE Thread, const ULONG *CpuSetIds,
+                                                   ULONG CpuSetIdCount);
+#endif
+
+/*
+ * Lab REIMS_VGPU_LAB_PCORES=on: the calling thread prefers the performance
+ * cores of a hybrid CPU (i7-14700K: 8 performance cores with two threads each,
+ * 12 efficiency cores), through a CPU-set selection (a preference the scheduler
+ * keeps, not a hard affinity). For the vCPU threads, the device drain and its
+ * recorder, which a frame waits for in turn.
+ */
+void whpx_lab_pin_pcores(const char *who)
+{
+    static int on = -1;
+    ULONG need = 0, ids[256], n = 0;
+    uint8_t *buf;
+    uint8_t maxc = 0;
+    size_t off;
+
+    if (on < 0) {
+        const char *e = getenv("REIMS_VGPU_LAB_PCORES");
+        on = e && strcmp(e, "on") == 0;
+    }
+    if (!on) {
+        return;
+    }
+    GetSystemCpuSetInformation(NULL, 0, &need, NULL, 0);
+    buf = need ? g_malloc0(need) : NULL;
+    if (!buf || !GetSystemCpuSetInformation((PSYSTEM_CPU_SET_INFORMATION)buf, need, &need,
+                                            NULL, 0)) {
+        g_free(buf);
+        return;
+    }
+    for (off = 0; off + 19 <= need;) {
+        PSYSTEM_CPU_SET_INFORMATION r = (PSYSTEM_CPU_SET_INFORMATION)(buf + off);
+        if (!r->Size) {
+            break;
+        }
+        maxc = MAX(maxc, r->CpuSet.EfficiencyClass);
+        off += r->Size;
+    }
+    for (off = 0; off + 19 <= need && n < G_N_ELEMENTS(ids);) {
+        PSYSTEM_CPU_SET_INFORMATION r = (PSYSTEM_CPU_SET_INFORMATION)(buf + off);
+        if (!r->Size) {
+            break;
+        }
+        if (r->CpuSet.EfficiencyClass == maxc) {
+            ids[n++] = r->CpuSet.Id;
+        }
+        off += r->Size;
+    }
+    g_free(buf);
+    if (n && SetThreadSelectedCpuSets(GetCurrentThread(), ids, n)) {
+        fprintf(stderr, "reims-pcores %s: %lu performance cpu sets\n", who, (unsigned long)n);
+    }
+}
 void (*whpx_wp_invalidate_hook)(void);
 static int whpx_wp_busy;
 static unsigned whpx_wp_gen;
