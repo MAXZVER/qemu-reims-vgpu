@@ -37,12 +37,72 @@ static const MemTxAttrs reims_vgpu_shim_ram_attrs = {
     .memory = true,
 };
 
+/*
+ * TEMP lab REIMS_VGPU_LAB_READ_FAST (=off disables): the drain reads guest RAM
+ * mostly a word at a time (page-table walks, object lists), and a 5K drag
+ * profile put address_space_read's translation (RCU, flatview lookup, dispatch)
+ * at ~8 % of the drain thread. Each thread remembers the last plain-RAM section
+ * it read from — its GPA bounds and host pointer, valid for one FlatView — so a
+ * read inside it is a memcpy. Only RAM sections of at least 1 MiB are kept
+ * (the guest's main memory); everything else, and any read crossing the
+ * section's end, takes address_space_read exactly as before.
+ */
+static int reims_vgpu_shim_read_fast_mode = -1;
+
+typedef struct ReimsVgpuReadCache {
+    FlatView *fv;
+    uint64_t lo, hi;        /* [lo, hi) of guest physical address space */
+    uint8_t *host;          /* host address of `lo` */
+} ReimsVgpuReadCache;
+
+static __thread ReimsVgpuReadCache reims_vgpu_read_cache;
+
+static bool reims_vgpu_shim_read_cached(uint64_t gpa, uint8_t *buf, size_t len)
+{
+    ReimsVgpuReadCache *c = &reims_vgpu_read_cache;
+    FlatView *fv;
+
+    RCU_READ_LOCK_GUARD();
+    fv = address_space_to_flatview(&address_space_memory);
+    if (c->fv != fv || gpa < c->lo || gpa + len > c->hi || gpa + len < gpa) {
+        MemoryRegionSection sec = memory_region_find(get_system_memory(), gpa, 1);
+        uint64_t size;
+
+        c->fv = NULL;
+        if (!sec.mr) {
+            return false;
+        }
+        size = int128_get64(sec.size);
+        if (memory_region_is_ram(sec.mr) && !memory_region_is_ram_device(sec.mr) &&
+            !sec.mr->rom_device && size >= (1u << 20)) {
+            c->lo = sec.offset_within_address_space;
+            c->hi = c->lo + size;
+            c->host = (uint8_t *)memory_region_get_ram_ptr(sec.mr) + sec.offset_within_region;
+            c->fv = fv;
+        }
+        memory_region_unref(sec.mr);
+        if (!c->fv || gpa < c->lo || gpa + len > c->hi) {
+            return false;
+        }
+    }
+    memcpy(buf, c->host + (gpa - c->lo), len);
+    return true;
+}
+
 int reims_vgpu_shim_read_gpa(void *ctx, uint64_t gpa, uint8_t *buf, size_t len)
 {
     MemTxResult r;
 
     (void)ctx;
     if (!buf || len == 0) {
+        return 0;
+    }
+    if (reims_vgpu_shim_read_fast_mode < 0) {
+        const char *e = getenv("REIMS_VGPU_LAB_READ_FAST");
+
+        reims_vgpu_shim_read_fast_mode = !(e && strcmp(e, "off") == 0);
+    }
+    if (reims_vgpu_shim_read_fast_mode && reims_vgpu_shim_read_cached(gpa, buf, len)) {
         return 0;
     }
     r = address_space_read(&address_space_memory, gpa,
