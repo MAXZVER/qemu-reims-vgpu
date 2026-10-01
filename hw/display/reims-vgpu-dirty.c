@@ -90,6 +90,14 @@ typedef struct ReimsVgpuDirtySet {
      * difference, so it sees the generation and the stamps of one evaluation.
      */
     uint32_t eval_seq;
+    /*
+     * Lab DIRTY_PERIOD: the needed epoch of this set's last read, and the gaps
+     * (in epochs, saturating at 255) between its last four distinct needed
+     * epochs, newest in the low byte; 0 = no history. Written by readers with
+     * plain atomic stores: a lost update only makes the hint older.
+     */
+    uint64_t rd_epoch;
+    uint32_t rd_gaps;
 } ReimsVgpuDirtySet;
 
 /*
@@ -399,6 +407,33 @@ struct ReimsVgpuDirty {
      * after it is exact in the strict sense) and its reads need that epoch.
      */
     uint32_t hole_mode;           /* 0 off, 1 census, 2 close, 3 tail */
+    /*
+     * REIMS_VGPU_LAB_DIRTY_PERIOD=on: a set of at least `period_big` pages joins
+     * a prefetch batch only when the batch's epoch is at least its shortest
+     * recent read gap past its last read. A set read once a frame spans ~3
+     * doorbell epochs, and the batch of every doorbell synced it: two of three
+     * syncs of the full-screen sets were never read (5K light scene trace,
+     * 2026-10-01: 7 sets of 2-11k pages, 98 % of batch-synced first reads
+     * unused), and their hypervisor queries are what the drain's own syncs queue
+     * behind. Only which sets a batch takes changes; a read that finds its set
+     * stale still syncs it, as before.
+     */
+    uint32_t period_mode;
+    uint64_t period_big;
+    /*
+     * REIMS_VGPU_LAB_DIRTY_BIGSPLIT=on: sets of at least `period_big` pages are
+     * not part of the prefetch batch. The batch publishes every set it holds
+     * only once the whole union has been queried, consumed and evaluated (~1.9
+     * ms after its doorbell at 5K, median), and the drain reaches a full-screen
+     * set ~1.5 ms after it (median; a quarter before 0.6 ms), so it synced most
+     * of them itself, beside the batch querying the same pages. Here each big set
+     * goes to a worker as its own sync (read order, no split, so they run side by
+     * side), published when that sync ends; a drain that reaches one a worker
+     * holds waits for that one sync. The small sets keep the batch.
+     */
+    uint32_t bigsplit_mode;
+    uint64_t lab_bigsplit_sets;
+    uint64_t lab_period_skipped, lab_period_taken;
     uint64_t lab_hole_closed;
     /*
      * DIRTY_HOLE=tail. Per channel, a child-ring tail every packet up to which
@@ -1085,9 +1120,55 @@ static uint64_t reims_vgpu_dirty_memo_answer(ReimsVgpuDirty *d, ReimsVgpuDirtySe
  * one and under nothing in the other. The read-order bookkeeping only steers the
  * prefetch; a race over it costs a worse prefetch order, never an answer.
  */
+/* Lab DIRTY_PERIOD: remember the needed epoch of a read and its gap. */
+static inline void reims_vgpu_dirty_note_read_epoch(ReimsVgpuDirty *d,
+                                                    ReimsVgpuDirtySet *s,
+                                                    uint64_t needed)
+{
+    uint64_t last;
+
+    if (!d->period_mode || needed == 0) {
+        return;
+    }
+    last = qatomic_read(&s->rd_epoch);
+    if (needed <= last) {
+        return;
+    }
+    qatomic_set(&s->rd_epoch, needed);
+    if (last) {
+        uint32_t gap = (uint32_t)MIN(needed - last, 255);
+
+        qatomic_set(&s->rd_gaps, (qatomic_read(&s->rd_gaps) << 8) | gap);
+    }
+}
+
+/*
+ * Lab DIRTY_PERIOD: whether a batch for `epoch` should take `s`. A set with no
+ * gap history is taken (as every hot set was); otherwise only from its shortest
+ * recent gap past its last read on. d->lock held.
+ */
+static bool reims_vgpu_dirty_period_due(const ReimsVgpuDirtySet *s, uint64_t epoch)
+{
+    uint32_t gaps = qatomic_read(&s->rd_gaps), floor = 255, g;
+    uint64_t last = qatomic_read(&s->rd_epoch);
+    int k;
+
+    if (gaps == 0 || last == 0) {
+        return true;
+    }
+    for (k = 0; k < 4; k++) {
+        g = (gaps >> (8 * k)) & 0xff;
+        if (g) {
+            floor = MIN(floor, g);
+        }
+    }
+    return epoch >= last + floor;
+}
+
 static void reims_vgpu_dirty_gen_hit(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
                                      uint64_t token, uint64_t needed, uint64_t epoch)
 {
+    reims_vgpu_dirty_note_read_epoch(d, s, needed);
     uint64_t hv = qatomic_read(&d->harvests) + 1;
 
     if (qatomic_read(&s->lab_last_read) != hv) {
@@ -1383,6 +1464,7 @@ uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token)
             gen = reims_vgpu_dirty_memo_answer(d, s, needed_pre, gen);
         }
         s->lab_last_read = d->harvests + 1;
+        reims_vgpu_dirty_note_read_epoch(d, s, needed_pre);
         if (d->lab_tr) {   /* TEMP lab (FGTRACE) */
             s->lab_nreads++;
             s->lab_pref = 0;
@@ -2826,7 +2908,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
      */
     qemu_mutex_lock(&d->lock);
     if (d->od_split && d->od_nworkers > 0 && walked_pages >= 4096 &&
-        !d->split_busy) {
+        !d->split_busy && (fg || !d->bigsplit_mode)) {
         guint k;
 
         /* The pieces carry their own tickets; this one has queried nothing. */
@@ -2958,7 +3040,9 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                     " wait_us=%" PRIu64 " prep_us=%" PRIu64 " query_us=%" PRIu64
                     " settle_us=%" PRIu64 " consume_us=%" PRIu64
                     " fg_ahead=%" PRIu64 " fg_missed=%" PRIu64 " fg_cold=%" PRIu64
-                    " gen_fast=%" PRIu64 " db_coalesced=%" PRIu64 " gen_lagged=%" PRIu64 "\n",
+                    " gen_fast=%" PRIu64 " db_coalesced=%" PRIu64 " gen_lagged=%" PRIu64
+                    " period=%u period_skipped=%" PRIu64 " period_taken=%" PRIu64
+                    " bigsplit=%u bigsplit_sets=%" PRIu64 "\n",
                     g_get_real_time() / 1000, d->lab_od_n, d->lab_od_ns / 1000,
                     d->lab_od_pages, d->lab_od_skipped, d->lab_od_epochs,
                     d->lab_od_fg_n, d->lab_od_fg_ns / 1000, d->lab_ph_wait / 1000,
@@ -2966,7 +3050,11 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                     d->lab_ph_settle / 1000, d->lab_ph_consume / 1000,
                     d->lab_fg_ahead, d->lab_fg_missed, d->lab_fg_cold,
                     qatomic_xchg(&d->lab_gen_fast, 0), d->lab_db_coalesced,
-                    qatomic_xchg(&d->lab_gen_lagged, 0));
+                    qatomic_xchg(&d->lab_gen_lagged, 0), d->period_mode,
+                    d->lab_period_skipped, d->lab_period_taken,
+                    d->bigsplit_mode, d->lab_bigsplit_sets);
+            d->lab_period_skipped = d->lab_period_taken = 0;
+            d->lab_bigsplit_sets = 0;
             d->lab_db_coalesced = 0;
             d->lab_fg_ahead = d->lab_fg_missed = d->lab_fg_cold = 0;
             d->lab_ph_wait = d->lab_ph_prep = d->lab_ph_query = 0;
@@ -3167,6 +3255,12 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
         d->epoch_named = reims_vgpu_dirty_lab_mode("REIMS_VGPU_LAB_EPOCH_NAMED") == 1;
         d->lf_mode = getenv("REIMS_VGPU_LAB_GEN_LOCKFREE")
                      ? reims_vgpu_dirty_lab_mode("REIMS_VGPU_LAB_GEN_LOCKFREE") : 1;
+        d->period_mode = getenv("REIMS_VGPU_LAB_DIRTY_PERIOD") &&     /* lab A/B */
+                         strcmp(getenv("REIMS_VGPU_LAB_DIRTY_PERIOD"), "on") == 0;
+        d->bigsplit_mode = getenv("REIMS_VGPU_LAB_DIRTY_BIGSPLIT") &&   /* lab A/B */
+                           strcmp(getenv("REIMS_VGPU_LAB_DIRTY_BIGSPLIT"), "on") == 0;
+        d->period_big = getenv("REIMS_VGPU_LAB_DIRTY_PERIOD_BIG") ?
+                        MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_PERIOD_BIG"))) : 2048;
         d->hole_mode = !getenv("REIMS_VGPU_LAB_DIRTY_HOLE") ? 0 :
                        strcmp(getenv("REIMS_VGPU_LAB_DIRTY_HOLE"), "census") == 0 ? 1 :
                        strcmp(getenv("REIMS_VGPU_LAB_DIRTY_HOLE"), "close") == 0 ? 2 :
@@ -3681,6 +3775,14 @@ void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
         if (set->synced_epoch < epoch && set->last_query_epoch + d->od_hot >= epoch) {
             ReimsVgpuDirtyOrdered o = { set->read_order, *(uint64_t *)key };
 
+            if (d->period_mode &&
+                set->count * (set->page_size >> qemu_target_page_bits()) >= d->period_big) {
+                if (!reims_vgpu_dirty_period_due(set, epoch)) {
+                    d->lab_period_skipped++;
+                    continue;
+                }
+                d->lab_period_taken++;
+            }
             g_array_append_val(order, o);
         }
     }
@@ -3692,6 +3794,35 @@ void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
     g_array_sort(order, reims_vgpu_dirty_cmp_ordered);
     for (t = 0; t < order->len; t++) {
         g_array_append_val(tokens, g_array_index(order, ReimsVgpuDirtyOrdered, t).token);
+    }
+    if (d->od_pbatch && d->bigsplit_mode && d->od_nworkers > 0) {
+        g_autoptr(GArray) small = g_array_new(FALSE, FALSE, sizeof(uint64_t));
+        guint nbig = 0;
+
+        g_array_set_size(d->od_work, 0);
+        for (t = 0; t < tokens->len; t++) {
+            uint64_t tk = g_array_index(tokens, uint64_t, t);
+            ReimsVgpuDirtySet *set = g_hash_table_lookup(d->sets, &tk);
+
+            if (set && set->count * (set->page_size >> qemu_target_page_bits()) >=
+                d->period_big) {
+                g_array_append_val(d->od_work, tk);
+                nbig++;
+            } else {
+                g_array_append_val(small, tk);
+            }
+        }
+        if (nbig) {
+            d->od_work_next = 0;
+            d->od_work_epoch = epoch;
+            d->lab_bigsplit_sets += nbig;
+            qemu_cond_broadcast(&d->od_work_cond);
+        }
+        qemu_mutex_unlock(&d->lock);
+        if (small->len) {
+            reims_vgpu_dirty_prefetch_batch(d, small, epoch);
+        }
+        return;
     }
     if (d->od_pbatch) {
         qemu_mutex_unlock(&d->lock);
