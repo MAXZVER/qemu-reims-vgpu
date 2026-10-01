@@ -467,6 +467,9 @@ struct ReimsVgpuDirty {
      * ~0.3 ms each and never written.
      */
     uint32_t wp_mode;
+    bool wp_active;               /* DIRTY_WP=toggle:<file>: the file exists (else always) */
+    bool wp_drop_all;             /* the BH drops every protection (toggled off) */
+    char *wp_toggle;
     uint32_t wp_streak_need;
     uint64_t wp_min_pages;
     QemuMutex wp_mutex;           /* remaps and `wp_list`; taken before `lock` */
@@ -1135,11 +1138,14 @@ static void reims_vgpu_dirty_wp_bh(void *opaque)
     int64_t t0;
     guint i;
 
+    if (qatomic_xchg(&d->wp_drop_all, false)) {
+        reims_vgpu_dirty_wp_invalidate();
+    }
     qemu_mutex_lock(&d->lock);
     g_array_append_vals(todo, d->wp_queue->data, d->wp_queue->len);
     g_array_set_size(d->wp_queue, 0);
     qemu_mutex_unlock(&d->lock);
-    if (!todo->len || !d->wp_mode) {
+    if (!todo->len || !d->wp_mode || !qatomic_read(&d->wp_active)) {
         return;
     }
     if (!d->wp_bits) {
@@ -2449,7 +2455,7 @@ static bool reims_vgpu_dirty_eval_set(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
     smp_wmb();
     qatomic_set(&s->eval_seq, s->eval_seq + 1);   /* even again */
     s->seen_seq = d->global_seq;
-    if (d->wp_mode && !by_harvest && !s->wp_on && s->gen != 0 &&
+    if (d->wp_mode && d->wp_active && !by_harvest && !s->wp_on && s->gen != 0 &&
         s->count * (s->page_size >> shift) >= d->wp_min_pages) {   /* lab DIRTY_WP */
         s->wp_streak = any ? 0 : s->wp_streak + 1;
         if (s->wp_streak == (d->wp_streak_need << MIN(s->wp_lost, 6))) {
@@ -3578,11 +3584,22 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                     d->lab_bigphase_big, d->lab_bigphase_groups, d->frontier_mode,
                     d->lab_frontier_child);
             d->lab_frontier_child = 0;
+            if (d->wp_toggle) {   /* lab DIRTY_WP=toggle: follow the flag file */
+                bool want = g_file_test(d->wp_toggle, G_FILE_TEST_EXISTS);
+
+                if (want != qatomic_read(&d->wp_active)) {
+                    qatomic_set(&d->wp_active, want);
+                    if (!want) {
+                        qatomic_set(&d->wp_drop_all, true);
+                        REIMS_WP_BH_SCHEDULE(d->wp_bh);
+                    }
+                }
+            }
             if (d->wp_mode || d->lab_wp_refused) {   /* lab DIRTY_WP */
-                fprintf(stderr, "reims-dirty-wp on=%u protected=%u protects=%" PRIu64
+                fprintf(stderr, "reims-dirty-wp active=%u protected=%u protects=%" PRIu64
                         " faults=%" PRIu64 " stale=%" PRIu64 " dirty_at_pause=%" PRIu64
                         " refused=%" PRIu64 " remap_us=%" PRId64 " pause_us=%" PRId64 "\n",
-                        d->wp_mode, d->wp_list ? d->wp_list->len : 0, d->lab_wp_protects,
+                        d->wp_active, d->wp_list ? d->wp_list->len : 0, d->lab_wp_protects,
                         d->lab_wp_faults, d->lab_wp_stale, d->lab_wp_dirty_at_pause,
                         d->lab_wp_refused, (int64_t)d->lab_wp_remap_ns / 1000,
                         (int64_t)d->lab_wp_pause_ns / 1000);
@@ -3820,7 +3837,12 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
         if (!d->wp_list) {   /* lab DIRTY_WP */
             const char *w = getenv("REIMS_VGPU_LAB_DIRTY_WP");
 
-            d->wp_mode = w && strcmp(w, "on") == 0;
+            d->wp_mode = w && (strcmp(w, "on") == 0 || strncmp(w, "toggle:", 7) == 0);
+            d->wp_active = true;
+            if (w && strncmp(w, "toggle:", 7) == 0) {
+                d->wp_toggle = g_strdup(w + 7);
+                d->wp_active = g_file_test(d->wp_toggle, G_FILE_TEST_EXISTS);
+            }
             d->wp_streak_need = getenv("REIMS_VGPU_LAB_DIRTY_WP_STREAK") ?
                                 MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_STREAK"))) : 16;
             d->wp_min_pages = getenv("REIMS_VGPU_LAB_DIRTY_WP_MIN") ?
