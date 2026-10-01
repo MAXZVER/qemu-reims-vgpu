@@ -1198,6 +1198,53 @@ static void reims_vgpu_dirty_wp_invalidate(void)
     REIMS_WP_BH_SCHEDULE(d->wp_bh);
 }
 
+/* Take the next eligible queued set as the one being protected. `wp_mutex` and `lock` held. */
+static bool reims_vgpu_dirty_wp_pick(ReimsVgpuDirty *d)
+{
+    while (!d->wp_cur && d->wp_queue->len) {
+        uint64_t token = g_array_index(d->wp_queue, uint64_t, d->wp_queue->len - 1);
+        ReimsVgpuDirtySet *c = g_hash_table_lookup(d->sets, &token);
+
+        g_array_set_size(d->wp_queue, d->wp_queue->len - 1);
+        if (c && c->wp_state == WP_NONE && c->gen != 0 && c->count &&
+            ((c->pages[c->count - 1] + c->page_size - 1) >> qemu_target_page_bits()) < d->wp_bits_n &&
+            !reims_vgpu_dirty_wp_any_ro(d, c, 0, c->count)) {
+            c->wp_state = WP_PROTECTING;
+            c->wp_next = 0;
+            d->wp_cur = token;
+            g_array_append_val(d->wp_list, token);
+        }
+    }
+    return d->wp_cur != 0;
+}
+
+/*
+ * Every page of `s` is read-only. A sync for a fresh epoch consumes what the chunk queries put in
+ * the VGA bitmap (its query begins after theirs); after it nothing can change, so the set reads
+ * as synced for good. `wp_mutex` held, `lock` not.
+ */
+static void reims_vgpu_dirty_wp_finish(ReimsVgpuDirty *d, uint64_t token, ReimsVgpuDirtySet *s)
+{
+    uint64_t fin_epoch;
+
+    qemu_mutex_lock(&d->lock);
+    qatomic_set(&d->epoch, d->epoch + 1);
+    d->epoch_queried = false;
+    fin_epoch = d->epoch;
+    qemu_mutex_unlock(&d->lock);
+    reims_vgpu_dirty_sync_one(d, token, true, NULL, NULL);
+    qemu_mutex_lock(&d->lock);
+    if (s->wp_state == WP_PROTECTING && s->claim_epoch == 0 && s->synced_epoch >= fin_epoch) {
+        s->wp_state = WP_ON;
+        qatomic_store_release(&s->synced_epoch, REIMS_VGPU_DIRTY_WP_EPOCH);
+        if (d->wp_cur == token) {
+            d->wp_cur = 0;
+        }
+        d->lab_wp_protects++;
+    }
+    qemu_mutex_unlock(&d->lock);
+}
+
 /*
  * Protect the next chunk of runs of set `token` (WP_PROTECTING) with every vCPU paused. Called
  * with neither lock: the pause comes first, because a vCPU inside the fault hook waits for
@@ -1214,14 +1261,13 @@ static int64_t reims_vgpu_dirty_wp_protect_chunk(ReimsVgpuDirty *d, uint64_t tok
     t0 = get_clock();
     pause_all_vcpus();
     qemu_mutex_lock(&d->wp_mutex);
+  next_set:
     /* Every store before the pause, into the VGA bitmap; the set's next sync consumes it. */
     qemu_mutex_lock(&d->lock);
     s = g_hash_table_lookup(d->sets, &token);
-    if (!s || s->wp_state != WP_PROTECTING || d->wp_cur != token) {
+    if (budget <= 0 || !s || s->wp_state != WP_PROTECTING || d->wp_cur != token) {
         qemu_mutex_unlock(&d->lock);
-        resume_all_vcpus();
-        qemu_mutex_unlock(&d->wp_mutex);
-        return get_clock() - t0;
+        goto done;
     }
     p0 = s->wp_next;
     for (p = p0, runs = 0; p < s->count && runs < budget; runs++) {
@@ -1253,10 +1299,7 @@ static int64_t reims_vgpu_dirty_wp_protect_chunk(ReimsVgpuDirty *d, uint64_t tok
         rc = reims_vgpu_dirty_wp_remap(d, s->pages[p], end - s->pages[p], false);
         p = q;
     }
-    resume_all_vcpus();
-    t0 = get_clock() - t0;
-    d->lab_wp_pause_ns += t0;
-    d->lab_wp_pause_max_ns = MAX(d->lab_wp_pause_max_ns, (uint64_t)t0);
+    budget -= runs;
     d->lab_wp_chunks++;
     qemu_mutex_lock(&d->lock);
     if (rc) {
@@ -1266,10 +1309,32 @@ static int64_t reims_vgpu_dirty_wp_protect_chunk(ReimsVgpuDirty *d, uint64_t tok
         d->wp_mode = 0;
         d->lab_wp_refused++;
         fprintf(stderr, "reims-dirty-wp: read-only remap refused (rc=%d), DIRTY_WP off\n", rc);
-    } else {
-        s->wp_next = p_end;
+        qemu_mutex_unlock(&d->lock);
+        goto done;
     }
+    s->wp_next = p_end;
     qemu_mutex_unlock(&d->lock);
+    if (s->wp_next >= s->count) {
+        /*
+         * Done inside this pause, and the next set taken in it too: small sets are a run or a
+         * few each, and one pause per set would cost far more than their queries. The next
+         * one is chosen only now that this one is wholly read-only, so the read-only check
+         * keeps them disjoint.
+         */
+        reims_vgpu_dirty_wp_finish(d, token, s);
+        qemu_mutex_lock(&d->lock);
+        if (budget > 0 && reims_vgpu_dirty_wp_pick(d)) {
+            token = d->wp_cur;
+            qemu_mutex_unlock(&d->lock);
+            goto next_set;
+        }
+        qemu_mutex_unlock(&d->lock);
+    }
+  done:
+    resume_all_vcpus();
+    t0 = get_clock() - t0;
+    d->lab_wp_pause_ns += t0;
+    d->lab_wp_pause_max_ns = MAX(d->lab_wp_pause_max_ns, (uint64_t)t0);
     qemu_mutex_unlock(&d->wp_mutex);
     return t0;
 }
@@ -1351,23 +1416,9 @@ static void reims_vgpu_dirty_wp_bh(void *opaque)
     more = more || d->wp_orphans->len;
     if (!more && budget > 0 && d->wp_mode && qatomic_read(&d->wp_active)) {
         ReimsVgpuDirtySet *s = NULL;
-        uint64_t fin_epoch = 0;
 
         qemu_mutex_lock(&d->lock);
-        while (!d->wp_cur && d->wp_queue->len) {
-            uint64_t token = g_array_index(d->wp_queue, uint64_t, d->wp_queue->len - 1);
-            ReimsVgpuDirtySet *c = g_hash_table_lookup(d->sets, &token);
-
-            g_array_set_size(d->wp_queue, d->wp_queue->len - 1);
-            if (c && c->wp_state == WP_NONE && c->gen != 0 && c->count &&
-                ((c->pages[c->count - 1] + c->page_size - 1) >> qemu_target_page_bits()) < d->wp_bits_n &&
-                !reims_vgpu_dirty_wp_any_ro(d, c, 0, c->count)) {
-                c->wp_state = WP_PROTECTING;
-                c->wp_next = 0;
-                d->wp_cur = token;
-                g_array_append_val(d->wp_list, token);
-            }
-        }
+        reims_vgpu_dirty_wp_pick(d);
         if (d->wp_cur) {
             s = g_hash_table_lookup(d->sets, &d->wp_cur);
             if (!s || s->wp_state != WP_PROTECTING) {
@@ -1386,27 +1437,7 @@ static void reims_vgpu_dirty_wp_bh(void *opaque)
             d->wp_delay_ms = (uint64_t)(paused / 1000000) * (100 - d->wp_duty) / d->wp_duty;
             qemu_mutex_lock(&d->wp_mutex);
         } else if (s) {
-            uint64_t token = d->wp_cur;
-
-            /*
-             * Every page read-only. A sync for a fresh epoch consumes what the chunk queries
-             * put in the VGA bitmap (its query begins after theirs); after it nothing can
-             * change, so the set reads as synced for good.
-             */
-            qemu_mutex_lock(&d->lock);
-            qatomic_set(&d->epoch, d->epoch + 1);
-            d->epoch_queried = false;
-            fin_epoch = d->epoch;
-            qemu_mutex_unlock(&d->lock);
-            reims_vgpu_dirty_sync_one(d, token, true, NULL, NULL);
-            qemu_mutex_lock(&d->lock);
-            if (s->wp_state == WP_PROTECTING && s->claim_epoch == 0 && s->synced_epoch >= fin_epoch) {
-                s->wp_state = WP_ON;
-                qatomic_store_release(&s->synced_epoch, REIMS_VGPU_DIRTY_WP_EPOCH);
-                d->wp_cur = 0;
-                d->lab_wp_protects++;
-            }
-            qemu_mutex_unlock(&d->lock);
+            reims_vgpu_dirty_wp_finish(d, d->wp_cur, s);
         }
         qemu_mutex_lock(&d->lock);
         more = d->wp_cur || d->wp_queue->len;
@@ -4096,7 +4127,7 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
             d->wp_streak_need = getenv("REIMS_VGPU_LAB_DIRTY_WP_STREAK") ?
                                 MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_STREAK"))) : 16;
             d->wp_min_pages = getenv("REIMS_VGPU_LAB_DIRTY_WP_MIN") ?
-                              MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_MIN"))) : 2048;
+                              MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_MIN"))) : 1;
             d->wp_chunk = getenv("REIMS_VGPU_LAB_DIRTY_WP_CHUNK") ?
                           MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_CHUNK"))) : 24;
             d->wp_duty = getenv("REIMS_VGPU_LAB_DIRTY_WP_DUTY") ?
