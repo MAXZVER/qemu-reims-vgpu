@@ -62,7 +62,18 @@ typedef struct ReimsVgpuReadRanges {
     uint8_t *host[REIMS_VGPU_READ_RANGES];
 } ReimsVgpuReadRanges;
 
-static __thread ReimsVgpuReadRanges reims_vgpu_read_ranges;
+/*
+ * v4: one snapshot shared by every thread, immutable once published (a new
+ * FlatView publishes a new one; the old is left in place, there are a handful
+ * per boot). A read compares the address space's current FlatView pointer with
+ * the snapshot's — a plain load, nothing is dereferenced, so no RCU section —
+ * and only a rebuild reads the FlatView, under RCU. The host pointers stay
+ * valid for the VM's life (guest RAM is never unplugged). v3 kept a per-thread
+ * copy behind __thread (emulated TLS here) and an RCU section per word.
+ */
+static ReimsVgpuReadRanges *reims_vgpu_read_snap;
+static QemuMutex reims_vgpu_read_snap_lock;
+static int reims_vgpu_read_snap_lock_init;
 
 static bool reims_vgpu_shim_read_range_cb(Int128 start, Int128 len, const MemoryRegion *mr,
                                           hwaddr offset_in_region, void *opaque)
@@ -84,25 +95,56 @@ static bool reims_vgpu_shim_read_range_cb(Int128 start, Int128 len, const Memory
     return false;
 }
 
-static bool reims_vgpu_shim_read_cached(uint64_t gpa, uint8_t *buf, size_t len)
+static G_NO_INLINE ReimsVgpuReadRanges *reims_vgpu_shim_read_rebuild(FlatView *want)
 {
-    ReimsVgpuReadRanges *r = &reims_vgpu_read_ranges;
-    FlatView *fv;
+    ReimsVgpuReadRanges *r;
+
+    if (qatomic_cmpxchg(&reims_vgpu_read_snap_lock_init, 0, 1) == 0) {
+        qemu_mutex_init(&reims_vgpu_read_snap_lock);
+        qatomic_set(&reims_vgpu_read_snap_lock_init, 2);
+    }
+    while (qatomic_read(&reims_vgpu_read_snap_lock_init) != 2) {
+        cpu_relax();
+    }
+    qemu_mutex_lock(&reims_vgpu_read_snap_lock);
+    r = qatomic_load_acquire(&reims_vgpu_read_snap);
+    if (!r || r->fv != want) {
+        RCU_READ_LOCK_GUARD();
+        r = g_new0(ReimsVgpuReadRanges, 1);
+        r->fv = address_space_to_flatview(&address_space_memory);
+        flatview_for_each_range(r->fv, reims_vgpu_shim_read_range_cb, r);
+        qatomic_store_release(&reims_vgpu_read_snap, r);
+    }
+    qemu_mutex_unlock(&reims_vgpu_read_snap_lock);
+    return r;
+}
+
+static inline bool reims_vgpu_shim_read_cached(uint64_t gpa, uint8_t *buf, size_t len)
+{
+    FlatView *fv = qatomic_read(&address_space_memory.current_map);
+    ReimsVgpuReadRanges *r = qatomic_load_acquire(&reims_vgpu_read_snap);
     int i;
 
     if (gpa + len < gpa) {
         return false;
     }
-    RCU_READ_LOCK_GUARD();
-    fv = address_space_to_flatview(&address_space_memory);
-    if (r->fv != fv) {
-        r->n = 0;
-        flatview_for_each_range(fv, reims_vgpu_shim_read_range_cb, r);
-        r->fv = fv;
+    if (unlikely(!r || r->fv != fv)) {
+        r = reims_vgpu_shim_read_rebuild(fv);
     }
     for (i = 0; i < r->n; i++) {
         if (gpa >= r->lo[i] && gpa + len <= r->hi[i]) {
-            memcpy(buf, r->host[i] + (gpa - r->lo[i]), len);
+            const uint8_t *src = r->host[i] + (gpa - r->lo[i]);
+
+            switch (len) {
+            case 4:
+                memcpy(buf, src, 4);    /* a fixed-size copy compiles to one load */
+                break;
+            case 8:
+                memcpy(buf, src, 8);
+                break;
+            default:
+                memcpy(buf, src, len);
+            }
             return true;
         }
     }
