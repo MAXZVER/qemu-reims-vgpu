@@ -38,7 +38,7 @@ static const MemTxAttrs reims_vgpu_shim_ram_attrs = {
 };
 
 /*
- * TEMP lab REIMS_VGPU_LAB_READ_FAST (=off disables): the drain reads guest RAM
+ * TEMP lab REIMS_VGPU_LAB_READ_FAST=on (opt-in): the drain reads guest RAM
  * mostly a word at a time (page-table walks, object lists), and a 5K drag
  * profile put address_space_read's translation (RCU, flatview lookup, dispatch)
  * at ~8 % of the drain thread. Each thread remembers the last plain-RAM section
@@ -121,7 +121,8 @@ int reims_vgpu_shim_read_gpa(void *ctx, uint64_t gpa, uint8_t *buf, size_t len)
     if (reims_vgpu_shim_read_fast_mode < 0) {
         const char *e = getenv("REIMS_VGPU_LAB_READ_FAST");
 
-        reims_vgpu_shim_read_fast_mode = !(e && strcmp(e, "off") == 0);
+        /* Opt-in: on, the 5K drag ran ~10 % slower in two A/Bs (frf*, fa3*). */
+        reims_vgpu_shim_read_fast_mode = e && strcmp(e, "on") == 0;
     }
     if (reims_vgpu_shim_read_fast_mode && reims_vgpu_shim_read_cached(gpa, buf, len)) {
         return 0;
