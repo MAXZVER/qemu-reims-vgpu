@@ -936,9 +936,66 @@ static void reims_vgpu_pci_wait_harvest(ReimsVGPUPCIState *s)
     qemu_mutex_unlock(&s->harvest_mutex);
 }
 
+/*
+ * TEMP lab (REIMS_VGPU_LAB_HIQOS=on): opt this process out of Windows power
+ * throttling (EcoQoS: E-cores at low clocks, coarse timers) and give the drain
+ * thread high QoS and above-normal priority. The drain is the device's serial
+ * critical path; QEMU launched from a script owns no foreground window, which
+ * is what the scheduler throttles on a hybrid (P/E core) CPU. Resolved at run
+ * time so the build does not depend on the SDK's Windows-version guards.
+ */
+#if defined(_WIN32)
+static bool reims_vgpu_lab_hiqos(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("REIMS_VGPU_LAB_HIQOS");
+
+        on = e && strcmp(e, "on") == 0;
+    }
+    return on;
+}
+
+typedef struct ReimsVgpuPowerThrottling {
+    ULONG Version;
+    ULONG ControlMask;
+    ULONG StateMask;
+} ReimsVgpuPowerThrottling;
+
+static void reims_vgpu_hiqos_apply(bool process)
+{
+    typedef BOOL (WINAPI *SetInfoFn)(HANDLE, int, LPVOID, DWORD);
+    /* ProcessPowerThrottling = 4, ThreadPowerThrottling = 3 (processthreadsapi.h) */
+    ReimsVgpuPowerThrottling st = { 1, process ? 0x5u : 0x1u, 0 };
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    SetInfoFn fn;
+    BOOL ok = FALSE, prio = TRUE;
+
+    if (!reims_vgpu_lab_hiqos() || !k32) {
+        return;
+    }
+    fn = (SetInfoFn)(void *)GetProcAddress(k32, process ? "SetProcessInformation"
+                                                        : "SetThreadInformation");
+    if (fn) {
+        ok = fn(process ? GetCurrentProcess() : GetCurrentThread(), process ? 4 : 3,
+                &st, sizeof(st));
+    }
+    if (!process) {
+        prio = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+    fprintf(stderr, "reims-vgpu-hiqos %s throttling_off=%d priority=%d\n",
+            process ? "process" : "drain", ok ? 1 : 0, prio ? 1 : 0);
+}
+#endif
+
 static void *reims_vgpu_pci_drain_thread(void *opaque)
 {
     ReimsVGPUPCIState *s = opaque;
+
+#if defined(_WIN32)
+    reims_vgpu_hiqos_apply(false);
+#endif
 
     /*
      * This thread reads the FlatView under RCU (the dirty tracker's RAM walk,
@@ -1497,6 +1554,9 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
             s->harvest_started = true;
         }
     }
+#if defined(_WIN32)
+    reims_vgpu_hiqos_apply(true);
+#endif
     qemu_thread_create(&s->drain_thread, "reims-vgpu-pci-drain",
                        reims_vgpu_pci_drain_thread, s, QEMU_THREAD_JOINABLE);
     s->drain_started = true;

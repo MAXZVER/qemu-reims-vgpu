@@ -351,6 +351,17 @@ struct ReimsVgpuDirty {
     uint64_t q_inflight[32];
     int q_ninflight;
     QemuCond q_cond;
+    /*
+     * Lab DIRTY_RSETTLE: what each in-flight ticket queries, sorted by (region,
+     * offset), or NULL for "not known" (every ticket until its owner says, and
+     * always for the full-harvest paths). A settle then waits only for tickets
+     * whose ranges meet its own: a query that touches none of a sync's pages
+     * cannot hold one of their bits. Parallel to `q_inflight`.
+     */
+    const struct ReimsVgpuDirtyChunk *q_fp[32];
+    guint q_fpn[32];
+    uint32_t rsettle_mode;
+    uint64_t lab_rs_waits, lab_rs_skipped;
     /* TEMP lab diagnostic: on-demand syncs and their cost. */
     uint64_t lab_od_n, lab_od_ns, lab_od_pages, lab_od_skipped;
     uint64_t lab_od_epochs, lab_od_fg_n, lab_od_fg_ns;   /* TEMP lab */
@@ -2139,8 +2150,73 @@ static uint64_t reims_vgpu_dirty_query_begin(ReimsVgpuDirty *d)
     while (d->q_ninflight == (int)ARRAY_SIZE(d->q_inflight)) {
         qemu_cond_wait(&d->q_cond, &d->lock);
     }
+    d->q_fp[d->q_ninflight] = NULL;
+    d->q_fpn[d->q_ninflight] = 0;
     d->q_inflight[d->q_ninflight++] = ++d->q_next;
     return d->q_next;
+}
+
+/*
+ * Lab DIRTY_RSETTLE: name what `ticket` queries (`chunks` sorted by region and
+ * offset, alive until the ticket ends). Before the queries are issued, so a
+ * settle never sees a ticket's footprint narrower than its queries. d->lock held.
+ */
+static void reims_vgpu_dirty_query_footprint(ReimsVgpuDirty *d, uint64_t ticket,
+                                             const ReimsVgpuDirtyChunk *chunks, guint n)
+{
+    int i;
+
+    if (!d->rsettle_mode || ticket == 0) {
+        return;
+    }
+    for (i = 0; i < d->q_ninflight; i++) {
+        if (d->q_inflight[i] == ticket) {
+            d->q_fp[i] = chunks;
+            d->q_fpn[i] = n;
+            return;
+        }
+    }
+}
+
+static int reims_vgpu_dirty_cmp_chunk(gconstpointer a, gconstpointer b)
+{
+    const ReimsVgpuDirtyChunk *x = a, *y = b;
+
+    if (x->mr != y->mr) {
+        return (uintptr_t)x->mr < (uintptr_t)y->mr ? -1 : 1;
+    }
+    return x->r.start < y->r.start ? -1 : x->r.start > y->r.start;
+}
+
+/*
+ * Whether two footprints share a byte. Both sorted by (region, offset); NULL
+ * is "not known" and meets everything. An interval that ends before the other
+ * list's current one starts meets nothing later in that list either.
+ */
+static bool reims_vgpu_dirty_fp_meet(const ReimsVgpuDirtyChunk *a, guint na,
+                                     const ReimsVgpuDirtyChunk *b, guint nb)
+{
+    guint i = 0, j = 0;
+
+    if (!a || !b) {
+        return true;
+    }
+    while (i < na && j < nb) {
+        if (a[i].mr != b[j].mr) {
+            if ((uintptr_t)a[i].mr < (uintptr_t)b[j].mr) {
+                i++;
+            } else {
+                j++;
+            }
+        } else if (a[i].r.start + a[i].r.len <= b[j].r.start) {
+            i++;
+        } else if (b[j].r.start + b[j].r.len <= a[i].r.start) {
+            j++;
+        } else {
+            return true;
+        }
+    }
+    return false;
 }
 
 /* Return a ticket whose queries' bits are in the VGA bitmap. d->lock held. */
@@ -2150,7 +2226,10 @@ static void reims_vgpu_dirty_query_end(ReimsVgpuDirty *d, uint64_t ticket)
 
     for (i = 0; i < d->q_ninflight; i++) {
         if (d->q_inflight[i] == ticket) {
-            d->q_inflight[i] = d->q_inflight[--d->q_ninflight];
+            --d->q_ninflight;
+            d->q_inflight[i] = d->q_inflight[d->q_ninflight];
+            d->q_fp[i] = d->q_fp[d->q_ninflight];
+            d->q_fpn[i] = d->q_fpn[d->q_ninflight];
             break;
         }
     }
@@ -2174,6 +2253,7 @@ static void reims_vgpu_dirty_split_help(ReimsVgpuDirty *d)
                                               d->split_next++);
         uint64_t pt = d->od_nopticket ? 0 : reims_vgpu_dirty_query_begin(d);
 
+        reims_vgpu_dirty_query_footprint(d, pt, &c, 1);
         qemu_mutex_unlock(&d->lock);
         memory_region_sync_dirty_ranges(c.mr, &c.r, 1);
         qemu_mutex_lock(&d->lock);
@@ -2190,23 +2270,46 @@ static void reims_vgpu_dirty_split_help(ReimsVgpuDirty *d)
  * Return a ticket once its queries' bits are in the VGA bitmap, then wait until
  * every query that began before now has done the same. d->lock held.
  */
-static void reims_vgpu_dirty_query_settle(ReimsVgpuDirty *d, uint64_t ticket)
+static void reims_vgpu_dirty_query_settle_fp(ReimsVgpuDirty *d, uint64_t ticket,
+                                             const ReimsVgpuDirtyChunk *mine,
+                                             guint nmine)
 {
     uint64_t upto = d->q_next;
+    bool waited = false, skipped = false;
     int i;
 
     reims_vgpu_dirty_query_end(d, ticket);   /* 0 = the caller holds none */
+    if (!d->rsettle_mode) {
+        mine = NULL;
+    }
     for (;;) {
         bool pending = false;
 
         for (i = 0; i < d->q_ninflight; i++) {
-            pending |= d->q_inflight[i] <= upto;
+            if (d->q_inflight[i] > upto) {
+                continue;
+            }
+            if (reims_vgpu_dirty_fp_meet(d->q_fp[i], d->q_fpn[i], mine, nmine)) {
+                pending = true;
+            } else {
+                skipped = true;
+            }
         }
         if (!pending) {
-            return;
+            break;
         }
+        waited = true;
         qemu_cond_wait(&d->q_cond, &d->lock);
     }
+    if (d->rsettle_mode) {   /* TEMP lab */
+        d->lab_rs_waits += waited;
+        d->lab_rs_skipped += skipped;
+    }
+}
+
+static void reims_vgpu_dirty_query_settle(ReimsVgpuDirty *d, uint64_t ticket)
+{
+    reims_vgpu_dirty_query_settle_fp(d, ticket, NULL, 0);
 }
 
 static void reims_vgpu_dirty_sync_tracked(ReimsVgpuDirty *d,
@@ -2835,7 +2938,12 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
     ranges = g_array_new(FALSE, FALSE, sizeof(MemoryRegionRange));
     walked = g_array_new(FALSE, FALSE, sizeof(MemoryRegionRange));  /* GPA spans */
     qemu_mutex_lock(&d->lock);
-    qticket = reims_vgpu_dirty_query_begin(d);
+    /*
+     * Lab DIRTY_RSETTLE: the ticket is taken below, with its footprint, once
+     * the ranges are known: a ticket held through the walk that builds them
+     * has no footprint yet, and every settle meanwhile has to wait for it.
+     */
+    qticket = d->rsettle_mode ? 0 : reims_vgpu_dirty_query_begin(d);
     qemu_mutex_unlock(&d->lock);
     ph_prep_end = get_clock();
     for (i = 0; i < n; i++) {
@@ -2906,7 +3014,15 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
      * anything else (a worker's own sync, a small set, a job already running)
      * queries alone, one call per region as before.
      */
+    if (d->rsettle_mode) {
+        g_array_sort(chunks, reims_vgpu_dirty_cmp_chunk);
+    }
     qemu_mutex_lock(&d->lock);
+    if (d->rsettle_mode) {
+        qticket = reims_vgpu_dirty_query_begin(d);
+    }
+    reims_vgpu_dirty_query_footprint(d, qticket, (const ReimsVgpuDirtyChunk *)chunks->data,
+                                     chunks->len);
     if (d->od_split && d->od_nworkers > 0 && walked_pages >= 4096 &&
         !d->split_busy && (fg || !d->bigsplit_mode)) {
         guint k;
@@ -2979,7 +3095,8 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
     if (lab_query) {   /* TEMP lab (FGTRACE) */
         *lab_query = ph_query_end - ph_prep_end;
     }
-    reims_vgpu_dirty_query_settle(d, qticket);
+    reims_vgpu_dirty_query_settle_fp(d, qticket, (const ReimsVgpuDirtyChunk *)chunks->data,
+                                     chunks->len);
     ph_settle_end = get_clock();
     d->lab_ph_prep += ph_prep_end - ph;
     d->lab_ph_query += ph_query_end - ph_prep_end;
@@ -3042,7 +3159,8 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                     " fg_ahead=%" PRIu64 " fg_missed=%" PRIu64 " fg_cold=%" PRIu64
                     " gen_fast=%" PRIu64 " db_coalesced=%" PRIu64 " gen_lagged=%" PRIu64
                     " period=%u period_skipped=%" PRIu64 " period_taken=%" PRIu64
-                    " bigsplit=%u bigsplit_sets=%" PRIu64 "\n",
+                    " bigsplit=%u bigsplit_sets=%" PRIu64 " rsettle=%u rs_waits=%" PRIu64
+                    " rs_skipped=%" PRIu64 "\n",
                     g_get_real_time() / 1000, d->lab_od_n, d->lab_od_ns / 1000,
                     d->lab_od_pages, d->lab_od_skipped, d->lab_od_epochs,
                     d->lab_od_fg_n, d->lab_od_fg_ns / 1000, d->lab_ph_wait / 1000,
@@ -3052,7 +3170,9 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                     qatomic_xchg(&d->lab_gen_fast, 0), d->lab_db_coalesced,
                     qatomic_xchg(&d->lab_gen_lagged, 0), d->period_mode,
                     d->lab_period_skipped, d->lab_period_taken,
-                    d->bigsplit_mode, d->lab_bigsplit_sets);
+                    d->bigsplit_mode, d->lab_bigsplit_sets, d->rsettle_mode,
+                    d->lab_rs_waits, d->lab_rs_skipped);
+            d->lab_rs_waits = d->lab_rs_skipped = 0;
             d->lab_period_skipped = d->lab_period_taken = 0;
             d->lab_bigsplit_sets = 0;
             d->lab_db_coalesced = 0;
@@ -3257,6 +3377,8 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                      ? reims_vgpu_dirty_lab_mode("REIMS_VGPU_LAB_GEN_LOCKFREE") : 1;
         d->period_mode = getenv("REIMS_VGPU_LAB_DIRTY_PERIOD") &&     /* lab A/B */
                          strcmp(getenv("REIMS_VGPU_LAB_DIRTY_PERIOD"), "on") == 0;
+        d->rsettle_mode = getenv("REIMS_VGPU_LAB_DIRTY_RSETTLE") &&     /* lab A/B */
+                          strcmp(getenv("REIMS_VGPU_LAB_DIRTY_RSETTLE"), "on") == 0;
         d->bigsplit_mode = getenv("REIMS_VGPU_LAB_DIRTY_BIGSPLIT") &&   /* lab A/B */
                            strcmp(getenv("REIMS_VGPU_LAB_DIRTY_BIGSPLIT"), "on") == 0;
         d->period_big = getenv("REIMS_VGPU_LAB_DIRTY_PERIOD_BIG") ?
@@ -3543,6 +3665,9 @@ static void reims_vgpu_dirty_prefetch_phase(ReimsVgpuDirty *d, GArray *tokens,
     }
 
     pb1 = get_clock();
+    if (d->rsettle_mode) {
+        g_array_sort(chunks, reims_vgpu_dirty_cmp_chunk);
+    }
     qemu_mutex_lock(&d->lock);
     qticket = 0;   /* the split pieces carry their own tickets */
     while (d->od_splitwait && d->od_nworkers > 0 && chunks->len && d->split_busy) {
@@ -3588,6 +3713,9 @@ static void reims_vgpu_dirty_prefetch_phase(ReimsVgpuDirty *d, GArray *tokens,
         guint k;
 
         qticket = reims_vgpu_dirty_query_begin(d);
+        reims_vgpu_dirty_query_footprint(d, qticket,
+                                         (const ReimsVgpuDirtyChunk *)chunks->data,
+                                         chunks->len);
         qemu_mutex_unlock(&d->lock);
         for (k = 0; k < chunks->len; k++) {
             ReimsVgpuDirtyChunk c = g_array_index(chunks, ReimsVgpuDirtyChunk, k);
@@ -3600,7 +3728,8 @@ static void reims_vgpu_dirty_prefetch_phase(ReimsVgpuDirty *d, GArray *tokens,
     hit = g_array_new(FALSE, FALSE, sizeof(size_t));
     pb2 = get_clock();
     qemu_mutex_lock(&d->lock);
-    reims_vgpu_dirty_query_settle(d, qticket);
+    reims_vgpu_dirty_query_settle_fp(d, qticket, (const ReimsVgpuDirtyChunk *)chunks->data,
+                                     chunks->len);
     pb3 = get_clock();
     /*
      * Stamp the set pages as queried for this epoch. The gap pages between

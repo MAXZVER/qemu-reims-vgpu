@@ -27,6 +27,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/atomic.h"
 #include <windows.h>
 #include "qapi/error.h"
 #include "qemu/main-loop.h"
@@ -259,10 +260,24 @@ void qemu_set_tty_echo(int fd, bool echo)
 
 int getpagesize(void)
 {
-    SYSTEM_INFO system_info;
+    /*
+     * GetSystemInfo is a system call (NtQueryInformationProcess) and this is
+     * asked on every dirty-log sync (physical_memory_set_dirty_lebitmap via
+     * qemu_real_host_page_size), hundreds of thousands of times a second
+     * under reims-vgpu's on-demand dirty tracking. The page size cannot
+     * change while the process runs.
+     */
+    static int page_size;
+    int ps = qatomic_read(&page_size);
 
-    GetSystemInfo(&system_info);
-    return system_info.dwPageSize;
+    if (!ps) {
+        SYSTEM_INFO system_info;
+
+        GetSystemInfo(&system_info);
+        ps = system_info.dwPageSize;
+        qatomic_set(&page_size, ps);
+    }
+    return ps;
 }
 
 bool qemu_prealloc_mem(int fd, char *area, size_t sz, int max_threads,

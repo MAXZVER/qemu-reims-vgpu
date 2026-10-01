@@ -457,28 +457,34 @@ static void whpx_log_sync(MemoryListener *listener,
              */
             static uint64_t n, ns, max_ns, pages_walked;
             static int64_t last;
-            static QemuMutex diag_lock;
-            static gsize diag_init;
             int64_t now = get_clock(), dt = now - t0;
-            if (g_once_init_enter(&diag_init)) {
-                qemu_mutex_init(&diag_lock);
-                g_once_init_leave(&diag_init, 1);
+            int64_t was;
+
+            /*
+             * Atomics, not a lock: every query thread (the drain and the
+             * dirty tracker's prefetch pool) passes here, hundreds of
+             * thousands of times a second, and a shared mutex queued them
+             * behind each other. A late update may land in the next line.
+             */
+            qatomic_add(&n, 1);
+            qatomic_add(&ns, (uint64_t)dt);
+            qatomic_add(&pages_walked, pages);
+            if ((uint64_t)dt > qatomic_read(&max_ns)) {
+                qatomic_set(&max_ns, (uint64_t)dt);
             }
-            qemu_mutex_lock(&diag_lock);
-            n++; ns += dt; pages_walked += pages;
-            if (dt > max_ns) {
-                max_ns = dt;
-            }
-            if (now - last >= NANOSECONDS_PER_SECOND) {
+            was = qatomic_read(&last);
+            if (now - was >= NANOSECONDS_PER_SECOND &&
+                qatomic_cmpxchg(&last, was, now) == was) {
+                uint64_t cn = qatomic_xchg(&n, 0), cns = qatomic_xchg(&ns, 0);
+
                 fprintf(stderr, "whpx-dirty-diag epoch_ms=%" PRId64
                         " syncs=%" PRIu64 " total_us=%" PRIu64
                         " avg_us=%" PRIu64 " max_us=%" PRIu64
-                        " pages=%" PRIu64 "\n", g_get_real_time() / 1000, n,
-                        ns / 1000, ns / n / 1000, max_ns / 1000, pages_walked);
-                n = ns = max_ns = pages_walked = 0;
-                last = now;
+                        " pages=%" PRIu64 "\n", g_get_real_time() / 1000, cn,
+                        cns / 1000, cn ? cns / cn / 1000 : 0,
+                        qatomic_xchg(&max_ns, 0) / 1000,
+                        qatomic_xchg(&pages_walked, 0));
             }
-            qemu_mutex_unlock(&diag_lock);
         }
         if (SUCCEEDED(hr)) {
             /*
