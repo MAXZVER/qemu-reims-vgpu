@@ -1082,15 +1082,42 @@ static bool reims_vgpu_pci_heartbeat_hires(ReimsVGPUPCIState *s)
     if (!t) {
         return false;
     }
-    warn_report("reims-vgpu heartbeat: high-resolution timer every %d us", us);
+    /*
+     * REIMS_VGPU_LAB_HB_GRID=1: when the next VBL grid point is closer than
+     * the period, sleep to ~150 us before it and spin the rest, so the poll
+     * that claims it lands on the grid rather than up to a period late.
+     */
+    const char *g = getenv("REIMS_VGPU_LAB_HB_GRID");
+    bool grid = g && g[0] == '1';
+
+    warn_report("reims-vgpu heartbeat: high-resolution timer every %d us grid=%d", us, grid);
     while (!qatomic_read(&s->heartbeat_stopping)) {
         LARGE_INTEGER due;
+        uint32_t vbl_in = 0;
+        int wait_us = us;
 
-        due.QuadPart = -(LONGLONG)us * 10;   /* relative, 100 ns units */
-        if (!SetWaitableTimerEx(t, &due, 0, NULL, NULL, NULL, 0)) {
-            Sleep(1);
-        } else {
-            WaitForSingleObject(t, INFINITE);
+        if (grid && s->rust_handle != 0) {
+            vbl_in = reims_vgpu_qemu_vbl_due_us(s->rust_handle);
+            if (vbl_in > 0 && vbl_in <= (uint32_t)us) {
+                wait_us = (int)vbl_in - 150;
+            }
+        }
+        if (wait_us > 0) {
+            due.QuadPart = -(LONGLONG)wait_us * 10;   /* relative, 100 ns units */
+            if (!SetWaitableTimerEx(t, &due, 0, NULL, NULL, NULL, 0)) {
+                Sleep(1);
+            } else {
+                WaitForSingleObject(t, INFINITE);
+            }
+        }
+        if (grid && vbl_in > 0 && vbl_in <= (uint32_t)us && s->rust_handle != 0) {
+            /* Spin the last stretch: a timer wake is ~0.1-0.5 ms imprecise. */
+            int spins = 0;
+
+            while (reims_vgpu_qemu_vbl_due_us(s->rust_handle) > 0 && spins < 200000) {
+                YieldProcessor();
+                spins++;
+            }
         }
         if (qatomic_read(&s->heartbeat_stopping)) {
             break;
