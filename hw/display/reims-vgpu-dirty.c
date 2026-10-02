@@ -355,6 +355,7 @@ struct ReimsVgpuDirty {
     bool od_split;
     bool od_pbatch;           /* lab A/B REIMS_VGPU_DIRTY_OD_PBATCH=on */
     uint64_t od_hot;          /* epochs a read keeps a set in the prefetch; lab REIMS_VGPU_DIRTY_OD_HOT */
+    bool hot_new;             /* lab REIMS_VGPU_LAB_DIRTY_HOT_NEW: new sets start hot */
     bool od_splitwait;        /* lab REIMS_VGPU_DIRTY_OD_SPLITWAIT=on */
     bool od_nopticket;        /* lab REIMS_VGPU_DIRTY_OD_PTICKET=off */
     GArray *split_chunks;     /* ReimsVgpuDirtyChunk */
@@ -961,6 +962,15 @@ uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
     s->arm_at = d->harvests + 1;
     s->seen_seq = d->global_seq;
     s->lab_created_epoch = d->epoch;   /* TEMP lab (FGTRACE) */
+    /*
+     * TEMP lab REIMS_VGPU_LAB_DIRTY_HOT_NEW=on: a new set counts as read this
+     * epoch, so the next prefetch arms it on a worker instead of the drain's
+     * first read doing it in the foreground. Full-screen transitions create
+     * 5K surfaces every frame; ~55 % of foreground syncs were cold sets.
+     */
+    if (d->hot_new) {
+        s->last_query_epoch = d->epoch;
+    }
     d->next_token++;
     token = d->next_token;
     s->token = token;   /* lab DIRTY_WP */
@@ -4169,6 +4179,8 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
          * pool; a batch helps a running split instead of walking alone. Each has
          * a lab switch that turns it back off.
          */
+        d->hot_new = getenv("REIMS_VGPU_LAB_DIRTY_HOT_NEW") &&          /* lab A/B */
+                     strcmp(getenv("REIMS_VGPU_LAB_DIRTY_HOT_NEW"), "on") == 0;
         d->od_hot = getenv("REIMS_VGPU_DIRTY_OD_HOT") ?                /* lab A/B */
                     MAX(1, atoi(getenv("REIMS_VGPU_DIRTY_OD_HOT"))) : 24;
         d->od_splitwait = !(getenv("REIMS_VGPU_DIRTY_OD_SPLITWAIT") && /* lab A/B */
