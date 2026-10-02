@@ -37,6 +37,7 @@
 #include "ui/console.h"
 #include "ui/surface.h"
 #include "trace.h"
+#include "hw/input/hid.h"
 #include "reims_vgpu_qemu_abi.h"
 #include "reims-vgpu-dirty.h"
 #include "reims-vgpu-shim.h"
@@ -1470,6 +1471,11 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
     };
     char backend[32];
     int rc;
+
+    /* TEMP (lab): HID latency marks beside the window's present probe. */
+    if (getenv("REIMS_VGPU_LAB_PROBE")) {
+        hid_lab_mark = reims_vgpu_qemu_lab_mark;
+    }
 
     if (reims_vgpu_qemu_abi_version() != REIMS_VGPU_QEMU_ABI_VERSION) {
         error_setg(errp,

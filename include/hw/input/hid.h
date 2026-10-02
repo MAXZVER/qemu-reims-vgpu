@@ -57,6 +57,12 @@ void hid_set_next_idle(HIDState *hs);
 void hid_pointer_activate(HIDState *hs);
 int hid_pointer_poll(HIDState *hs, uint8_t *buf, int len);
 int hid_keyboard_poll(HIDState *hs, uint8_t *buf, int len);
+/*
+ * TEMP (lab): input latency marks. A display device may install this; kinds:
+ * 1 key event queued, 2 keyboard report taken with events pending,
+ * 3 pointer event made guest-visible, 4 pointer report taken with events pending.
+ */
+extern void (*hid_lab_mark)(uint32_t kind, uint32_t arg);
 int hid_keyboard_write(HIDState *hs, uint8_t *buf, int len);
 
 extern const VMStateDescription vmstate_hid_keyboard_device;
