@@ -164,6 +164,18 @@ typedef struct ReimsVgpuDirtySplitJob {
 #define REIMS_VGPU_DIRTY_FGSLOTS_MAX 8
 
 /*
+ * The target page frames' query epochs (see `qep`), published through RCU so
+ * that a sync's prep can read them without `lock`. Written under `lock` only,
+ * with atomic stores; growing copies into a new array, publishes it and
+ * retires the old one through RCU.
+ */
+typedef struct ReimsVgpuDirtyQep {
+    struct rcu_head rcu;      /* first: call_rcu needs offset 0 */
+    uint64_t n;
+    uint64_t e[];
+} ReimsVgpuDirtyQep;
+
+/*
  * TEMP lab (REIMS_VGPU_LAB_FGTRACE=<file>): one 72-byte record per traced event,
  * appended to <file> about once a second. Kinds:
  *   0 fast-path hit, first read of the set in its needed epoch
@@ -267,9 +279,14 @@ struct ReimsVgpuDirty {
      * stores made after the doorbell, which that epoch does not owe anyone; so
      * a set's sync skips pages already queried in its epoch and takes their
      * bits (or the stamps of whoever took them) like any other. Same indexing
-     * and length as `page_seq`.
+     * and length as `page_seq` (NULL until the first stamp).
+     *
+     * RCU (an RCU pointer; written under `lock`): a sync's prep reads it
+     * without `lock` (lab DIRTY_PREPLOCK). A reader holding an array that a
+     * growth has since replaced sees older epochs than the current ones, which
+     * only makes it query a page it could have skipped.
      */
-    uint64_t *page_qepoch;
+    ReimsVgpuDirtyQep *qep;
     /*
      * On-demand mode: doorbells only advance `epoch`; a generation read of a set
      * not synced since the last doorbell syncs that set's pages first. The
@@ -492,6 +509,20 @@ struct ReimsVgpuDirty {
      */
     uint32_t fgjoin_mode;
     uint64_t lab_dup_inflight, lab_ov_older;
+    /*
+     * Lab DIRTY_PREPLOCK (on unless =off): a sync's prep holds `lock` only to
+     * claim the set. The page list (the set's pages less those already queried
+     * this epoch) was ~97 % of the prep's hold (stress, sets of 4-8k pages:
+     * ~9 us of ~9.5) and is built after it, under RCU: the set's `pages` are
+     * immutable and a set is freed through RCU, and `qep` is RCU-published. A
+     * stale epoch read there only queries a page again (harmless); an epoch
+     * that does let it skip a page was stamped under `lock` after that query's
+     * bits were in the VGA bitmap, and this sync consumes under `lock` later.
+     * The query ticket is taken where the queries are decided (as DIRTY_RSETTLE
+     * did), still before any of them, so the lock is taken three times, not
+     * four. Off: the list under `lock` and the ticket before the walk.
+     */
+    uint32_t prep_unlocked;
     /*
      * REIMS_VGPU_LAB_EPOCH_NAMED=on: a gfx register write that names no doorbell
      * (gfx_write_doorbell_channel() answers none: it schedules no FIFO drain,
@@ -929,6 +960,8 @@ void reims_vgpu_dirty_free(ReimsVgpuDirty *d)
         reims_vgpu_dirty_tab_free(d->tab);
     }
     g_free(d->slices);
+    g_free(d->page_seq);
+    g_free(d->qep);   /* every reader thread is gone by now */
     g_free(d->sync_pages);
     if (d->sync_ranges) {
         g_array_free(d->sync_ranges, TRUE);
@@ -1707,19 +1740,22 @@ void reims_vgpu_dirty_untrack(ReimsVgpuDirty *d, uint64_t token)
         }
     }
     qemu_mutex_lock(&d->sets_lock);
-    if (d->lf_mode) {
-        /* TEMP lab GEN_LOCKFREE: a lock-free reader may hold the set, so it is
-         * unpublished first and freed once every reader that could have found it
-         * has left its read-side section. */
+    {
+        /*
+         * A reader may hold the set without `lock` — a lock-free generation read
+         * (TEMP lab GEN_LOCKFREE), or a sync's prep reading the page list (lab
+         * DIRTY_PREPLOCK) — so it is unpublished first and freed once every
+         * reader that could have found it has left its read-side section.
+         */
         gpointer okey, oval;
 
         if (g_hash_table_steal_extended(d->sets, &token, &okey, &oval)) {
-            reims_vgpu_dirty_tab_del(d, token);
+            if (d->lf_mode) {
+                reims_vgpu_dirty_tab_del(d, token);
+            }
             g_free(okey);
             call_rcu((ReimsVgpuDirtySet *)oval, reims_vgpu_dirty_set_free_rcu, rcu);
         }
-    } else {
-        g_hash_table_remove(d->sets, &token);
     }
     qemu_mutex_unlock(&d->sets_lock);
     qemu_mutex_unlock(&d->lock);
@@ -1935,16 +1971,47 @@ void reims_vgpu_dirty_note_work_scope(ReimsVgpuDirty *d, uint32_t scope)
  * set can arm within the epoch, and "cannot tell" is the conservative reading
  * either way. Under concurrent readers the first to install an answer for a
  * `needed` wins and the rest adopt it; an install never replaces a newer epoch's.
+ *
+ * The value pinned is re-read at the install, not the `live` the caller once
+ * read: the lock-free peek walks the token table before it gets here, and a
+ * sync can evaluate the set in that window. Pinning the older generation under
+ * the newer `needed` would answer every later hit of that epoch less than a
+ * read had already been told mid-window, and a generation an answer went 27 ->
+ * 24 (stress, ring + exact3; the committed pre-PREPLOCK tree fails the same
+ * rows, so the race is the memo's own, not the prep unlock's). A straggler
+ * (a newer epoch's answer already installed) answers the generation the set
+ * holds now, for the same reason, and raises the pin to it: an answer above
+ * the pin has been served, and no later hit may be told less than that.
  */
+static void reims_vgpu_dirty_memo_raise(ReimsVgpuDirtySet *s, uint64_t ans)
+{
+    uint64_t m = qatomic_read(&s->memo);
+
+    if ((ans >> 32) || ans == 0) {
+        return;   /* nothing that does not fit the value half can be raised to */
+    }
+    for (;;) {
+        uint64_t mn = m >> 32, old;
+
+        if (m == 0 || (uint32_t)m >= ans) {
+            return;
+        }
+        old = qatomic_cmpxchg(&s->memo, m, (mn << 32) | ans);
+        if (old == m) {
+            return;
+        }
+        m = old;   /* somebody moved it: raise against what is there now */
+    }
+}
+
 static uint64_t reims_vgpu_dirty_memo_answer(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
                                              uint64_t needed, uint64_t live)
 {
-    uint64_t m, nm;
+    uint64_t m;
 
     if (!d->gen_memo_mode || live == 0 || (live >> 32) || (needed >> 32)) {
         return live;   /* "cannot tell" is never memoized; nor is what does not fit */
     }
-    nm = (needed << 32) | live;
     m = qatomic_read(&s->memo);
     for (;;) {
         uint64_t mn = m >> 32, old;
@@ -1956,15 +2023,23 @@ static uint64_t reims_vgpu_dirty_memo_answer(ReimsVgpuDirty *d, ReimsVgpuDirtySe
             if (memo != live) {
                 qatomic_inc(&d->lab_memo_diff);
                 if (memo > live) {
-                    qatomic_inc(&d->lab_memo_bad);   /* a generation never shrinks */
+                    /* the pin leads a stale peek: a straggler raised it since */
+                    qatomic_inc(&d->lab_memo_bad);
                 }
             }
             return d->gen_memo_mode == 1 ? memo : live;
         }
         if (m != 0 && mn > needed) {
-            return live;   /* a later epoch's answer is installed: this read is a straggler */
+            uint64_t now = qatomic_read(&s->gen);   /* this read is a straggler */
+
+            reims_vgpu_dirty_memo_raise(s, now);
+            return now;   /* answer what the set holds now, never the stale `live` */
         }
-        old = qatomic_cmpxchg(&s->memo, m, nm);
+        live = qatomic_read(&s->gen);
+        if (live == 0 || (live >> 32)) {
+            return live;   /* disarmed meanwhile, or too big to pin */
+        }
+        old = qatomic_cmpxchg(&s->memo, m, (needed << 32) | live);
         if (old == m) {
             qatomic_inc(&d->lab_memo_fresh);
             return live;
@@ -2322,6 +2397,13 @@ uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token)
              * does vouch for it.
              */
             gen = reims_vgpu_dirty_memo_answer(d, s, needed_pre, gen);
+        } else if (d->gen_memo_mode) {
+            /*
+             * It does not vouch for it (a write-protection fault reset the set
+             * mid-read): the fresh generation goes out unmemoized, and the pin
+             * must not answer a later hit below it.
+             */
+            reims_vgpu_dirty_memo_raise(s, gen);
         }
         s->lab_last_read = d->harvests + 1;
         reims_vgpu_dirty_note_read_epoch(d, s, needed_pre);
@@ -2708,9 +2790,15 @@ static int reims_vgpu_dirty_slice_of(const ReimsVgpuDirtySlice *slices, int n,
     return -1;
 }
 
+static void reims_vgpu_dirty_qep_free(ReimsVgpuDirtyQep *q)
+{
+    g_free(q);
+}
+
 /* Grow the page stamps to cover target page frames below `end_pfn`. d->lock held. */
 static void reims_vgpu_dirty_page_seq_cover(ReimsVgpuDirty *d, uint64_t end_pfn)
 {
+    ReimsVgpuDirtyQep *oq = d->qep, *nq;
     uint64_t n;
 
     if (end_pfn <= d->page_seq_n) {
@@ -2719,9 +2807,32 @@ static void reims_vgpu_dirty_page_seq_cover(ReimsVgpuDirty *d, uint64_t end_pfn)
     n = MAX(end_pfn, d->page_seq_n * 2);
     d->page_seq = g_renew(uint64_t, d->page_seq, n);
     memset(d->page_seq + d->page_seq_n, 0, (n - d->page_seq_n) * sizeof(uint64_t));
-    d->page_qepoch = g_renew(uint64_t, d->page_qepoch, n);
-    memset(d->page_qepoch + d->page_seq_n, 0, (n - d->page_seq_n) * sizeof(uint64_t));
+    /* Copied, not reallocated in place: a prep may be reading the old one. */
+    nq = g_malloc0(sizeof(*nq) + n * sizeof(uint64_t));
+    nq->n = n;
+    if (oq) {
+        memcpy(nq->e, oq->e, d->page_seq_n * sizeof(uint64_t));
+    }
+    qatomic_rcu_set(&d->qep, nq);
+    if (oq) {
+        call_rcu(oq, reims_vgpu_dirty_qep_free, rcu);
+    }
     d->page_seq_n = n;
+}
+
+/* Stamp target page frames [pfn, end) as queried in `epoch`. d->lock held. */
+static void reims_vgpu_dirty_qep_stamp(ReimsVgpuDirty *d, uint64_t pfn, uint64_t end,
+                                       uint64_t epoch)
+{
+    uint64_t *e;
+
+    reims_vgpu_dirty_page_seq_cover(d, end);
+    e = d->qep->e;
+    for (; pfn < end; pfn++) {
+        if (e[pfn] < epoch) {
+            qatomic_set(&e[pfn], epoch);
+        }
+    }
 }
 
 /*
@@ -3771,6 +3882,36 @@ static bool reims_vgpu_dirty_sync_batch(ReimsVgpuDirty *d, uint64_t token)
 }
 
 /*
+ * The pages of a set a sync for `epoch` queries: all of `spages` but those
+ * already queried in `epoch` or later (all of them when `arming`: an arming
+ * sync queries every page itself, after its own flush). Returns how many, in a
+ * new array `*out`; `*skipped` counts the rest. Either under `lock`, or (lab
+ * DIRTY_PREPLOCK) inside an RCU read-side section with the set claimed: `qep`
+ * may then be stale, which only skips fewer pages.
+ */
+static size_t reims_vgpu_dirty_page_list(ReimsVgpuDirty *d, const uint64_t *spages,
+                                         size_t scount, uint64_t epoch, bool arming,
+                                         uint64_t **out, uint64_t *skipped)
+{
+    const int shift = qemu_target_page_bits();
+    const ReimsVgpuDirtyQep *q = arming ? NULL : qatomic_rcu_read(&d->qep);
+    uint64_t *pages = g_new(uint64_t, MAX(scount, 1));
+    size_t p, count = 0;
+
+    for (p = 0; p < scount; p++) {
+        uint64_t pfn = spages[p] >> shift;
+
+        if (q && pfn < q->n && qatomic_read(&q->e[pfn]) >= epoch) {
+            continue;
+        }
+        pages[count++] = spages[p];
+    }
+    *skipped = scount - count;
+    *out = pages;
+    return count;
+}
+
+/*
  * Bring one set up to date: on return it is synced for `needed` or later (or
  * gone). `needed` is the epoch the caller's read must see (0 = the epoch at
  * entry); a sync this one starts is for the epoch at entry, never older. A sync
@@ -3801,6 +3942,10 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
     int64_t t0;
     int64_t lk_wait, lk_prep, lk_list, lk_split, lk_post, lk_t;   /* TEMP lab: d->lock wait/hold */
     uint64_t set_pages;   /* TEMP lab: target pages of the set */
+    const uint64_t *spages;   /* the set's page list (immutable; RCU-freed) */
+    size_t scount;
+    uint64_t skipped = 0;
+    bool unlocked;        /* lab DIRTY_PREPLOCK */
 
     if (d->od_batch && reims_vgpu_dirty_sync_batch(d, token)) {
         return;
@@ -3884,19 +4029,16 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
     page_size = s->page_size;
     set_pages = s->count * (page_size >> shift);
     arming = d->arm_flush && qatomic_read(&s->gen) == 0 && memory_dirty_log_flush_hook;
-    pages = g_new(uint64_t, s->count);
-    count = 0;
-    for (p = 0; p < s->count; p++) {
-        uint64_t pfn = s->pages[p] >> shift;
+    spages = s->pages;
+    scount = s->count;
+    unlocked = d->prep_unlocked;
+    lk_list = 0;
+    if (!unlocked) {
+        int64_t l0 = get_clock();
 
-        /* An arming sync queries every page itself, after its own flush. */
-        if (!arming && pfn < d->page_seq_n && d->page_qepoch[pfn] >= epoch) {
-            d->lab_od_skipped++;
-            continue;
-        }
-        pages[count++] = s->pages[p];
+        count = reims_vgpu_dirty_page_list(d, spages, scount, epoch, arming, &pages, &skipped);
+        lk_list = get_clock() - l0;   /* TEMP lab */
     }
-    lk_list = get_clock() - ph;   /* TEMP lab */
     {
         int64_t wait = d->doorbell_ns + d->lab_od_delay_ns - get_clock();
 
@@ -3910,7 +4052,20 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
             d->lab_arm_flushes++;
         }
         lk_prep = get_clock() - ph;   /* TEMP lab: held from the claim on */
-        qemu_mutex_unlock(&d->lock);
+        if (unlocked) {
+            /* Lab DIRTY_PREPLOCK: the page list under RCU, after the unlock. */
+            int64_t l0;
+
+            rcu_read_lock();
+            qemu_mutex_unlock(&d->lock);
+            l0 = get_clock();
+            count = reims_vgpu_dirty_page_list(d, spages, scount, epoch, arming, &pages,
+                                               &skipped);
+            lk_list = get_clock() - l0;   /* TEMP lab: built, but not held */
+            rcu_read_unlock();
+        } else {
+            qemu_mutex_unlock(&d->lock);
+        }
         if (d->lab_od_delay_ns > 0 && wait > 0) {
             g_usleep(wait / 1000);
         }
@@ -3932,24 +4087,20 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
     for (i = 0; i < n; i++) {
         slices[i].logged = g_hash_table_contains(d->logged, slices[i].mr);
     }
+    d->lab_od_skipped += skipped;
+    /*
+     * Lab DIRTY_RSETTLE, DIRTY_PREPLOCK: the ticket is taken below, with its
+     * footprint, once the ranges are known and before any query: a ticket held
+     * through the walk that builds them has no footprint yet, and every settle
+     * meanwhile has to wait for it.
+     */
+    qticket = d->rsettle_mode || unlocked ? 0 : reims_vgpu_dirty_query_begin(d);
     lk_prep += get_clock() - lk_t;
     qemu_mutex_unlock(&d->lock);
 
     /* Contiguous runs of this set's pages, per logged region. */
     ranges = g_array_new(FALSE, FALSE, sizeof(MemoryRegionRange));
     walked = g_array_new(FALSE, FALSE, sizeof(MemoryRegionRange));  /* GPA spans */
-    lk_t = get_clock();
-    qemu_mutex_lock(&d->lock);
-    lk_wait += get_clock() - lk_t;
-    lk_t = get_clock();
-    /*
-     * Lab DIRTY_RSETTLE: the ticket is taken below, with its footprint, once
-     * the ranges are known: a ticket held through the walk that builds them
-     * has no footprint yet, and every settle meanwhile has to wait for it.
-     */
-    qticket = d->rsettle_mode ? 0 : reims_vgpu_dirty_query_begin(d);
-    lk_prep += get_clock() - lk_t;
-    qemu_mutex_unlock(&d->lock);
     ph_prep_end = get_clock();
     for (i = 0; i < n; i++) {
         const ReimsVgpuDirtySlice *sl = &slices[i];
@@ -4026,7 +4177,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
     qemu_mutex_lock(&d->lock);
     lk_wait += get_clock() - lk_t;
     lk_t = get_clock();
-    if (d->rsettle_mode) {
+    if (d->rsettle_mode || unlocked) {
         qticket = reims_vgpu_dirty_query_begin(d);
     }
     reims_vgpu_dirty_query_footprint(d, qticket, (const ReimsVgpuDirtyChunk *)chunks->data,
@@ -4154,12 +4305,8 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
      */
     for (p = 0; p < walked->len; p++) {
         const MemoryRegionRange *w = &g_array_index(walked, MemoryRegionRange, p);
-        uint64_t pfn = w->start >> shift, end = (w->start + w->len) >> shift;
 
-        reims_vgpu_dirty_page_seq_cover(d, end);
-        for (; pfn < end; pfn++) {
-            d->page_qepoch[pfn] = MAX(d->page_qepoch[pfn], epoch);
-        }
+        reims_vgpu_dirty_qep_stamp(d, w->start >> shift, (w->start + w->len) >> shift, epoch);
     }
     s = g_hash_table_lookup(d->sets, &token);
     if (s) {
@@ -4523,6 +4670,8 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                         strcmp(getenv("REIMS_VGPU_DIRTY_GEN_FAST"), "off") == 0);
         d->fgjoin_mode = !(getenv("REIMS_VGPU_LAB_DIRTY_FGJOIN") &&    /* lab A/B */
                            strcmp(getenv("REIMS_VGPU_LAB_DIRTY_FGJOIN"), "off") == 0);
+        d->prep_unlocked = !(getenv("REIMS_VGPU_LAB_DIRTY_PREPLOCK") &&  /* lab A/B */
+                             strcmp(getenv("REIMS_VGPU_LAB_DIRTY_PREPLOCK"), "off") == 0);
         {   /* lab A/B: DIRTY_FGSLOT=off, DIRTY_FGSLOTS=1..8 (default 4) */
             const char *fs = getenv("REIMS_VGPU_LAB_DIRTY_FGSLOTS");
             bool off = getenv("REIMS_VGPU_LAB_DIRTY_FGSLOT") &&
@@ -4996,12 +5145,8 @@ static void reims_vgpu_dirty_prefetch_phase(ReimsVgpuDirty *d, GArray *tokens,
      */
     for (pi = 0; pi < walked->len; pi++) {
         const MemoryRegionRange *w = &g_array_index(walked, MemoryRegionRange, pi);
-        uint64_t pfn = w->start >> shift, end = (w->start + w->len) >> shift;
 
-        reims_vgpu_dirty_page_seq_cover(d, end);
-        for (; pfn < end; pfn++) {
-            d->page_qepoch[pfn] = MAX(d->page_qepoch[pfn], epoch);
-        }
+        reims_vgpu_dirty_qep_stamp(d, w->start >> shift, (w->start + w->len) >> shift, epoch);
     }
     pb4 = get_clock();
     for (t = 0; t < claimed->len; t++) {
