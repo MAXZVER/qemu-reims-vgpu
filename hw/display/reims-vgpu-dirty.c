@@ -80,6 +80,17 @@ typedef struct ReimsVgpuDirtySet {
      */
     uint64_t bclaim;
     /*
+     * Epoch a thread's own sync of this set (reims_vgpu_dirty_sync_one) is
+     * running for, or 0; set with `claim_epoch` and cleared by that sync when
+     * it publishes. A batch's claim leaves it alone. It is what tells a
+     * foreground read that finds the set claimed by a batch whether a thread
+     * already bypassed that claim (lab STEAL) for an epoch the read can use:
+     * then the read waits for that thread (and helps its split pieces) instead
+     * of querying the same pages a third time. Without it every concurrent
+     * foreground read of a batch-claimed set stole and queried on its own.
+     */
+    uint64_t tclaim;
+    /*
      * Lab GEN_MEMO: the generation this set answered for an epoch a read had to
      * be synced for, packed as (needed << 32) | generation, both below 2^32;
      * 0 = none. One word so that concurrent readers see a consistent pair and
@@ -138,6 +149,19 @@ typedef struct ReimsVgpuDirtyChunk {
     MemoryRegion *mr;
     MemoryRegionRange r;
 } ReimsVgpuDirtyChunk;
+
+/*
+ * TEMP lab DIRTY_FGSLOTS: one foreground split job. Its owner publishes the
+ * pieces, helpers take them in turn (`next`), and the owner resets the job once
+ * every piece is in (`done == total`); a piece taken holds the job until it is
+ * counted done, so a helper's `done` pointer stays valid. Under `lock`.
+ */
+typedef struct ReimsVgpuDirtySplitJob {
+    GArray *chunks;           /* ReimsVgpuDirtyChunk */
+    guint next, done, total;
+    bool busy;                /* published and its owner not yet done */
+} ReimsVgpuDirtySplitJob;
+#define REIMS_VGPU_DIRTY_FGSLOTS_MAX 8
 
 /*
  * TEMP lab (REIMS_VGPU_LAB_FGTRACE=<file>): one 72-byte record per traced event,
@@ -365,16 +389,37 @@ struct ReimsVgpuDirty {
     bool split_busy;          /* a job is published and its owner not yet done */
     QemuCond split_cond;
     /*
-     * TEMP lab DIRTY_FGSLOT (on unless =off): the drain's foreground sync gets
-     * a split job of its own, which every helper serves before the batch's.
+     * TEMP lab DIRTY_FGSLOT (on unless =off): a large foreground sync gets a
+     * split job of its own, which every helper serves before the batch's.
      * With one job a prefetch batch held it through most of a transition, and
      * a 5K set the drain needed then queried alone (~0.6 ms instead of ~0.1).
+     *
+     * TEMP lab DIRTY_FGSLOTS=N (1..8, default 4): N such jobs, so foreground
+     * syncs on several threads at once (the drain, and the device's own worker
+     * threads through reims_vgpu_dirty_gen) each split instead of all but one
+     * querying alone. A sync takes a free job; helpers take one piece at a time
+     * from the open jobs in turn (`fjob_rr`), and the batch's only when none is
+     * open; an owner takes only its own job's pieces. `fgslots` = 0 is
+     * DIRTY_FGSLOT=off. `fjob_open` has bit k set while job k has pieces left.
      */
-    bool fgslot_mode;
-    GArray *fsplit_chunks;    /* ReimsVgpuDirtyChunk */
-    guint fsplit_next, fsplit_done, fsplit_total;
-    bool fsplit_busy;
+    uint32_t fgslots;
+    ReimsVgpuDirtySplitJob fjob[REIMS_VGPU_DIRTY_FGSLOTS_MAX];
+    uint32_t fjob_open;
+    uint32_t fjob_rr;
+    uint32_t fjob_busy;       /* jobs published and not yet reset */
     uint64_t lab_fg_split_slot, lab_fg_split_shared, lab_fg_big_alone;
+    uint64_t lab_fg_slots_max, lab_fg_slots_multi, lab_fg_noslot;   /* TEMP lab (FGSLOTS) */
+    /*
+     * TEMP lab: `lock` in reims_vgpu_dirty_sync_one, per sync that got past the
+     * claim (lk_n): time spent acquiring it (lk_wait), held for the prep from
+     * the claim to the walk (lk_prep, of which lk_list builds the page list),
+     * for the ticket and the split publication (lk_split), and after the settle
+     * for the stamps, consume and evaluation (lk_post).
+     */
+    uint64_t lab_hold_n;
+    int64_t lab_hold_prep, lab_hold_list, lab_hold_split, lab_hold_post, lab_lock_wait;
+    uint64_t lab_holdb_n;     /* the same for sets of >= 4096 target pages (lkb_*) */
+    int64_t lab_holdb_prep, lab_holdb_list, lab_holdb_post;
     /* Epoch of each channel's latest doorbell (0 = root FIFO). */
     uint64_t chan_epoch[64];
     /*
@@ -434,6 +479,19 @@ struct ReimsVgpuDirty {
      *                               counts how often the memo would have differed.
      */
     uint32_t steal_mode, gen_memo_mode;
+    /*
+     * TEMP lab DIRTY_FGJOIN (on unless =off): a read waits for a sync already
+     * running for the epoch it needs (not only for the newest epoch), and a
+     * foreground read bypasses a batch's claim only if no thread already did
+     * for an epoch it can use (`tclaim`). Off: the earlier rule, where only a
+     * claim for the newest epoch was waited for and every foreground read of a
+     * batch-claimed set queried it on its own. `lab_dup_inflight` counts syncs
+     * begun while a thread's sync of the same set for an epoch the read could
+     * use was running (0 by construction when on), `lab_ov_older` those begun
+     * beside a thread's sync for an older epoch, which the read cannot use.
+     */
+    uint32_t fgjoin_mode;
+    uint64_t lab_dup_inflight, lab_ov_older;
     /*
      * REIMS_VGPU_LAB_EPOCH_NAMED=on: a gfx register write that names no doorbell
      * (gfx_write_doorbell_channel() answers none: it schedules no FIFO drain,
@@ -589,7 +647,7 @@ struct ReimsVgpuDirty {
      */
     uint32_t lab_run[64];
     uint64_t lab_dbp[64], lab_hole[64];
-    uint64_t lab_steals, lab_steal_same, lab_steal_late;
+    uint64_t lab_steals, lab_steal_same, lab_steal_late, lab_steal_joined;
     uint64_t lab_memo_hit, lab_memo_fresh, lab_memo_diff, lab_memo_bad;
     /*
      * REIMS_VGPU_LAB_GEN_LOCKFREE: 0 = a generation read of a synced set takes
@@ -815,7 +873,9 @@ ReimsVgpuDirty *reims_vgpu_dirty_new(void)
     qemu_cond_init(&d->q_cond);
     qemu_cond_init(&d->split_cond);
     d->split_chunks = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyChunk));
-    d->fsplit_chunks = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyChunk));
+    for (int k = 0; k < REIMS_VGPU_DIRTY_FGSLOTS_MAX; k++) {
+        d->fjob[k].chunks = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyChunk));
+    }
     d->od_work = g_array_new(FALSE, FALSE, sizeof(uint64_t));
     d->sets = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free,
                                     reims_vgpu_dirty_set_free);
@@ -844,6 +904,10 @@ void reims_vgpu_dirty_free(ReimsVgpuDirty *d)
         g_free(d->od_workers);
     }
     g_array_free(d->od_work, TRUE);
+    g_array_free(d->split_chunks, TRUE);
+    for (int k = 0; k < REIMS_VGPU_DIRTY_FGSLOTS_MAX; k++) {
+        g_array_free(d->fjob[k].chunks, TRUE);
+    }
     if (d->lab_tr) {   /* TEMP lab (FGTRACE) */
         qemu_mutex_lock(&d->lock);
         reims_vgpu_lab_flush(d, true);
@@ -1022,7 +1086,8 @@ void reims_stress_bh_schedule(QEMUBH *bh);
 #define REIMS_WP_BH_SCHEDULE(bh) qemu_bh_schedule(bh)
 #endif
 static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg,
-                                      int64_t *lab_wait, int64_t *lab_query);
+                                      uint64_t needed, int64_t *lab_wait,
+                                      int64_t *lab_query);
 
 static int reims_vgpu_dirty_ram_slices_into(ReimsVgpuDirtySlice **buf, int *cap);
 static int reims_vgpu_dirty_slice_of(const ReimsVgpuDirtySlice *slices, int n, uint64_t gpa);
@@ -1283,7 +1348,7 @@ static void reims_vgpu_dirty_wp_finish(ReimsVgpuDirty *d, uint64_t token, ReimsV
     d->epoch_queried = false;
     fin_epoch = d->epoch;
     qemu_mutex_unlock(&d->lock);
-    reims_vgpu_dirty_sync_one(d, token, true, NULL, NULL);
+    reims_vgpu_dirty_sync_one(d, token, true, 0, NULL, NULL);   /* 0: an epoch from now on */
     qemu_mutex_lock(&d->lock);
     if (s->wp_state == WP_PROTECTING && s->claim_epoch == 0 && s->synced_epoch >= fin_epoch) {
         s->wp_state = WP_ON;
@@ -2236,7 +2301,7 @@ uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token)
     qemu_mutex_unlock(&d->lock);
     fg0 = stale ? get_clock() : 0;
     if (stale) {
-        reims_vgpu_dirty_sync_one(d, token, true, &lw, &lq);
+        reims_vgpu_dirty_sync_one(d, token, true, needed_pre, &lw, &lq);
     }
     qemu_mutex_lock(&d->lock);
     if (stale) {
@@ -2401,6 +2466,7 @@ int64_t reims_vgpu_dirty_written_since(ReimsVgpuDirty *d, uint64_t token,
         /* A page list read in a later epoch than the set's last sync would
          * miss what the guest wrote since; bring the set up to date first. */
         int64_t fg0 = get_clock();
+        uint64_t ws_needed = reims_vgpu_dirty_needed_epoch(d);
 
         s->lab_fg_n++;   /* TEMP lab */
         if (s->last_query_epoch + d->od_hot < d->epoch) {   /* TEMP lab */
@@ -2426,7 +2492,7 @@ int64_t reims_vgpu_dirty_written_since(ReimsVgpuDirty *d, uint64_t token,
         }
 
         qemu_mutex_unlock(&d->lock);
-        reims_vgpu_dirty_sync_one(d, token, true, &lw, &lq);
+        reims_vgpu_dirty_sync_one(d, token, true, ws_needed, &lw, &lq);
         qemu_mutex_lock(&d->lock);
         d->lab_od_fg_n++;
         d->lab_od_fg_ns += get_clock() - fg0;
@@ -3041,29 +3107,81 @@ static void reims_vgpu_dirty_query_end(ReimsVgpuDirty *d, uint64_t ticket)
  */
 static bool reims_vgpu_dirty_split_pending(ReimsVgpuDirty *d)
 {
-    return d->fsplit_next < d->fsplit_total || d->split_next < d->split_total;
+    return d->fjob_open != 0 || d->split_next < d->split_total;
 }
 
 /*
- * Query split pieces until none is left: the foreground job's first (lab
- * DIRTY_FGSLOT), then the batch's, unless `fg_only` (the foreground job's own
- * owner, which must not wander into a batch piece while its job finishes).
+ * Cut `chunks` into pieces of at most 1024 target pages into `out` (emptied
+ * first), so a set of a few long runs still spreads over every helper.
+ */
+static void reims_vgpu_dirty_split_cut(GArray *out, const GArray *chunks, int shift)
+{
+    const uint64_t piece = 1024ULL << shift;
+    guint k;
+
+    g_array_set_size(out, 0);
+    for (k = 0; k < chunks->len; k++) {
+        ReimsVgpuDirtyChunk c = g_array_index(chunks, ReimsVgpuDirtyChunk, k);
+
+        while (c.r.len > piece) {
+            ReimsVgpuDirtyChunk head = { c.mr, { c.r.start, piece } };
+
+            g_array_append_val(out, head);
+            c.r.start += piece;
+            c.r.len -= piece;
+        }
+        g_array_append_val(out, c);
+    }
+}
+
+/*
+ * The open foreground job a helper takes its next piece from: the first open
+ * one at or after the round-robin cursor, which then moves past it, so that
+ * concurrent foreground syncs progress side by side. `fjob_open` nonzero.
  * d->lock held.
  */
-static void reims_vgpu_dirty_split_help_from(ReimsVgpuDirty *d, bool fg_only)
+static int reims_vgpu_dirty_fjob_pick(ReimsVgpuDirty *d)
+{
+    uint32_t open = d->fjob_open;
+    uint32_t from = open & ~((1u << d->fjob_rr) - 1);
+    int k = ctz32(from ? from : open);
+
+    d->fjob_rr = (k + 1) % REIMS_VGPU_DIRTY_FGSLOTS_MAX;
+    return k;
+}
+
+/*
+ * Query split pieces until none is left that this thread may take. `own` >= 0
+ * is the owner of foreground job `own` (lab DIRTY_FGSLOTS): it takes only that
+ * job's pieces, since a piece of another job (or of the batch's) could outlast
+ * its own job and hold its sync up. `own` < 0 is a helper: one piece at a time
+ * from the open foreground jobs in turn, then the batch's. d->lock held.
+ */
+static void reims_vgpu_dirty_split_help_from(ReimsVgpuDirty *d, int own)
 {
     for (;;) {
         GArray *arr;
         guint *next, *done, total;
         ReimsVgpuDirtyChunk c;
         uint64_t pt;
+        int k = -1;
 
-        if (d->fsplit_next < d->fsplit_total) {
-            arr = d->fsplit_chunks;
-            next = &d->fsplit_next;
-            done = &d->fsplit_done;
-            total = d->fsplit_total;
-        } else if (!fg_only && d->split_next < d->split_total) {
+        if (own >= 0) {
+            if (!(d->fjob_open & (1u << own))) {
+                return;
+            }
+            k = own;
+        } else if (d->fjob_open) {
+            k = reims_vgpu_dirty_fjob_pick(d);
+        }
+        if (k >= 0) {
+            ReimsVgpuDirtySplitJob *j = &d->fjob[k];
+
+            arr = j->chunks;
+            next = &j->next;
+            done = &j->done;
+            total = j->total;
+        } else if (d->split_next < d->split_total) {
             arr = d->split_chunks;
             next = &d->split_next;
             done = &d->split_done;
@@ -3073,6 +3191,9 @@ static void reims_vgpu_dirty_split_help_from(ReimsVgpuDirty *d, bool fg_only)
         }
         /* A job is reset only after all its pieces are done, this one included. */
         c = g_array_index(arr, ReimsVgpuDirtyChunk, (*next)++);
+        if (k >= 0 && *next == total) {
+            d->fjob_open &= ~(1u << k);
+        }
         pt = d->od_nopticket ? 0 : reims_vgpu_dirty_query_begin(d);
         reims_vgpu_dirty_query_footprint(d, pt, &c, 1);
         qemu_mutex_unlock(&d->lock);
@@ -3089,7 +3210,7 @@ static void reims_vgpu_dirty_split_help_from(ReimsVgpuDirty *d, bool fg_only)
 
 static void reims_vgpu_dirty_split_help(ReimsVgpuDirty *d)
 {
-    reims_vgpu_dirty_split_help_from(d, false);
+    reims_vgpu_dirty_split_help_from(d, -1);
 }
 
 /*
@@ -3649,8 +3770,16 @@ static bool reims_vgpu_dirty_sync_batch(ReimsVgpuDirty *d, uint64_t token)
     return covered;
 }
 
+/*
+ * Bring one set up to date: on return it is synced for `needed` or later (or
+ * gone). `needed` is the epoch the caller's read must see (0 = the epoch at
+ * entry); a sync this one starts is for the epoch at entry, never older. A sync
+ * already running for `needed` or later (a thread's, or a batch's that `fg`
+ * does not bypass) is waited for instead, helping split pieces meanwhile.
+ */
 static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg,
-                                      int64_t *lab_wait, int64_t *lab_query)
+                                      uint64_t needed, int64_t *lab_wait,
+                                      int64_t *lab_query)
 {
     const int shift = qemu_target_page_bits();
     ReimsVgpuDirtySlice *slices = NULL;
@@ -3662,18 +3791,24 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
     g_autoptr(GArray) written = NULL;
     g_autoptr(GArray) hit = NULL;
     size_t count, p;
-    uint64_t page_size, epoch, qticket, walked_pages = 0;
+    uint64_t page_size, epoch, need, qticket, walked_pages = 0;
+    int slot;             /* lab DIRTY_FGSLOTS: the foreground job this sync owns, or -1 */
     int64_t ph = 0, ph_prep_end = 0, ph_query_end = 0, ph_settle_end = 0;
     bool stole = false;   /* TEMP lab STEAL */
+    bool joined = false;  /* TEMP lab: waited for a thread that stole the set for us */
     bool arming = false;  /* lab ARM_FLUSH */
     g_autoptr(GArray) chunks = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyChunk));
     int64_t t0;
+    int64_t lk_wait, lk_prep, lk_list, lk_split, lk_post, lk_t;   /* TEMP lab: d->lock wait/hold */
+    uint64_t set_pages;   /* TEMP lab: target pages of the set */
 
     if (d->od_batch && reims_vgpu_dirty_sync_batch(d, token)) {
         return;
     }
     t0 = get_clock();
     qemu_mutex_lock(&d->lock);
+    lk_t = get_clock();
+    lk_wait = lk_t - t0;
     s = g_hash_table_lookup(d->sets, &token);
     if (!s) {
         qemu_mutex_unlock(&d->lock);
@@ -3681,12 +3816,21 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
     }
     epoch = d->epoch;
     /*
+     * The epoch this read must see. A read that needs an older epoch than the
+     * newest (the drain's work epoch lags the doorbells) is served by any sync
+     * claimed for that epoch or later — it began after that doorbell, so it
+     * vouches for every store before it — and waits for one already running
+     * rather than starting its own beside it. Several foreground readers of
+     * one set (the drain and the device's worker threads) then share one sync.
+     */
+    need = needed && d->fgjoin_mode ? MIN(needed, epoch) : epoch;
+    /*
      * Up to date already, or being brought up to date for this epoch by the
      * other thread (drain or prefetch): wait for that one rather than repeat
      * its hypervisor calls. The claimant holds no lock while it syncs.
      */
     ph = get_clock();
-    while (s && s->synced_epoch < epoch && s->claim_epoch >= epoch) {
+    while (s && s->synced_epoch < need && s->claim_epoch >= need) {
         /*
          * Lab STEAL: the claimant is a prefetch batch, which publishes every set
          * it holds only after the whole union has been queried, consumed and
@@ -3698,12 +3842,17 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
          * is what makes two overlapping queries of one page safe: whichever
          * took the hypervisor's bit, the settle below waits for it to be
          * deposited before this sync consumes. A set claimed by another
-         * *thread's* sync (`bclaim` 0) is still waited for.
+         * *thread's* sync (`bclaim` 0) is still waited for, and so is one a
+         * thread already stole for an epoch this read can use (`tclaim`): one
+         * bypass per batch claim, not one per reader.
          */
-        if (d->steal_mode && fg && s->bclaim >= epoch) {
-            stole = true;
-            d->lab_steals++;
-            break;
+        if (d->steal_mode && fg && s->bclaim >= need) {
+            if (s->tclaim < need || !d->fgjoin_mode) {
+                stole = true;
+                d->lab_steals++;
+                break;
+            }
+            joined = true;   /* TEMP lab */
         }
         /* Waiting for the claimant: query its split chunks meanwhile. */
         if (reims_vgpu_dirty_split_pending(d)) {
@@ -3714,17 +3863,26 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
         s = g_hash_table_lookup(d->sets, &token);
     }
     d->lab_ph_wait += get_clock() - ph;
+    d->lab_steal_joined += joined;
     if (lab_wait) {   /* TEMP lab (FGTRACE) */
         *lab_wait = get_clock() - ph;
     }
-    if (!s || s->synced_epoch >= epoch) {
+    if (!s || s->synced_epoch >= need) {
         qemu_mutex_unlock(&d->lock);
         return;
     }
     ph = get_clock();
-    s->claim_epoch = epoch;
+    /* Not below a newer batch claim this read bypasses: that batch still runs. */
+    s->claim_epoch = d->fgjoin_mode ? MAX(s->claim_epoch, epoch) : epoch;
+    if (s->tclaim >= (needed ? MIN(needed, epoch) : epoch)) {   /* TEMP lab */
+        d->lab_dup_inflight++;
+    } else if (s->tclaim) {
+        d->lab_ov_older++;
+    }
+    s->tclaim = MAX(s->tclaim, epoch);
     d->epoch_queried = true;
     page_size = s->page_size;
+    set_pages = s->count * (page_size >> shift);
     arming = d->arm_flush && qatomic_read(&s->gen) == 0 && memory_dirty_log_flush_hook;
     pages = g_new(uint64_t, s->count);
     count = 0;
@@ -3738,6 +3896,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
         }
         pages[count++] = s->pages[p];
     }
+    lk_list = get_clock() - ph;   /* TEMP lab */
     {
         int64_t wait = d->doorbell_ns + d->lab_od_delay_ns - get_clock();
 
@@ -3750,6 +3909,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
         if (arming) {
             d->lab_arm_flushes++;
         }
+        lk_prep = get_clock() - ph;   /* TEMP lab: held from the claim on */
         qemu_mutex_unlock(&d->lock);
         if (d->lab_od_delay_ns > 0 && wait > 0) {
             g_usleep(wait / 1000);
@@ -3765,22 +3925,30 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
     }
 
     n = reims_vgpu_dirty_ram_slices_into(&slices, &cap);
+    lk_t = get_clock();
     qemu_mutex_lock(&d->lock);
+    lk_wait += get_clock() - lk_t;
+    lk_t = get_clock();
     for (i = 0; i < n; i++) {
         slices[i].logged = g_hash_table_contains(d->logged, slices[i].mr);
     }
+    lk_prep += get_clock() - lk_t;
     qemu_mutex_unlock(&d->lock);
 
     /* Contiguous runs of this set's pages, per logged region. */
     ranges = g_array_new(FALSE, FALSE, sizeof(MemoryRegionRange));
     walked = g_array_new(FALSE, FALSE, sizeof(MemoryRegionRange));  /* GPA spans */
+    lk_t = get_clock();
     qemu_mutex_lock(&d->lock);
+    lk_wait += get_clock() - lk_t;
+    lk_t = get_clock();
     /*
      * Lab DIRTY_RSETTLE: the ticket is taken below, with its footprint, once
      * the ranges are known: a ticket held through the walk that builds them
      * has no footprint yet, and every settle meanwhile has to wait for it.
      */
     qticket = d->rsettle_mode ? 0 : reims_vgpu_dirty_query_begin(d);
+    lk_prep += get_clock() - lk_t;
     qemu_mutex_unlock(&d->lock);
     ph_prep_end = get_clock();
     for (i = 0; i < n; i++) {
@@ -3854,82 +4022,76 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
     if (d->rsettle_mode) {
         g_array_sort(chunks, reims_vgpu_dirty_cmp_chunk);
     }
+    lk_t = get_clock();
     qemu_mutex_lock(&d->lock);
+    lk_wait += get_clock() - lk_t;
+    lk_t = get_clock();
     if (d->rsettle_mode) {
         qticket = reims_vgpu_dirty_query_begin(d);
     }
     reims_vgpu_dirty_query_footprint(d, qticket, (const ReimsVgpuDirtyChunk *)chunks->data,
                                      chunks->len);
-    if (fg && d->fgslot_mode && d->od_split && d->od_nworkers > 0 &&
-        walked_pages >= 4096 && !d->fsplit_busy) {
-        guint k;
-
-        /* Lab DIRTY_FGSLOT: the same pieces, in the foreground job. */
-        if (!d->od_nopticket) {
-            reims_vgpu_dirty_query_end(d, qticket);
-            qticket = 0;
-        }
-        g_array_set_size(d->fsplit_chunks, 0);
-        for (k = 0; k < chunks->len; k++) {
-            ReimsVgpuDirtyChunk c = g_array_index(chunks, ReimsVgpuDirtyChunk, k);
-            const uint64_t piece = 1024ULL << shift;
-
-            while (c.r.len > piece) {
-                ReimsVgpuDirtyChunk head = { c.mr, { c.r.start, piece } };
-
-                g_array_append_val(d->fsplit_chunks, head);
-                c.r.start += piece;
-                c.r.len -= piece;
+    slot = -1;
+    if (fg && d->fgslots && d->od_split && d->od_nworkers > 0 && walked_pages >= 4096) {
+        /* Lab DIRTY_FGSLOTS: a free foreground job, else the batch's, else alone. */
+        for (i = 0; i < (int)d->fgslots; i++) {
+            if (!d->fjob[i].busy) {
+                slot = i;
+                break;
             }
-            g_array_append_val(d->fsplit_chunks, c);
         }
-        d->fsplit_next = d->fsplit_done = 0;
-        d->fsplit_total = d->fsplit_chunks->len;
-        d->fsplit_busy = true;
-        if (d->split_busy) {
-            d->lab_fg_split_shared++;
+        if (slot < 0) {
+            d->lab_fg_noslot++;
         }
-        qemu_cond_broadcast(&d->od_work_cond);
-        qemu_cond_broadcast(&d->synced_cond);   /* claim waiters help too */
-        reims_vgpu_dirty_split_help_from(d, true);
-        while (d->fsplit_done < d->fsplit_total) {
-            qemu_cond_wait(&d->split_cond, &d->lock);
-        }
-        d->fsplit_total = d->fsplit_done = d->fsplit_next = 0;
-        d->fsplit_busy = false;
-        d->lab_fg_split++;   /* TEMP lab (FGTRACE) */
-        d->lab_fg_split_slot++;
-        qemu_mutex_unlock(&d->lock);
-    } else if (d->od_split && d->od_nworkers > 0 && walked_pages >= 4096 &&
-        !d->split_busy && (fg || !d->bigsplit_mode)) {
-        guint k;
+    }
+    if (slot >= 0) {
+        ReimsVgpuDirtySplitJob *j = &d->fjob[slot];
 
         /* The pieces carry their own tickets; this one has queried nothing. */
         if (!d->od_nopticket) {
             reims_vgpu_dirty_query_end(d, qticket);
             qticket = 0;
         }
-        /* Pieces of at most 1024 pages, so a set of a few long runs still
-         * spreads over every worker. */
-        g_array_set_size(d->split_chunks, 0);
-        for (k = 0; k < chunks->len; k++) {
-            ReimsVgpuDirtyChunk c = g_array_index(chunks, ReimsVgpuDirtyChunk, k);
-            const uint64_t piece = 1024ULL << shift;
-
-            while (c.r.len > piece) {
-                ReimsVgpuDirtyChunk head = { c.mr, { c.r.start, piece } };
-
-                g_array_append_val(d->split_chunks, head);
-                c.r.start += piece;
-                c.r.len -= piece;
-            }
-            g_array_append_val(d->split_chunks, c);
+        reims_vgpu_dirty_split_cut(j->chunks, chunks, shift);
+        j->next = j->done = 0;
+        j->total = j->chunks->len;
+        j->busy = true;
+        if (j->total) {
+            d->fjob_open |= 1u << slot;
         }
+        d->fjob_busy++;
+        d->lab_fg_slots_max = MAX(d->lab_fg_slots_max, d->fjob_busy);
+        d->lab_fg_slots_multi += d->fjob_busy > 1;
+        if (d->split_busy) {
+            d->lab_fg_split_shared++;
+        }
+        qemu_cond_broadcast(&d->od_work_cond);
+        qemu_cond_broadcast(&d->synced_cond);   /* claim waiters help too */
+        lk_split = get_clock() - lk_t;
+        reims_vgpu_dirty_split_help_from(d, slot);
+        while (j->done < j->total) {
+            qemu_cond_wait(&d->split_cond, &d->lock);
+        }
+        j->total = j->done = j->next = 0;
+        j->busy = false;
+        d->fjob_busy--;
+        d->lab_fg_split++;   /* TEMP lab (FGTRACE) */
+        d->lab_fg_split_slot++;
+        qemu_mutex_unlock(&d->lock);
+    } else if (d->od_split && d->od_nworkers > 0 && walked_pages >= 4096 &&
+        !d->split_busy && (fg || !d->bigsplit_mode)) {
+        /* The pieces carry their own tickets; this one has queried nothing. */
+        if (!d->od_nopticket) {
+            reims_vgpu_dirty_query_end(d, qticket);
+            qticket = 0;
+        }
+        reims_vgpu_dirty_split_cut(d->split_chunks, chunks, shift);
         d->split_next = d->split_done = 0;
         d->split_total = d->split_chunks->len;
         d->split_busy = true;
         qemu_cond_broadcast(&d->od_work_cond);
         qemu_cond_broadcast(&d->synced_cond);   /* claim waiters help too */
+        lk_split = get_clock() - lk_t;
         reims_vgpu_dirty_split_help(d);
         while (d->split_done < d->split_total) {
             qemu_cond_wait(&d->split_cond, &d->lock);
@@ -3946,6 +4108,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
         if (fg && walked_pages >= 4096) {
             d->lab_fg_big_alone++;   /* TEMP lab: a large foreground sync not split */
         }
+        lk_split = get_clock() - lk_t;
         qemu_mutex_unlock(&d->lock);
         while (k < chunks->len) {
             MemoryRegion *mr = g_array_index(chunks, ReimsVgpuDirtyChunk, k).mr;
@@ -3970,8 +4133,10 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
 
     written = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyWritten));
     hit = g_array_new(FALSE, FALSE, sizeof(size_t));
+    lk_t = get_clock();
     qemu_mutex_lock(&d->lock);
     ph_query_end = get_clock();
+    lk_wait += ph_query_end - lk_t;
     if (lab_query) {   /* TEMP lab (FGTRACE) */
         *lab_query = ph_query_end - ph_prep_end;
     }
@@ -4006,13 +4171,16 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
         if (s->claim_epoch == epoch) {
             s->claim_epoch = 0;
         }
+        if (s->tclaim == epoch) {
+            s->tclaim = 0;
+        }
     }
     qemu_cond_broadcast(&d->synced_cond);
     if (stole && d->steal_mode == 2) {
         /* Lab STEAL verify: answer as the original did, after the batch. */
         uint64_t g1 = s ? s->gen : 0;
 
-        while ((s = g_hash_table_lookup(d->sets, &token)) && s->bclaim >= epoch) {
+        while ((s = g_hash_table_lookup(d->sets, &token)) && s->bclaim >= need) {
             qemu_cond_wait(&d->synced_cond, &d->lock);
         }
         if (s) {
@@ -4026,6 +4194,19 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
     {
         int64_t now = get_clock();
 
+        lk_post = now - ph_settle_end;   /* TEMP lab: stamp, consume, eval */
+        d->lab_hold_prep += lk_prep;
+        d->lab_hold_list += lk_list;
+        d->lab_hold_split += lk_split;
+        d->lab_hold_post += lk_post;
+        d->lab_lock_wait += lk_wait;
+        d->lab_hold_n++;
+        if (set_pages >= 4096) {
+            d->lab_holdb_n++;
+            d->lab_holdb_prep += lk_prep;
+            d->lab_holdb_list += lk_list;
+            d->lab_holdb_post += lk_post;
+        }
         d->lab_ph_consume += now - ph_settle_end;
         d->lab_od_n++;
         d->lab_od_ns += now - t0;
@@ -4043,7 +4224,12 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                     " rs_skipped=%" PRIu64 " bigphase=%u bp_big=%" PRIu64
                     " bp_groups=%" PRIu64 " frontier=%u fr_child=%" PRIu64
                     " fgslot=%u fg_split_slot=%" PRIu64 " fg_split_shared=%" PRIu64
-                    " fg_big_alone=%" PRIu64 "\n",
+                    " fg_big_alone=%" PRIu64 " fgslots=%u fg_slots_max=%" PRIu64
+                    " fg_slots_multi=%" PRIu64 " fg_noslot=%" PRIu64 " lk_n=%" PRIu64
+                    " lk_wait_us=%" PRId64 " lk_prep_us=%" PRId64 " lk_list_us=%" PRId64
+                    " lk_split_us=%" PRId64 " lk_post_us=%" PRId64 " lkb_n=%" PRIu64
+                    " lkb_prep_us=%" PRId64 " lkb_list_us=%" PRId64 " lkb_post_us=%" PRId64
+                    " fgjoin=%u dup_inflight=%" PRIu64 " ov_older=%" PRIu64 "\n",
                     g_get_real_time() / 1000, d->lab_od_n, d->lab_od_ns / 1000,
                     d->lab_od_pages, d->lab_od_skipped, d->lab_od_epochs,
                     d->lab_od_fg_n, d->lab_od_fg_ns / 1000, d->lab_ph_wait / 1000,
@@ -4056,10 +4242,23 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                     d->bigsplit_mode, d->lab_bigsplit_sets, d->rsettle_mode,
                     d->lab_rs_waits, d->lab_rs_skipped, d->bigphase_mode,
                     d->lab_bigphase_big, d->lab_bigphase_groups, d->frontier_mode,
-                    d->lab_frontier_child, d->fgslot_mode, d->lab_fg_split_slot,
-                    d->lab_fg_split_shared, d->lab_fg_big_alone);
+                    d->lab_frontier_child, d->fgslots != 0, d->lab_fg_split_slot,
+                    d->lab_fg_split_shared, d->lab_fg_big_alone, d->fgslots,
+                    d->lab_fg_slots_max, d->lab_fg_slots_multi, d->lab_fg_noslot,
+                    d->lab_hold_n, d->lab_lock_wait / 1000, d->lab_hold_prep / 1000,
+                    d->lab_hold_list / 1000, d->lab_hold_split / 1000,
+                    d->lab_hold_post / 1000, d->lab_holdb_n, d->lab_holdb_prep / 1000,
+                    d->lab_holdb_list / 1000, d->lab_holdb_post / 1000, d->fgjoin_mode,
+                    d->lab_dup_inflight, d->lab_ov_older);
             d->lab_frontier_child = 0;
             d->lab_fg_split_slot = d->lab_fg_split_shared = d->lab_fg_big_alone = 0;
+            d->lab_fg_slots_max = d->lab_fg_slots_multi = d->lab_fg_noslot = 0;
+            d->lab_hold_n = 0;
+            d->lab_lock_wait = d->lab_hold_prep = d->lab_hold_list = 0;
+            d->lab_hold_split = d->lab_hold_post = 0;
+            d->lab_holdb_n = 0;
+            d->lab_holdb_prep = d->lab_holdb_list = d->lab_holdb_post = 0;
+            d->lab_dup_inflight = d->lab_ov_older = 0;
             if (d->wp_toggle) {   /* lab DIRTY_WP=toggle: follow the flag file */
                 bool want = g_file_test(d->wp_toggle, G_FILE_TEST_EXISTS);
 
@@ -4142,13 +4341,13 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                 d->lf_mode) {   /* TEMP lab gates */
                 fprintf(stderr, "reims-dirty-lab epoch_ms=%" PRId64 " steal=%u memo=%u"
                         " steals=%" PRIu64 " steal_same=%" PRIu64 " steal_late=%" PRIu64
-                        " memo_hit=%" PRIu64 " memo_fresh=%" PRIu64
+                        " steal_joined=%" PRIu64 " memo_hit=%" PRIu64 " memo_fresh=%" PRIu64
                         " memo_diff=%" PRIu64 " memo_bad=%" PRIu64 " named=%u unnamed_skipped=%" PRIu64 " lf=%u lf_hit=%" PRIu64 " lf_hitdiff=%" PRIu64
                         " lf_gendiff=%" PRIu64 " lf_race=%" PRIu64 " lf_fast=%" PRIu64 " lfw_hit=%" PRIu64
                         " lfw_miss=%" PRIu64 " lfw_diff=%" PRIu64 " lfw_race=%" PRIu64 "\n",
                         g_get_real_time() / 1000, d->steal_mode, d->gen_memo_mode,
                         d->lab_steals, d->lab_steal_same, d->lab_steal_late,
-                        qatomic_xchg(&d->lab_memo_hit, 0),
+                        d->lab_steal_joined, qatomic_xchg(&d->lab_memo_hit, 0),
                         qatomic_xchg(&d->lab_memo_fresh, 0),
                         qatomic_xchg(&d->lab_memo_diff, 0),
                         qatomic_xchg(&d->lab_memo_bad, 0), d->epoch_named,
@@ -4159,6 +4358,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                         qatomic_xchg(&d->lab_lfw_hit, 0), qatomic_xchg(&d->lab_lfw_miss, 0),
                         qatomic_xchg(&d->lab_lfw_diff, 0), qatomic_xchg(&d->lab_lfw_race, 0));
                 d->lab_steals = d->lab_steal_same = d->lab_steal_late = 0;
+                d->lab_steal_joined = 0;
             }
             if (d->hole_mode) {   /* TEMP lab (DIRTY_HOLE) */
                 unsigned ch;
@@ -4237,7 +4437,7 @@ static void reims_vgpu_dirty_prefetch_drain(ReimsVgpuDirty *d, uint64_t epoch)
         }
         token = g_array_index(d->od_work, uint64_t, d->od_work_next++);
         qemu_mutex_unlock(&d->lock);
-        reims_vgpu_dirty_sync_one(d, token, false, NULL, NULL);
+        reims_vgpu_dirty_sync_one(d, token, false, 0, NULL, NULL);
     }
 }
 
@@ -4321,8 +4521,16 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                       strcmp(getenv("REIMS_VGPU_DIRTY_PB_SPLIT"), "on") == 0;
         d->gen_fast = !(getenv("REIMS_VGPU_DIRTY_GEN_FAST") &&        /* lab A/B */
                         strcmp(getenv("REIMS_VGPU_DIRTY_GEN_FAST"), "off") == 0);
-        d->fgslot_mode = !(getenv("REIMS_VGPU_LAB_DIRTY_FGSLOT") &&    /* lab A/B */
-                           strcmp(getenv("REIMS_VGPU_LAB_DIRTY_FGSLOT"), "off") == 0);
+        d->fgjoin_mode = !(getenv("REIMS_VGPU_LAB_DIRTY_FGJOIN") &&    /* lab A/B */
+                           strcmp(getenv("REIMS_VGPU_LAB_DIRTY_FGJOIN"), "off") == 0);
+        {   /* lab A/B: DIRTY_FGSLOT=off, DIRTY_FGSLOTS=1..8 (default 4) */
+            const char *fs = getenv("REIMS_VGPU_LAB_DIRTY_FGSLOTS");
+            bool off = getenv("REIMS_VGPU_LAB_DIRTY_FGSLOT") &&
+                       strcmp(getenv("REIMS_VGPU_LAB_DIRTY_FGSLOT"), "off") == 0;
+            int want = fs ? atoi(fs) : 4;
+
+            d->fgslots = off ? 0 : MIN(MAX(want, 1), REIMS_VGPU_DIRTY_FGSLOTS_MAX);
+        }
         d->od_split = !(getenv("REIMS_VGPU_DIRTY_OD_SPLIT") &&        /* lab A/B */
                         strcmp(getenv("REIMS_VGPU_DIRTY_OD_SPLIT"), "off") == 0);
         d->work_epoch_off = getenv("REIMS_VGPU_DIRTY_WORK_EPOCH") &&   /* lab A/B */
