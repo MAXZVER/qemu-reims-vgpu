@@ -493,7 +493,7 @@ struct ReimsVgpuDirty {
     uint64_t wp_cur;              /* the set being protected, or 0 (under `wp_mutex`) */
     ReimsVgpuDirtySlice *wp_slices;
     int wp_slices_cap;
-    uint32_t wp_chunk;            /* runs per step (DIRTY_WP_CHUNK, 24) */
+    uint32_t wp_chunk;            /* runs per step (DIRTY_WP_CHUNK, 4) */
     uint32_t wp_pace_ms;          /* between steps (DIRTY_WP_PACE_MS, 4) */
     uint32_t wp_duty;             /* max % of time the guest is paused (DIRTY_WP_DUTY, 10) */
     /*
@@ -4243,8 +4243,15 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                                 MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_STREAK"))) : 16;
             d->wp_min_pages = getenv("REIMS_VGPU_LAB_DIRTY_WP_MIN") ?
                               MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_MIN"))) : 2048;
+            /*
+             * 4 runs a pause (~2-7 ms with every vCPU stopped), not 24: at 24 a pause
+             * was 10-29 ms, which full-screen transitions (new 5K surfaces every frame,
+             * protected and dropped again) hit 10-30 times a second. Same duty, same
+             * drag (120 Hz, max gap 18.5 ms against 29); transitions 17-18 % of frames
+             * over 25 ms against 15-28 %.
+             */
             d->wp_chunk = getenv("REIMS_VGPU_LAB_DIRTY_WP_CHUNK") ?
-                          MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_CHUNK"))) : 24;
+                          MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_CHUNK"))) : 4;
             d->wp_duty = getenv("REIMS_VGPU_LAB_DIRTY_WP_DUTY") ?
                          MIN(100, MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_DUTY")))) : 10;
             d->wp_pace_ms = getenv("REIMS_VGPU_LAB_DIRTY_WP_PACE_MS") ?
