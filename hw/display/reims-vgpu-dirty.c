@@ -362,6 +362,17 @@ struct ReimsVgpuDirty {
     guint split_next, split_done, split_total;
     bool split_busy;          /* a job is published and its owner not yet done */
     QemuCond split_cond;
+    /*
+     * TEMP lab DIRTY_FGSLOT (on unless =off): the drain's foreground sync gets
+     * a split job of its own, which every helper serves before the batch's.
+     * With one job a prefetch batch held it through most of a transition, and
+     * a 5K set the drain needed then queried alone (~0.6 ms instead of ~0.1).
+     */
+    bool fgslot_mode;
+    GArray *fsplit_chunks;    /* ReimsVgpuDirtyChunk */
+    guint fsplit_next, fsplit_done, fsplit_total;
+    bool fsplit_busy;
+    uint64_t lab_fg_split_slot, lab_fg_split_shared, lab_fg_big_alone;
     /* Epoch of each channel's latest doorbell (0 = root FIFO). */
     uint64_t chan_epoch[64];
     /*
@@ -802,6 +813,7 @@ ReimsVgpuDirty *reims_vgpu_dirty_new(void)
     qemu_cond_init(&d->q_cond);
     qemu_cond_init(&d->split_cond);
     d->split_chunks = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyChunk));
+    d->fsplit_chunks = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyChunk));
     d->od_work = g_array_new(FALSE, FALSE, sizeof(uint64_t));
     d->sets = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free,
                                     reims_vgpu_dirty_set_free);
@@ -3025,13 +3037,41 @@ static void reims_vgpu_dirty_query_end(ReimsVgpuDirty *d, uint64_t ticket)
  * ticket once every piece is done, which waits for every query begun before
  * then — the same guarantee a job-long ticket gave it.
  */
-static void reims_vgpu_dirty_split_help(ReimsVgpuDirty *d)
+static bool reims_vgpu_dirty_split_pending(ReimsVgpuDirty *d)
 {
-    while (d->split_next < d->split_total) {
-        ReimsVgpuDirtyChunk c = g_array_index(d->split_chunks, ReimsVgpuDirtyChunk,
-                                              d->split_next++);
-        uint64_t pt = d->od_nopticket ? 0 : reims_vgpu_dirty_query_begin(d);
+    return d->fsplit_next < d->fsplit_total || d->split_next < d->split_total;
+}
 
+/*
+ * Query split pieces until none is left: the foreground job's first (lab
+ * DIRTY_FGSLOT), then the batch's, unless `fg_only` (the foreground job's own
+ * owner, which must not wander into a batch piece while its job finishes).
+ * d->lock held.
+ */
+static void reims_vgpu_dirty_split_help_from(ReimsVgpuDirty *d, bool fg_only)
+{
+    for (;;) {
+        GArray *arr;
+        guint *next, *done, total;
+        ReimsVgpuDirtyChunk c;
+        uint64_t pt;
+
+        if (d->fsplit_next < d->fsplit_total) {
+            arr = d->fsplit_chunks;
+            next = &d->fsplit_next;
+            done = &d->fsplit_done;
+            total = d->fsplit_total;
+        } else if (!fg_only && d->split_next < d->split_total) {
+            arr = d->split_chunks;
+            next = &d->split_next;
+            done = &d->split_done;
+            total = d->split_total;
+        } else {
+            return;
+        }
+        /* A job is reset only after all its pieces are done, this one included. */
+        c = g_array_index(arr, ReimsVgpuDirtyChunk, (*next)++);
+        pt = d->od_nopticket ? 0 : reims_vgpu_dirty_query_begin(d);
         reims_vgpu_dirty_query_footprint(d, pt, &c, 1);
         qemu_mutex_unlock(&d->lock);
         memory_region_sync_dirty_ranges(c.mr, &c.r, 1);
@@ -3039,10 +3079,15 @@ static void reims_vgpu_dirty_split_help(ReimsVgpuDirty *d)
         if (pt) {
             reims_vgpu_dirty_query_end(d, pt);
         }
-        if (++d->split_done == d->split_total) {
+        if (++*done == total) {
             qemu_cond_broadcast(&d->split_cond);
         }
     }
+}
+
+static void reims_vgpu_dirty_split_help(ReimsVgpuDirty *d)
+{
+    reims_vgpu_dirty_split_help_from(d, false);
 }
 
 /*
@@ -3659,7 +3704,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
             break;
         }
         /* Waiting for the claimant: query its split chunks meanwhile. */
-        if (d->split_next < d->split_total) {
+        if (reims_vgpu_dirty_split_pending(d)) {
             reims_vgpu_dirty_split_help(d);
         } else {
             qemu_cond_wait(&d->synced_cond, &d->lock);
@@ -3813,7 +3858,47 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
     }
     reims_vgpu_dirty_query_footprint(d, qticket, (const ReimsVgpuDirtyChunk *)chunks->data,
                                      chunks->len);
-    if (d->od_split && d->od_nworkers > 0 && walked_pages >= 4096 &&
+    if (fg && d->fgslot_mode && d->od_split && d->od_nworkers > 0 &&
+        walked_pages >= 4096 && !d->fsplit_busy) {
+        guint k;
+
+        /* Lab DIRTY_FGSLOT: the same pieces, in the foreground job. */
+        if (!d->od_nopticket) {
+            reims_vgpu_dirty_query_end(d, qticket);
+            qticket = 0;
+        }
+        g_array_set_size(d->fsplit_chunks, 0);
+        for (k = 0; k < chunks->len; k++) {
+            ReimsVgpuDirtyChunk c = g_array_index(chunks, ReimsVgpuDirtyChunk, k);
+            const uint64_t piece = 1024ULL << shift;
+
+            while (c.r.len > piece) {
+                ReimsVgpuDirtyChunk head = { c.mr, { c.r.start, piece } };
+
+                g_array_append_val(d->fsplit_chunks, head);
+                c.r.start += piece;
+                c.r.len -= piece;
+            }
+            g_array_append_val(d->fsplit_chunks, c);
+        }
+        d->fsplit_next = d->fsplit_done = 0;
+        d->fsplit_total = d->fsplit_chunks->len;
+        d->fsplit_busy = true;
+        if (d->split_busy) {
+            d->lab_fg_split_shared++;
+        }
+        qemu_cond_broadcast(&d->od_work_cond);
+        qemu_cond_broadcast(&d->synced_cond);   /* claim waiters help too */
+        reims_vgpu_dirty_split_help_from(d, true);
+        while (d->fsplit_done < d->fsplit_total) {
+            qemu_cond_wait(&d->split_cond, &d->lock);
+        }
+        d->fsplit_total = d->fsplit_done = d->fsplit_next = 0;
+        d->fsplit_busy = false;
+        d->lab_fg_split++;   /* TEMP lab (FGTRACE) */
+        d->lab_fg_split_slot++;
+        qemu_mutex_unlock(&d->lock);
+    } else if (d->od_split && d->od_nworkers > 0 && walked_pages >= 4096 &&
         !d->split_busy && (fg || !d->bigsplit_mode)) {
         guint k;
 
@@ -3856,6 +3941,9 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
         guint k = 0;
         int64_t w0 = d->lab_tr ? get_clock() : 0;   /* TEMP lab (FGTRACE) */
 
+        if (fg && walked_pages >= 4096) {
+            d->lab_fg_big_alone++;   /* TEMP lab: a large foreground sync not split */
+        }
         qemu_mutex_unlock(&d->lock);
         while (k < chunks->len) {
             MemoryRegion *mr = g_array_index(chunks, ReimsVgpuDirtyChunk, k).mr;
@@ -3951,7 +4039,9 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                     " period=%u period_skipped=%" PRIu64 " period_taken=%" PRIu64
                     " bigsplit=%u bigsplit_sets=%" PRIu64 " rsettle=%u rs_waits=%" PRIu64
                     " rs_skipped=%" PRIu64 " bigphase=%u bp_big=%" PRIu64
-                    " bp_groups=%" PRIu64 " frontier=%u fr_child=%" PRIu64 "\n",
+                    " bp_groups=%" PRIu64 " frontier=%u fr_child=%" PRIu64
+                    " fgslot=%u fg_split_slot=%" PRIu64 " fg_split_shared=%" PRIu64
+                    " fg_big_alone=%" PRIu64 "\n",
                     g_get_real_time() / 1000, d->lab_od_n, d->lab_od_ns / 1000,
                     d->lab_od_pages, d->lab_od_skipped, d->lab_od_epochs,
                     d->lab_od_fg_n, d->lab_od_fg_ns / 1000, d->lab_ph_wait / 1000,
@@ -3964,8 +4054,10 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                     d->bigsplit_mode, d->lab_bigsplit_sets, d->rsettle_mode,
                     d->lab_rs_waits, d->lab_rs_skipped, d->bigphase_mode,
                     d->lab_bigphase_big, d->lab_bigphase_groups, d->frontier_mode,
-                    d->lab_frontier_child);
+                    d->lab_frontier_child, d->fgslot_mode, d->lab_fg_split_slot,
+                    d->lab_fg_split_shared, d->lab_fg_big_alone);
             d->lab_frontier_child = 0;
+            d->lab_fg_split_slot = d->lab_fg_split_shared = d->lab_fg_big_alone = 0;
             if (d->wp_toggle) {   /* lab DIRTY_WP=toggle: follow the flag file */
                 bool want = g_file_test(d->wp_toggle, G_FILE_TEST_EXISTS);
 
@@ -4154,7 +4246,7 @@ static void *reims_vgpu_dirty_od_worker(void *opaque)
     while (!d->od_stop) {
         uint64_t epoch = d->od_work_epoch;
 
-        if (d->split_next < d->split_total) {
+        if (reims_vgpu_dirty_split_pending(d)) {
             reims_vgpu_dirty_split_help(d);
             continue;
         }
@@ -4222,6 +4314,8 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                       strcmp(getenv("REIMS_VGPU_DIRTY_PB_SPLIT"), "on") == 0;
         d->gen_fast = !(getenv("REIMS_VGPU_DIRTY_GEN_FAST") &&        /* lab A/B */
                         strcmp(getenv("REIMS_VGPU_DIRTY_GEN_FAST"), "off") == 0);
+        d->fgslot_mode = !(getenv("REIMS_VGPU_LAB_DIRTY_FGSLOT") &&    /* lab A/B */
+                           strcmp(getenv("REIMS_VGPU_LAB_DIRTY_FGSLOT"), "off") == 0);
         d->od_split = !(getenv("REIMS_VGPU_DIRTY_OD_SPLIT") &&        /* lab A/B */
                         strcmp(getenv("REIMS_VGPU_DIRTY_OD_SPLIT"), "off") == 0);
         d->work_epoch_off = getenv("REIMS_VGPU_DIRTY_WORK_EPOCH") &&   /* lab A/B */
