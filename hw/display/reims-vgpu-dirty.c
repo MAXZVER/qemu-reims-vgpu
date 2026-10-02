@@ -1539,8 +1539,15 @@ static void reims_vgpu_dirty_wp_bh(void *opaque)
             qemu_mutex_unlock(&d->wp_mutex);
             int64_t paused = reims_vgpu_dirty_wp_protect_chunk(d, token, budget);
 
-            /* Keep the guest paused at most `wp_duty` percent of the time. */
-            d->wp_delay_ms = (uint64_t)(paused / 1000000) * (100 - d->wp_duty) / d->wp_duty;
+            /*
+             * Keep the guest paused at most `wp_duty` percent of the time. From
+             * nanoseconds and rounded up: whole milliseconds truncated every
+             * pause under 1 ms to no delay at all, and with 4-run chunks (~1-3 ms
+             * pauses) the guest sat paused 30-100 % of a second on full-screen
+             * transitions (qemu-log 20261002-204324: pause_us 1001 ms in one s).
+             */
+            d->wp_delay_ms = paused <= 0 ? 0 :
+                ((uint64_t)paused * (100 - d->wp_duty) / d->wp_duty + 999999) / 1000000;
             qemu_mutex_lock(&d->wp_mutex);
         } else if (s) {
             reims_vgpu_dirty_wp_finish(d, d->wp_cur, s);
