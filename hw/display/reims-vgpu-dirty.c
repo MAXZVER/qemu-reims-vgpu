@@ -4204,8 +4204,10 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
          * pool; a batch helps a running split instead of walking alone. Each has
          * a lab switch that turns it back off.
          */
-        d->hot_new = getenv("REIMS_VGPU_LAB_DIRTY_HOT_NEW") &&          /* lab A/B */
-                     strcmp(getenv("REIMS_VGPU_LAB_DIRTY_HOT_NEW"), "on") == 0;
+        /* On by default (n78b: cold foreground syncs 12.3-13.4k -> 6.8-7.0k a boot,
+         * drain sync time 12.4-14.0 s -> 7.9-11.1 s); =off restores lazy arming. */
+        d->hot_new = !(getenv("REIMS_VGPU_LAB_DIRTY_HOT_NEW") &&        /* lab A/B */
+                       strcmp(getenv("REIMS_VGPU_LAB_DIRTY_HOT_NEW"), "off") == 0);
         d->od_hot = getenv("REIMS_VGPU_DIRTY_OD_HOT") ?                /* lab A/B */
                     MAX(1, atoi(getenv("REIMS_VGPU_DIRTY_OD_HOT"))) : 24;
         d->od_splitwait = !(getenv("REIMS_VGPU_DIRTY_OD_SPLITWAIT") && /* lab A/B */
