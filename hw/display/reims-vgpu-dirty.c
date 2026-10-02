@@ -264,6 +264,17 @@ struct ReimsVgpuDirty {
      * dirty logs before the first on-demand sync of each epoch. */
     bool od_flush;
     uint64_t flushed_epoch;
+    /*
+     * Lab ARM_FLUSH (on unless REIMS_VGPU_LAB_ARM_FLUSH=off): flush the per-vCPU
+     * dirty logs before the sync that arms a new set, and query all its pages.
+     * The guest zero-fills a surface's pages just before handing them over; a
+     * store still in a running vCPU's log is invisible to the arming query and
+     * surfaced one generation later as a write after the device's first Store,
+     * which overlaid whole 16 KiB granules of zeros onto WebKit tiles.
+     */
+    bool arm_flush;
+    uint64_t lab_arm_flushes;
+    int64_t lab_arm_flush_ns;
     /* Lab A/B (REIMS_VGPU_DIRTY_OD_BATCH=on): the first stale read of an epoch
      * syncs every set read in the previous epoch in one merged range list. */
     bool od_batch;
@@ -3572,6 +3583,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
     uint64_t page_size, epoch, qticket, walked_pages = 0;
     int64_t ph = 0, ph_prep_end = 0, ph_query_end = 0, ph_settle_end = 0;
     bool stole = false;   /* TEMP lab STEAL */
+    bool arming = false;  /* lab ARM_FLUSH */
     g_autoptr(GArray) chunks = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyChunk));
     int64_t t0;
 
@@ -3631,12 +3643,14 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
     s->claim_epoch = epoch;
     d->epoch_queried = true;
     page_size = s->page_size;
+    arming = d->arm_flush && qatomic_read(&s->gen) == 0 && memory_dirty_log_flush_hook;
     pages = g_new(uint64_t, s->count);
     count = 0;
     for (p = 0; p < s->count; p++) {
         uint64_t pfn = s->pages[p] >> shift;
 
-        if (pfn < d->page_seq_n && d->page_qepoch[pfn] >= epoch) {
+        /* An arming sync queries every page itself, after its own flush. */
+        if (!arming && pfn < d->page_seq_n && d->page_qepoch[pfn] >= epoch) {
             d->lab_od_skipped++;
             continue;
         }
@@ -3651,12 +3665,20 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
         if (flush) {
             d->flushed_epoch = epoch;
         }
+        if (arming) {
+            d->lab_arm_flushes++;
+        }
         qemu_mutex_unlock(&d->lock);
         if (d->lab_od_delay_ns > 0 && wait > 0) {
             g_usleep(wait / 1000);
         }
-        if (flush) {
+        if (flush || arming) {
+            int64_t f0 = get_clock();
+
             memory_dirty_log_flush_hook();
+            if (arming) {
+                qatomic_add(&d->lab_arm_flush_ns, get_clock() - f0);
+            }
         }
     }
 
@@ -3978,6 +4000,12 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
             d->lab_od_n = d->lab_od_ns = d->lab_od_pages = d->lab_od_skipped = 0;
             d->lab_od_epochs = d->lab_od_fg_n = d->lab_od_fg_ns = 0;
             d->lab_od_last = now;
+            if (d->arm_flush && d->lab_arm_flushes) {   /* TEMP lab ARM_FLUSH */
+                fprintf(stderr, "reims-dirty-armflush epoch_ms=%" PRId64 " n=%" PRIu64
+                        " us=%" PRId64 "\n", g_get_real_time() / 1000, d->lab_arm_flushes,
+                        qatomic_xchg(&d->lab_arm_flush_ns, 0) / 1000);
+                d->lab_arm_flushes = 0;
+            }
             if (d->steal_mode || d->gen_memo_mode || d->epoch_named ||
                 d->lf_mode) {   /* TEMP lab gates */
                 fprintf(stderr, "reims-dirty-lab epoch_ms=%" PRId64 " steal=%u memo=%u"
@@ -4128,6 +4156,8 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
         qemu_mutex_lock(&d->lock);
         qatomic_set(&d->ondemand, on);
         d->od_flush = fl && strcmp(fl, "on") == 0;
+        d->arm_flush = !(getenv("REIMS_VGPU_LAB_ARM_FLUSH") &&      /* lab A/B */
+                         strcmp(getenv("REIMS_VGPU_LAB_ARM_FLUSH"), "off") == 0);
         d->od_batch = ob && strcmp(ob, "on") == 0;
         /* On by default (lab: CSS animation ~108 -> ~115, scroll ~88 -> ~100). */
         d->od_prefetch = !(op && strcmp(op, "off") == 0);
