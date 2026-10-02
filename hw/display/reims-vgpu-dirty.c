@@ -505,6 +505,7 @@ struct ReimsVgpuDirty {
      */
     bool wp_nopause;
     uint64_t wp_delay_ms;         /* the next step's wait after a chunk's pause */
+    int64_t wp_next_ok_ns;        /* no protect pause before this (duty gate) */
     QEMUTimer *wp_timer;
     QEMUBH *wp_bh;
     unsigned long *wp_bits;       /* pfns of protected sets (they never overlap); under `wp_mutex` */
@@ -1520,6 +1521,21 @@ static void reims_vgpu_dirty_wp_bh(void *opaque)
         qemu_mutex_unlock(&d->lock);
     }
     more = more || d->wp_orphans->len;
+    /*
+     * The duty gate is checked here and not only in the pacing timer: the step
+     * is also scheduled straight away by faults, untracks and a set reaching its
+     * streak, and those runs used to protect another chunk regardless — up to
+     * 715 ms of vCPU pause in one second on full-screen transitions even with
+     * the delay rounded correctly (qemu-log 20261002-205648).
+     */
+    if (!more && budget > 0 && d->wp_mode && qatomic_read(&d->wp_active) &&
+        get_clock() < d->wp_next_ok_ns) {
+        int64_t wait_ns = d->wp_next_ok_ns - get_clock();
+
+        d->wp_delay_ms = wait_ns > 0 ? ((uint64_t)wait_ns + 999999) / 1000000 : 0;
+        more = true;
+        budget = 0;
+    }
     if (!more && budget > 0 && d->wp_mode && qatomic_read(&d->wp_active)) {
         ReimsVgpuDirtySet *s = NULL;
 
@@ -1548,6 +1564,8 @@ static void reims_vgpu_dirty_wp_bh(void *opaque)
              */
             d->wp_delay_ms = paused <= 0 ? 0 :
                 ((uint64_t)paused * (100 - d->wp_duty) / d->wp_duty + 999999) / 1000000;
+            d->wp_next_ok_ns = get_clock() +
+                (paused <= 0 ? 0 : (int64_t)((uint64_t)paused * (100 - d->wp_duty) / d->wp_duty));
             qemu_mutex_lock(&d->wp_mutex);
         } else if (s) {
             reims_vgpu_dirty_wp_finish(d, d->wp_cur, s);
