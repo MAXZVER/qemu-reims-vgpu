@@ -17,6 +17,7 @@
 #include "system/whpx-wp.h"
 #endif
 #include "qemu/log.h"
+#include "qemu/error-report.h"
 #include "qemu/module.h"
 #include "qemu/main-loop.h"
 #include "qemu/aio.h"
@@ -1054,6 +1055,57 @@ static void *reims_vgpu_pci_drain_thread(void *opaque)
  */
 #define REIMS_VGPU_PCI_HEARTBEAT_MS 1
 
+#ifdef _WIN32
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+/*
+ * TEMP (lab): REIMS_VGPU_LAB_HB_US=N (100..2000) polls every N us on a
+ * high-resolution waitable timer instead of a 1 ms condvar wait. A condvar
+ * timeout on Windows lands anywhere in 1-2 ms, and a VBL is claimed only on
+ * the first poll past its grid point, so the guest's frame start inherits up
+ * to ~2 ms of that jitter (lab_vbl_late). Returns false, having polled
+ * nothing, when the switch is off or the timer cannot be created; the caller
+ * then runs the condvar loop.
+ */
+static bool reims_vgpu_pci_heartbeat_hires(ReimsVGPUPCIState *s)
+{
+    const char *v = getenv("REIMS_VGPU_LAB_HB_US");
+    int us = v ? atoi(v) : 0;
+    HANDLE t;
+
+    if (us < 100 || us > 2000) {
+        return false;
+    }
+    t = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                               TIMER_ALL_ACCESS);
+    if (!t) {
+        return false;
+    }
+    warn_report("reims-vgpu heartbeat: high-resolution timer every %d us", us);
+    while (!qatomic_read(&s->heartbeat_stopping)) {
+        LARGE_INTEGER due;
+
+        due.QuadPart = -(LONGLONG)us * 10;   /* relative, 100 ns units */
+        if (!SetWaitableTimerEx(t, &due, 0, NULL, NULL, NULL, 0)) {
+            Sleep(1);
+        } else {
+            WaitForSingleObject(t, INFINITE);
+        }
+        if (qatomic_read(&s->heartbeat_stopping)) {
+            break;
+        }
+        if (s->rust_handle != 0 &&
+            reims_vgpu_qemu_device_poll(s->rust_handle) == REIMS_VGPU_QEMU_OK &&
+            s->action_bh) {
+            qemu_bh_schedule(s->action_bh);
+        }
+    }
+    CloseHandle(t);
+    return true;
+}
+#endif
+
 static void *reims_vgpu_pci_heartbeat_thread(void *opaque)
 {
     ReimsVGPUPCIState *s = opaque;
@@ -1061,6 +1113,11 @@ static void *reims_vgpu_pci_heartbeat_thread(void *opaque)
     int period_ms = REIMS_VGPU_PCI_HEARTBEAT_MS;
     const char *hb = getenv("REIMS_VGPU_HEARTBEAT_MS");   /* lab A/B */
 
+#ifdef _WIN32
+    if (reims_vgpu_pci_heartbeat_hires(s)) {
+        return NULL;
+    }
+#endif
     if (hb && atoi(hb) >= 1 && atoi(hb) <= 16) {
         period_ms = atoi(hb);
     }
