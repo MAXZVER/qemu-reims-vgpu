@@ -489,7 +489,18 @@ static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
     mem = memory_region_get_ram_ptr(area) + section->offset_within_region;
 
     if (!whpx_dirty_tracking_decided) {
+        const char *ut = getenv("REIMS_VGPU_LAB_RAM_UNTRACKED");
+
         whpx_dirty_tracking = whp_dispatch.WHvQueryGpaRangeDirtyBitmap != NULL;
+        /*
+         * TEMP (lab, n125): RAM mapped without dirty tracking, to measure what
+         * tracked mappings cost the guest's own CPU work (4 KiB SLAT, logging).
+         * Every sync then reports logged RAM fully dirty: diagnostic only.
+         */
+        if (ut && strcmp(ut, "on") == 0) {
+            whpx_dirty_tracking = false;
+            fprintf(stderr, "reims-lab: guest RAM mapped untracked\n");
+        }
         whpx_dirty_tracking_decided = true;
     }
     if (whpx_dirty_tracking && writable && memory_region_is_ram(area)) {
