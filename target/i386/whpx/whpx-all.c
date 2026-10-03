@@ -2046,23 +2046,27 @@ static UINT64 whpx_get_default_exceptions(void)
      * and re-injecting the fault as a pending event keeps the guest in control.
      *
      * Every guest #PF then costs a VM exit to user space, tens of thousands a
-     * second under a desktop workload, so QEMU_WHPX_PF_INTERCEPT=0 turns the
-     * intercept off for hosts that boot without it.
+     * second under a desktop workload, so it is off unless QEMU_WHPX_PF_INTERCEPT=1
+     * asks for it (a host whose guests do not boot without it).
      */
     if (whpx_pf_intercept < 0) {
         /*
-         * TEMP (lab, n130): only for the first QEMU_WHPX_PF_INTERCEPT_SECS
-         * seconds of the run (default 90: firmware, OpenCore and the early
-         * kernel, where the storm was seen), then dropped; 0 keeps it for
-         * the whole run. Kept, a macOS desktop pays ~8 us per guest page
-         * fault (n129/n130: 256 MiB of fresh pages 520 -> 87 ms, 300
-         * process spawns 1.54 -> 0.55 s without it).
+         * TEMP (lab, n130/hq): off by default. Kept, a macOS desktop pays
+         * ~8 us per guest page fault (n129/n130: 256 MiB of fresh pages 520 ->
+         * 87 ms, 300 process spawns 1.54 -> 0.55 s without it), and macOS 26
+         * boots without it on the i7-14700K and on the Ryzen 9 7950X host
+         * alike (the home rig: guest up in ~40 s instead of ~100). Dropping it
+         * at run time (QEMU_WHPX_PF_INTERCEPT_SECS) froze QEMU with two VMs
+         * on the AMD host, so that stays opt-in.
+         *
+         * QEMU_WHPX_PF_INTERCEPT=1 intercepts for the whole run, or for the
+         * first QEMU_WHPX_PF_INTERCEPT_SECS seconds when that is set too.
          */
         const char *v = g_getenv("QEMU_WHPX_PF_INTERCEPT");
         const char *secs = g_getenv("QEMU_WHPX_PF_INTERCEPT_SECS");
-        int keep_s = secs ? atoi(secs) : 90;
+        int keep_s = secs ? atoi(secs) : 0;
 
-        whpx_pf_intercept = !(v && strcmp(v, "0") == 0);
+        whpx_pf_intercept = v && strcmp(v, "1") == 0;
         if (whpx_pf_intercept && keep_s > 0) {
             whpx_pf_intercept_until_ns = get_clock() +
                                          (int64_t)keep_s * NANOSECONDS_PER_SECOND;
