@@ -273,7 +273,9 @@ struct ReimsVgpuDirty {
      * which overlaid whole 16 KiB granules of zeros onto WebKit tiles.
      */
     bool arm_flush;
+    bool pb_arm_flush;   /* TEMP lab (REIMS_VGPU_LAB_PB_ARM_FLUSH=off): the batch's half */
     uint64_t lab_arm_flushes;
+    uint64_t lab_pb_arm_flushes;   /* TEMP lab: arming flushes of the batch (qatomic) */
     int64_t lab_arm_flush_ns;
     /* Lab A/B (REIMS_VGPU_DIRTY_OD_BATCH=on): the first stale read of an epoch
      * syncs every set read in the previous epoch in one merged range list. */
@@ -4127,9 +4129,12 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
             d->lab_od_n = d->lab_od_ns = d->lab_od_pages = d->lab_od_skipped = 0;
             d->lab_od_epochs = d->lab_od_fg_n = d->lab_od_fg_ns = 0;
             d->lab_od_last = now;
-            if (d->arm_flush && d->lab_arm_flushes) {   /* TEMP lab ARM_FLUSH */
+            if (d->arm_flush && (d->lab_arm_flushes || d->lab_pb_arm_flushes)) {
+                /* TEMP lab ARM_FLUSH */
                 fprintf(stderr, "reims-dirty-armflush epoch_ms=%" PRId64 " n=%" PRIu64
+                        " pb=%" PRIu64
                         " us=%" PRId64 "\n", g_get_real_time() / 1000, d->lab_arm_flushes,
+                        qatomic_xchg(&d->lab_pb_arm_flushes, 0),
                         qatomic_xchg(&d->lab_arm_flush_ns, 0) / 1000);
                 d->lab_arm_flushes = 0;
             }
@@ -4285,6 +4290,8 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
         d->od_flush = fl && strcmp(fl, "on") == 0;
         d->arm_flush = !(getenv("REIMS_VGPU_LAB_ARM_FLUSH") &&      /* lab A/B */
                          strcmp(getenv("REIMS_VGPU_LAB_ARM_FLUSH"), "off") == 0);
+        d->pb_arm_flush = !(getenv("REIMS_VGPU_LAB_PB_ARM_FLUSH") &&  /* lab A/B */
+                            strcmp(getenv("REIMS_VGPU_LAB_PB_ARM_FLUSH"), "off") == 0);
         d->od_batch = ob && strcmp(ob, "on") == 0;
         /* On by default (lab: CSS animation ~108 -> ~115, scroll ~88 -> ~100). */
         d->od_prefetch = !(op && strcmp(op, "off") == 0);
@@ -4589,6 +4596,7 @@ static void reims_vgpu_dirty_prefetch_phase(ReimsVgpuDirty *d, GArray *tokens,
     guint t, pi;
     int64_t pb0 = get_clock(), pb1, pb2, pb3, pb4, pb5, pb6, pb7;  /* TEMP lab */
     uint64_t setpages = 0;
+    bool arming = false;   /* lab ARM_FLUSH: this pass sets some set's baseline */
 
     qemu_mutex_lock(&d->lock);
     if (!preclaimed && d->epoch != epoch) {
@@ -4614,6 +4622,9 @@ static void reims_vgpu_dirty_prefetch_phase(ReimsVgpuDirty *d, GArray *tokens,
         if (set->claim_epoch >= epoch && !(preclaimed && set->pb_claim == epoch)) {
             continue;
         }
+        if (qatomic_read(&set->gen) == 0) {
+            arming = true;
+        }
         set->claim_epoch = epoch;
         set->bclaim = no_steal ? 0 : epoch;   /* lab BIGPHASE: a big set's own phase is waited for */
         set->pb_claim = 0;
@@ -4626,6 +4637,24 @@ static void reims_vgpu_dirty_prefetch_phase(ReimsVgpuDirty *d, GArray *tokens,
     reims_vgpu_dirty_pb_runs(d, shift, pages);
     if (claimed->len == 0) {
         return;
+    }
+    /*
+     * Lab ARM_FLUSH, the batch's half of the 72c5c3e5 invariant: a set this
+     * pass takes from gen 0 gets its baseline here, and a guest store still
+     * sitting in a running vCPU's log is invisible to this pass's queries —
+     * it would surface with the *next* epoch's query as a write after the
+     * Store, and the device would reseed the page from guest zeros (the
+     * fullscreen-enter stripe class). The hook is global, so one flush covers
+     * the whole union; the pass queries the union with no qep skips of its
+     * own, so completeness is already there. Same gate as sync_one's arming.
+     */
+    if (arming && d->arm_flush && d->pb_arm_flush &&
+        memory_dirty_log_flush_hook) {   /* lab ARM_FLUSH; PB_ARM_FLUSH=off: the control */
+        int64_t f0 = get_clock();
+
+        memory_dirty_log_flush_hook();
+        qatomic_add(&d->lab_arm_flush_ns, get_clock() - f0);
+        qatomic_inc(&d->lab_pb_arm_flushes);
     }
 
     n = reims_vgpu_dirty_ram_slices_into(&slices, &cap);
