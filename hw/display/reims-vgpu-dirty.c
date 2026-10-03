@@ -616,9 +616,37 @@ struct ReimsVgpuDirty {
     int64_t wp_next_ok_ns;        /* no protect pause before this (duty gate) */
     QEMUTimer *wp_timer;
     QEMUBH *wp_bh;
+    /*
+     * TEMP lab REIMS_VGPU_LAB_DIRTY_WP_THREAD=on: the protect step runs on a thread of its own, not in
+     * the main loop, and always without pausing the vCPUs (DIRTY_WP_NOPAUSE). The main-loop BH and
+     * the pacing timer only wake it. With the vCPUs paused a 2048-page set took seconds to protect
+     * at the 10 % pause duty (one set at a time, 4 runs a pause, ~0.3 ms a run) and a page-scattered
+     * hot set was never reached (n149: worker reads of clean mapper sets 685 ms/s); NOPAUSE in the
+     * main loop instead held the loop that delivers the device's interrupts (n80: 36.7 s a boot).
+     * `wp_thread_duty` caps the share of time the thread spends in a step (the remaps share the
+     * hypervisor with every dirty query).
+     */
+    bool wp_thread_mode;
+    uint32_t wp_thread_duty;
+    QemuThread wp_thread;
+    QemuEvent wp_ev;
     unsigned long *wp_bits;       /* pfns of protected sets (they never overlap); under `wp_mutex` */
     uint64_t wp_bits_n;
     uint64_t lab_wp_protects, lab_wp_faults, lab_wp_refused, lab_wp_chunks, lab_wp_remaps;
+    /*
+     * TEMP lab (n148): why the protect step passed over a queued set — gone or no longer WP_NONE,
+     * unarmed, past the WP bitmap, or sharing a page that is already read-only — and how often a
+     * set was queued again because its streak went on past the one moment it used to be queued at.
+     */
+    uint64_t lab_wp_rej_state, lab_wp_rej_gen, lab_wp_rej_bits, lab_wp_rej_ro, lab_wp_requeued;
+    /* TEMP lab (n148): target pages a sync left out of its query because they are read-only. */
+    uint64_t lab_ro_skipped;
+    /*
+     * TEMP lab REIMS_VGPU_LAB_DIRTY_WP_RETRY (on unless =off): a clean set past its streak is queued
+     * again every `wp_streak_need` clean syncs, not only when the streak equals the need.
+     * REIMS_VGPU_LAB_DIRTY_RO_SKIP (on unless =off): a sync does not query read-only pages.
+     */
+    bool wp_retry, ro_skip;
     uint64_t lab_wp_lost, lab_wp_dropped, lab_wp_remap_ns, lab_wp_pause_ns, lab_wp_pause_max_ns;
     /*
      * REIMS_VGPU_LAB_DIRTY_PERIOD=on: a set of at least `period_big` pages joins
@@ -1361,9 +1389,16 @@ static bool reims_vgpu_dirty_wp_pick(ReimsVgpuDirty *d)
         ReimsVgpuDirtySet *c = g_hash_table_lookup(d->sets, &token);
 
         g_array_set_size(d->wp_queue, d->wp_queue->len - 1);
-        if (c && c->wp_state == WP_NONE && c->gen != 0 && c->count &&
-            ((c->pages[c->count - 1] + c->page_size - 1) >> qemu_target_page_bits()) < d->wp_bits_n &&
-            !reims_vgpu_dirty_wp_any_ro(d, c, 0, c->count)) {
+        if (!c || c->wp_state != WP_NONE || !c->count) {
+            d->lab_wp_rej_state++;
+        } else if (c->gen == 0) {
+            d->lab_wp_rej_gen++;
+        } else if (((c->pages[c->count - 1] + c->page_size - 1) >> qemu_target_page_bits()) >=
+                   d->wp_bits_n) {
+            d->lab_wp_rej_bits++;
+        } else if (reims_vgpu_dirty_wp_any_ro(d, c, 0, c->count)) {
+            d->lab_wp_rej_ro++;
+        } else {
             c->wp_state = WP_PROTECTING;
             c->wp_next = 0;
             d->wp_cur = token;
@@ -1565,13 +1600,12 @@ static int64_t reims_vgpu_dirty_wp_protect_chunk(ReimsVgpuDirty *d, uint64_t tok
 }
 
 /*
- * Main loop (BH or pacing timer), BQL held. One step: up to `wp_chunk` runs made writable again
- * (orphans, then dropping sets), then one chunk of the set being protected, then reschedule while
- * anything is left.
+ * One step: up to `wp_chunk` runs made writable again (orphans, then dropping sets), then one chunk
+ * of the set being protected. Returns whether anything is left. Main loop (BH or pacing timer, BQL
+ * held), or the WP thread (DIRTY_WP_THREAD, no BQL, never pausing).
  */
-static void reims_vgpu_dirty_wp_bh(void *opaque)
+static bool reims_vgpu_dirty_wp_step(ReimsVgpuDirty *d)
 {
-    ReimsVgpuDirty *d = opaque;
     int budget = d->wp_chunk;
     bool more = false;
     guint i;
@@ -1693,7 +1727,47 @@ static void reims_vgpu_dirty_wp_bh(void *opaque)
         qemu_mutex_unlock(&d->lock);
     }
     qemu_mutex_unlock(&d->wp_mutex);
-    if (more) {
+    return more;
+}
+
+/* TEMP lab DIRTY_WP_THREAD: the thread that runs the protect step, woken by the BH. */
+static void *reims_vgpu_dirty_wp_thread_fn(void *opaque)
+{
+    ReimsVgpuDirty *d = opaque;
+
+    rcu_register_thread();
+    for (;;) {
+        qemu_event_wait(&d->wp_ev);
+        qemu_event_reset(&d->wp_ev);   /* before the step: a wake during it runs another */
+        for (;;) {
+            int64_t t0 = get_clock();
+            bool more = reims_vgpu_dirty_wp_step(d);
+            int64_t spent = get_clock() - t0;
+            int64_t rest_us;
+
+            if (!more) {
+                break;
+            }
+            rest_us = spent * (100 - d->wp_thread_duty) / d->wp_thread_duty / 1000;
+            g_usleep(MAX(rest_us, MAX((int64_t)d->wp_delay_ms * 1000, 250)));
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Main loop (BH or pacing timer), BQL held: one step and a reschedule while anything is left, or
+ * (DIRTY_WP_THREAD) a wake of the thread that runs the steps.
+ */
+static void reims_vgpu_dirty_wp_bh(void *opaque)
+{
+    ReimsVgpuDirty *d = opaque;
+
+    if (d->wp_thread_mode) {
+        qemu_event_set(&d->wp_ev);
+        return;
+    }
+    if (reims_vgpu_dirty_wp_step(d)) {
         REIMS_WP_PACE(d);
     }
 }
@@ -3025,8 +3099,21 @@ static bool reims_vgpu_dirty_eval_set(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
     s->seen_seq = d->global_seq;
     if (d->wp_mode && d->wp_active && !by_harvest && s->wp_state == WP_NONE && s->gen != 0 &&
         s->count * (s->page_size >> shift) >= d->wp_min_pages) {   /* lab DIRTY_WP */
+        uint32_t need = d->wp_streak_need << MIN(s->wp_lost, 6);
+
         s->wp_streak = any ? 0 : s->wp_streak + 1;
-        if (s->wp_streak == (d->wp_streak_need << MIN(s->wp_lost, 6))) {
+        /*
+         * Queued when the streak reaches the need and, with WP_RETRY, again every `need` clean
+         * syncs after: the step passes over a set it cannot take at that moment (its pages share a
+         * read-only page with a set being protected, the bitmap is not up yet), and a set queued
+         * only at `streak == need` was then never queued again — n145's two hottest foreground sets
+         * were 5K surfaces clean for 5 300 syncs in a row and never protected.
+         */
+        if (s->wp_streak == need ||
+            (d->wp_retry && s->wp_streak > need && (s->wp_streak - need) % need == 0)) {
+            if (s->wp_streak != need) {
+                d->lab_wp_requeued++;
+            }
             g_array_append_val(d->wp_queue, s->token);
             REIMS_WP_BH_SCHEDULE(d->wp_bh);
         }
@@ -3902,7 +3989,16 @@ static size_t reims_vgpu_dirty_page_list(ReimsVgpuDirty *d, const uint64_t *spag
     const int shift = qemu_target_page_bits();
     const ReimsVgpuDirtyQep *q = arming ? NULL : qatomic_rcu_read(&d->qep);
     uint64_t *pages = g_new(uint64_t, MAX(scount, 1));
-    size_t p, count = 0;
+    size_t p, count = 0, ro = 0;
+    /*
+     * TEMP lab DIRTY_RO_SKIP: a read-only page takes no store without a fault, and the fault makes
+     * it writable (and clears its bit) before the store lands, so a page whose bit is set when the
+     * list is built — after the epoch it is for opened — has no hypervisor bit this query could
+     * find. Whatever the protect step's own query moved into the VGA bitmap is consumed by every
+     * set's consume pass, which walks all of a set's pages, not this list. A set sharing its pages
+     * with a protected one is thereby protected for free.
+     */
+    bool ro_skip = d->ro_skip && !arming && qatomic_read(&d->wp_bits);
 
     for (p = 0; p < scount; p++) {
         uint64_t pfn = spages[p] >> shift;
@@ -3910,7 +4006,14 @@ static size_t reims_vgpu_dirty_page_list(ReimsVgpuDirty *d, const uint64_t *spag
         if (q && pfn < q->n && qatomic_read(&q->e[pfn]) >= epoch) {
             continue;
         }
+        if (ro_skip && reims_vgpu_dirty_wp_ro(d, spages[p])) {
+            ro++;
+            continue;
+        }
         pages[count++] = spages[p];
+    }
+    if (ro) {
+        qatomic_add(&d->lab_ro_skipped, ro);
     }
     *skipped = scount - count;
     *out = pages;
@@ -4427,12 +4530,18 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                 fprintf(stderr, "reims-dirty-wp active=%u listed=%u protecting=%u protects=%" PRIu64
                         " chunks=%" PRIu64 " faults=%" PRIu64 " lost=%" PRIu64 " dropped=%" PRIu64
                         " orphans=%u remaps=%" PRIu64 " refused=%" PRIu64 " remap_us=%" PRId64
-                        " pause_us=%" PRId64 " pause_max_us=%" PRId64 "\n",
+                        " pause_us=%" PRId64 " pause_max_us=%" PRId64
+                        " rej_state=%" PRIu64 " rej_gen=%" PRIu64 " rej_bits=%" PRIu64
+                        " rej_ro=%" PRIu64 " requeued=%" PRIu64 " ro_skipped=%" PRIu64 "\n",
                         d->wp_active, d->wp_list ? d->wp_list->len : 0, d->wp_cur != 0,
                         d->lab_wp_protects, d->lab_wp_chunks, d->lab_wp_faults, d->lab_wp_lost,
                         d->lab_wp_dropped, d->wp_orphans ? d->wp_orphans->len : 0, d->lab_wp_remaps,
                         d->lab_wp_refused, (int64_t)d->lab_wp_remap_ns / 1000,
-                        (int64_t)d->lab_wp_pause_ns / 1000, (int64_t)d->lab_wp_pause_max_ns / 1000);
+                        (int64_t)d->lab_wp_pause_ns / 1000, (int64_t)d->lab_wp_pause_max_ns / 1000,
+                        d->lab_wp_rej_state, d->lab_wp_rej_gen, d->lab_wp_rej_bits, d->lab_wp_rej_ro,
+                        d->lab_wp_requeued, qatomic_xchg(&d->lab_ro_skipped, 0));
+                d->lab_wp_rej_state = d->lab_wp_rej_gen = d->lab_wp_rej_bits = 0;
+                d->lab_wp_rej_ro = d->lab_wp_requeued = 0;
                 d->lab_wp_protects = d->lab_wp_chunks = d->lab_wp_faults = d->lab_wp_lost = 0;
                 d->lab_wp_dropped = d->lab_wp_remaps = d->lab_wp_remap_ns = 0;
                 d->lab_wp_pause_ns = d->lab_wp_pause_max_ns = 0;
@@ -4744,6 +4853,10 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                 d->wp_toggle = g_strdup(w + 7);
                 d->wp_active = g_file_test(d->wp_toggle, G_FILE_TEST_EXISTS);
             }
+            d->wp_retry = !(getenv("REIMS_VGPU_LAB_DIRTY_WP_RETRY") &&
+                            strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_RETRY"), "off") == 0);
+            d->ro_skip = !(getenv("REIMS_VGPU_LAB_DIRTY_RO_SKIP") &&
+                           strcmp(getenv("REIMS_VGPU_LAB_DIRTY_RO_SKIP"), "off") == 0);
             d->wp_streak_need = getenv("REIMS_VGPU_LAB_DIRTY_WP_STREAK") ?
                                 MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_STREAK"))) : 16;
             d->wp_min_pages = getenv("REIMS_VGPU_LAB_DIRTY_WP_MIN") ?
@@ -4763,6 +4876,18 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                             MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_PACE_MS"))) : 4;
             d->wp_nopause = getenv("REIMS_VGPU_LAB_DIRTY_WP_NOPAUSE") &&
                             strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_NOPAUSE"), "on") == 0;
+#ifndef REIMS_DIRTY_STRESS
+            d->wp_thread_mode = getenv("REIMS_VGPU_LAB_DIRTY_WP_THREAD") &&
+                                strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_THREAD"), "on") == 0;
+#endif
+            d->wp_thread_duty = getenv("REIMS_VGPU_LAB_DIRTY_WP_THREAD_DUTY") ?
+                                MIN(100, MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_THREAD_DUTY")))) : 30;
+            if (d->wp_thread_mode) {
+                d->wp_nopause = true;
+                if (!getenv("REIMS_VGPU_LAB_DIRTY_WP_CHUNK")) {
+                    d->wp_chunk = 32;   /* no pause to bound: the duty paces the thread */
+                }
+            }
             qemu_mutex_init(&d->wp_mutex);
             d->wp_queue = g_array_new(FALSE, FALSE, sizeof(uint64_t));
             d->wp_list = g_array_new(FALSE, FALSE, sizeof(uint64_t));
@@ -4772,6 +4897,13 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                 d->wp_timer = timer_new_ms(QEMU_CLOCK_REALTIME, reims_vgpu_dirty_wp_bh, d);
 #endif
                 d->wp_bh = REIMS_WP_BH_NEW(reims_vgpu_dirty_wp_bh, d);
+                if (d->wp_thread_mode) {
+                    qemu_event_init(&d->wp_ev, false);
+                    qemu_thread_create(&d->wp_thread, "reims-wp", reims_vgpu_dirty_wp_thread_fn, d,
+                                       QEMU_THREAD_DETACHED);
+                    fprintf(stderr, "reims-dirty-wp thread on: chunk=%u duty=%u%%\n", d->wp_chunk,
+                            d->wp_thread_duty);
+                }
                 reims_vgpu_dirty_wp_dev = d;
                 whpx_wp_invalidate_hook = reims_vgpu_dirty_wp_invalidate;
                 whpx_wp_fault_hook = reims_vgpu_dirty_wp_fault;
