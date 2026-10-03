@@ -344,6 +344,12 @@ struct ReimsVgpuDirty {
     /* Generation reads may skip `lock` for synced sets (lab A/B
      * REIMS_VGPU_DIRTY_GEN_FAST=off restores the locked read). */
     bool gen_fast;
+    /*
+     * TEMP (lab, diagnostic only) REIMS_VGPU_LAB_DIRTY_NOSYNC=on: every generation read takes the lagged
+     * answer (what the prefetch workers last synced) instead of a foreground sync. Not correct — a store's
+     * witness may miss guest writes — it measures how much of a frame the foreground syncs cost.
+     */
+    bool lab_nosync;
     uint64_t lab_gen_fast;    /* TEMP lab: fast-path answers since the last report */
     uint64_t lab_gen_lagged;  /* TEMP lab: lagged answers since the last report */
     /*
@@ -2342,7 +2348,7 @@ uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token)
         }
         return gen;
     }
-    if (lagged && qatomic_read(&d->ondemand)) {
+    if ((lagged || d->lab_nosync) && qatomic_read(&d->ondemand)) {
         return reims_vgpu_dirty_gen_lagged(d, token);
     }
     qemu_mutex_lock(&d->lock);
@@ -4666,6 +4672,8 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                       strcmp(getenv("REIMS_VGPU_DIRTY_COALESCE"), "on") == 0;
         d->pb_split = getenv("REIMS_VGPU_DIRTY_PB_SPLIT") &&           /* lab A/B */
                       strcmp(getenv("REIMS_VGPU_DIRTY_PB_SPLIT"), "on") == 0;
+        d->lab_nosync = getenv("REIMS_VGPU_LAB_DIRTY_NOSYNC") &&      /* lab, diagnostic */
+                        strcmp(getenv("REIMS_VGPU_LAB_DIRTY_NOSYNC"), "on") == 0;
         d->gen_fast = !(getenv("REIMS_VGPU_DIRTY_GEN_FAST") &&        /* lab A/B */
                         strcmp(getenv("REIMS_VGPU_DIRTY_GEN_FAST"), "off") == 0);
         d->fgjoin_mode = !(getenv("REIMS_VGPU_LAB_DIRTY_FGJOIN") &&    /* lab A/B */
