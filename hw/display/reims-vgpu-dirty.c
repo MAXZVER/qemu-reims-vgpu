@@ -1381,9 +1381,89 @@ static void reims_vgpu_dirty_wp_invalidate(void)
     REIMS_WP_BH_SCHEDULE(d->wp_bh);
 }
 
+/*
+ * TEMP lab DIRTY_WP_THREAD (pick by heat): the queued set worth most to protect — the longest clean
+ * streak times its pages, i.e. the queries protecting it saves — rather than the last one queued.
+ * One pass drops what the step cannot take (gone, not WP_NONE, unarmed, past the bitmap) and the
+ * duplicates WP_RETRY leaves; only the winner pays the read-only walk, and a set that shares a
+ * read-only page goes back for a later pass. n151: the LIFO step spent its whole duty on
+ * short-lived sets while the hottest ones (clean for 1 400-3 600 syncs) waited.
+ */
+static bool reims_vgpu_dirty_wp_pick_hot(ReimsVgpuDirty *d)
+{
+    while (!d->wp_cur && d->wp_queue->len) {
+        guint i, keep = 0, best = G_MAXUINT;
+        uint64_t best_score = 0;
+        ReimsVgpuDirtySet *c;
+
+        for (i = 0; i < d->wp_queue->len; i++) {
+            uint64_t token = g_array_index(d->wp_queue, uint64_t, i);
+            guint j;
+            bool dup = false;
+
+            c = g_hash_table_lookup(d->sets, &token);
+            if (!c || c->wp_state != WP_NONE || !c->count) {
+                d->lab_wp_rej_state++;
+                continue;
+            }
+            if (c->gen == 0) {
+                d->lab_wp_rej_gen++;
+                continue;
+            }
+            if (((c->pages[c->count - 1] + c->page_size - 1) >> qemu_target_page_bits()) >=
+                d->wp_bits_n) {
+                d->lab_wp_rej_bits++;
+                continue;
+            }
+            for (j = 0; j < keep; j++) {
+                if (g_array_index(d->wp_queue, uint64_t, j) == token) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) {
+                continue;
+            }
+            g_array_index(d->wp_queue, uint64_t, keep) = token;
+            {
+                uint64_t score = (uint64_t)c->wp_streak * c->count *
+                                 (c->page_size >> qemu_target_page_bits());
+
+                if (best == G_MAXUINT || score > best_score) {
+                    best = keep;
+                    best_score = score;
+                }
+            }
+            keep++;
+        }
+        g_array_set_size(d->wp_queue, keep);
+        if (best == G_MAXUINT) {
+            break;
+        }
+        {
+            uint64_t token = g_array_index(d->wp_queue, uint64_t, best);
+
+            g_array_remove_index_fast(d->wp_queue, best);
+            c = g_hash_table_lookup(d->sets, &token);
+            if (reims_vgpu_dirty_wp_any_ro(d, c, 0, c->count)) {
+                d->lab_wp_rej_ro++;
+                continue;   /* WP_RETRY queues it again later */
+            }
+            c->wp_state = WP_PROTECTING;
+            c->wp_next = 0;
+            d->wp_cur = token;
+            g_array_append_val(d->wp_list, token);
+        }
+    }
+    return d->wp_cur != 0;
+}
+
 /* Take the next eligible queued set as the one being protected. `wp_mutex` and `lock` held. */
 static bool reims_vgpu_dirty_wp_pick(ReimsVgpuDirty *d)
 {
+    if (d->wp_thread_mode) {
+        return reims_vgpu_dirty_wp_pick_hot(d);
+    }
     while (!d->wp_cur && d->wp_queue->len) {
         uint64_t token = g_array_index(d->wp_queue, uint64_t, d->wp_queue->len - 1);
         ReimsVgpuDirtySet *c = g_hash_table_lookup(d->sets, &token);
@@ -4877,8 +4957,13 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
             d->wp_nopause = getenv("REIMS_VGPU_LAB_DIRTY_WP_NOPAUSE") &&
                             strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_NOPAUSE"), "on") == 0;
 #ifndef REIMS_DIRTY_STRESS
-            d->wp_thread_mode = getenv("REIMS_VGPU_LAB_DIRTY_WP_THREAD") &&
-                                strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_THREAD"), "on") == 0;
+            /*
+             * On by default (n153, heavy glass scene, frames of ~120 draws: 104 / 115 Hz and 11.1 /
+             * 12.0 k draws/s against 91 / 9.8 k with the paused main-loop step and 75 / 8.0 k with the
+             * old queueing); `=off` restores the paused main-loop step.
+             */
+            d->wp_thread_mode = !(getenv("REIMS_VGPU_LAB_DIRTY_WP_THREAD") &&
+                                  strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_THREAD"), "off") == 0);
 #endif
             d->wp_thread_duty = getenv("REIMS_VGPU_LAB_DIRTY_WP_THREAD_DUTY") ?
                                 MIN(100, MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_THREAD_DUTY")))) : 30;
@@ -4886,6 +4971,14 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                 d->wp_nopause = true;
                 if (!getenv("REIMS_VGPU_LAB_DIRTY_WP_CHUNK")) {
                     d->wp_chunk = 32;   /* no pause to bound: the duty paces the thread */
+                }
+                if (!getenv("REIMS_VGPU_LAB_DIRTY_WP_STREAK")) {
+                    /*
+                     * ~0.7 s of a set read every epoch: transition surfaces live shorter, and each
+                     * one protected is a remap per run now and again when it is freed (n151 t256:
+                     * orphans released at ~0.3-0.9 s of remaps a second).
+                     */
+                    d->wp_streak_need = 128;
                 }
             }
             qemu_mutex_init(&d->wp_mutex);
