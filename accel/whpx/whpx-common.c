@@ -444,6 +444,38 @@ int whpx_wp_remap(uint64_t gpa, uint64_t size, bool writable)
     return rc;
 }
 
+/*
+ * TEMP (lab, n128): REIMS_VGPU_LAB_RAM_POPULATE=on asks the hypervisor to fill
+ * in its second-level translation for a freshly mapped stretch of guest RAM
+ * at once (WHvAdviseGpaRange Populate), instead of one exit per page on the
+ * guest's first touch (~7.5 us a page measured in the guest, n126; host-side
+ * prealloc did not change it). Big RAM sections only; one line per call.
+ */
+static void whpx_lab_populate(uint64_t gpa, uint64_t size, bool ram)
+{
+    static int on = -1;
+    WHV_MEMORY_RANGE_ENTRY range = { .GuestAddress = gpa, .SizeInBytes = size };
+    WHV_ADVISE_GPA_RANGE advice = { 0 };
+    int64_t t0;
+    HRESULT hr;
+
+    if (on < 0) {
+        const char *e = getenv("REIMS_VGPU_LAB_RAM_POPULATE");
+        on = e && strcmp(e, "on") == 0;
+    }
+    if (!on || !ram || size < (64ULL << 20) || !whp_dispatch.WHvAdviseGpaRange) {
+        return;
+    }
+    advice.Populate.AccessType = WHvMemoryAccessWrite;
+    t0 = get_clock();
+    hr = whp_dispatch.WHvAdviseGpaRange(whpx_global.partition, &range, 1,
+                                        WHvAdviseGpaRangeCodePopulate,
+                                        &advice, sizeof(advice));
+    fprintf(stderr, "reims-lab: populate gpa=0x%" PRIx64 " size_mb=%" PRIu64
+            " hr=0x%lx ms=%" PRId64 "\n", gpa, size >> 20, hr,
+            (get_clock() - t0) / 1000000);
+}
+
 static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
 {
     struct whpx_state *whpx = &whpx_global;
@@ -508,6 +540,7 @@ static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
                                          flags |
                                          WHvMapGpaRangeFlagTrackDirtyPages);
         if (SUCCEEDED(hr)) {
+            whpx_lab_populate(gva, size, writable && memory_region_is_ram(area));
             return;
         }
         whpx_dirty_tracking_disable("tracked mapping refused", hr);
@@ -519,6 +552,7 @@ static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
         error_report("WHPX: failed to map GPA range");
         abort();
     }
+    whpx_lab_populate(gva, size, writable && memory_region_is_ram(area));
 }
 
 static void whpx_region_add(MemoryListener *listener,

@@ -2025,6 +2025,10 @@ uint64_t whpx_get_supported_msr_feature(uint32_t index)
     return 0;
 }
 
+/* QEMU_WHPX_PF_INTERCEPT state: -1 undecided, 0 off, 1 on (see below). */
+static int whpx_pf_intercept = -1;
+static int64_t whpx_pf_intercept_until_ns;
+
 static UINT64 whpx_get_default_exceptions(void)
 {
     struct whpx_state *whpx = &whpx_global;
@@ -2045,16 +2049,60 @@ static UINT64 whpx_get_default_exceptions(void)
      * second under a desktop workload, so QEMU_WHPX_PF_INTERCEPT=0 turns the
      * intercept off for hosts that boot without it.
      */
-    static int pf_intercept = -1;
-    if (pf_intercept < 0) {
+    if (whpx_pf_intercept < 0) {
+        /*
+         * TEMP (lab, n130): only for the first QEMU_WHPX_PF_INTERCEPT_SECS
+         * seconds of the run (default 90: firmware, OpenCore and the early
+         * kernel, where the storm was seen), then dropped; 0 keeps it for
+         * the whole run. Kept, a macOS desktop pays ~8 us per guest page
+         * fault (n129/n130: 256 MiB of fresh pages 520 -> 87 ms, 300
+         * process spawns 1.54 -> 0.55 s without it).
+         */
         const char *v = g_getenv("QEMU_WHPX_PF_INTERCEPT");
-        pf_intercept = !(v && strcmp(v, "0") == 0);
+        const char *secs = g_getenv("QEMU_WHPX_PF_INTERCEPT_SECS");
+        int keep_s = secs ? atoi(secs) : 90;
+
+        whpx_pf_intercept = !(v && strcmp(v, "0") == 0);
+        if (whpx_pf_intercept && keep_s > 0) {
+            whpx_pf_intercept_until_ns = get_clock() +
+                                         (int64_t)keep_s * NANOSECONDS_PER_SECOND;
+        }
     }
-    if (pf_intercept) {
+    if (whpx_pf_intercept) {
         intercepts |= 1UL << WHvX64ExceptionTypePageFault;
     }
 
     return intercepts;
+}
+
+/*
+ * TEMP (lab, n130): QEMU_WHPX_PF_INTERCEPT_SECS=N keeps the #PF intercept only
+ * for the first N seconds of the run (the early-boot fault storm it exists
+ * for), then drops it, so the desktop's page faults no longer each cost an
+ * exit to QEMU (~8 us a fault in a macOS guest, n129). Called by every vCPU
+ * before it runs; the switch itself happens once, with all vCPUs stopped.
+ */
+static void whpx_pf_intercept_expire(void)
+{
+    struct whpx_state *whpx = &whpx_global;
+    UINT64 debug_bits;
+
+    if (!whpx_pf_intercept_until_ns || get_clock() < whpx_pf_intercept_until_ns) {
+        return;
+    }
+    start_exclusive();
+    if (whpx_pf_intercept_until_ns) {
+        whpx_pf_intercept_until_ns = 0;
+        whpx_pf_intercept = 0;
+        debug_bits = whpx->exception_exit_bitmap;
+        whpx->exception_exit_bitmap = -1;   /* force the setter to write */
+        if (FAILED(whpx_set_exception_exit_bitmap(debug_bits == (UINT64)-1 ? 0 : debug_bits))) {
+            error_report("WHPX: could not drop the #PF intercept");
+        } else {
+            fprintf(stderr, "reims-lab: #PF intercept dropped\n");
+        }
+    }
+    end_exclusive();
 }
 
 /*
@@ -2891,6 +2939,8 @@ int whpx_vcpu_run(CPUState *cpu)
 
     bql_unlock();
 
+    whpx_pf_intercept_expire();   /* lab: QEMU_WHPX_PF_INTERCEPT_SECS */
+
     if (exclusive_step_mode != WHPX_STEP_NONE) {
         start_exclusive();
         g_assert(cpu == current_cpu);
@@ -2925,6 +2975,11 @@ int whpx_vcpu_run(CPUState *cpu)
 
         if (exclusive_step_mode == WHPX_STEP_NONE) {
             whpx_vcpu_pre_run(cpu);
+
+            /* lab: leave the loop so the #PF intercept can be dropped above */
+            if (whpx_pf_intercept_until_ns && get_clock() >= whpx_pf_intercept_until_ns) {
+                qatomic_set(&cpu->exit_request, true);
+            }
 
             /* Corresponding store-release is in cpu_exit. */
             if (qatomic_load_acquire(&cpu->exit_request)) {

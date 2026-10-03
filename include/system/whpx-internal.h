@@ -122,6 +122,11 @@ void whpx_apic_get(APICCommonState *s);
         (WHV_PARTITION_HANDLE Partition, \
         WHV_GUEST_PHYSICAL_ADDRESS GuestAddress, UINT64 RangeSizeInBytes, \
         UINT64 *Bitmap, UINT32 BitmapSizeInBytes)) \
+  X(HRESULT, WHvAdviseGpaRange, \
+        (WHV_PARTITION_HANDLE Partition, \
+        const WHV_MEMORY_RANGE_ENTRY *GpaRanges, UINT32 GpaRangesCount, \
+        WHV_ADVISE_GPA_RANGE_CODE Advice, const VOID *AdviceBuffer, \
+        UINT32 AdviceBufferSizeInBytes)) \
   LIST_WINHVPLATFORM_FUNCTIONS_SUPPLEMENTAL_ARCH(X)
 
 #define WHP_DEFINE_TYPE(return_type, function_name, signature) \
