@@ -1175,6 +1175,7 @@ static int reims_vgpu_dirty_cmp_written(gconstpointer a, gconstpointer b)
 
 /* Lab DIRTY_HASH ------------------------------------------------------- */
 static uint64_t reims_vgpu_dirty_gap_pages(void);
+#define REIMS_VGPU_DIRTY_HASH_HOT 4   /* epochs a hashed set stays in the background prefetch */
 
 /*
  * Whether a set of these (sorted, distinct) pages is cheaper to hash than to query: the
@@ -5804,8 +5805,12 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                       MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_HASH_MAX"))) : 4096;
         d->hash_all = getenv("REIMS_VGPU_LAB_DIRTY_HASH_ALL") &&
                       strcmp(getenv("REIMS_VGPU_LAB_DIRTY_HASH_ALL"), "on") == 0;
-        qatomic_set(&d->hash_mode, getenv("REIMS_VGPU_LAB_DIRTY_HASH") &&   /* lab A/B */
-                                   strcmp(getenv("REIMS_VGPU_LAB_DIRTY_HASH"), "on") == 0);
+        /*
+         * On by default (n176/n177, 5K Intel, def vs hash x3 each: glass 84.5 -> 93.9 and 85.9 ->
+         * 112.2 Hz, scroll 86.2 -> 111.6 and 84.6 -> 107.1 Hz); `=off` restores the queried path.
+         */
+        qatomic_set(&d->hash_mode, !(getenv("REIMS_VGPU_LAB_DIRTY_HASH") &&   /* lab A/B */
+                                     strcmp(getenv("REIMS_VGPU_LAB_DIRTY_HASH"), "off") == 0));
         d->chan_prefetch = getenv("REIMS_VGPU_LAB_DIRTY_CHAN_PREFETCH") &&   /* lab A/B */
                            strcmp(getenv("REIMS_VGPU_LAB_DIRTY_CHAN_PREFETCH"), "on") == 0;
         /* Opt-in: n170 +8 % glass, n172 -2 % (PSTAMP=off 87.6 / 101.6 against 97.7 / 87.1) — noise. */
@@ -6535,6 +6540,7 @@ void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
     g_autoptr(GArray) tokens = NULL;
     g_autoptr(GArray) order = NULL;
     g_autoptr(GArray) hot_hash = NULL;   /* lab DIRTY_HASH */
+    g_autoptr(GArray) hot_ord = NULL;    /* lab DIRTY_HASH: the same, with the read order */
     GHashTableIter it;
     gpointer key, val;
     uint64_t epoch;
@@ -6557,6 +6563,7 @@ void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
     tokens = g_array_new(FALSE, FALSE, sizeof(uint64_t));
     order = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyOrdered));
     hot_hash = g_array_new(FALSE, FALSE, sizeof(uint64_t));
+    hot_ord = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyOrdered));
     qemu_mutex_lock(&d->lock);
     epoch = d->epoch;
     {
@@ -6569,9 +6576,18 @@ void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
             ReimsVgpuDirtySet *set = val;
 
             if (set->hash && d->hash_mode) {
-                /* Lab DIRTY_HASH: its own hashes, on a worker, never a batch's query. */
-                if (set->synced_epoch < epoch && set->last_query_epoch + d->od_hot >= epoch) {
-                    g_array_append_val(hot_hash, *(uint64_t *)key);
+                /*
+                 * Lab DIRTY_HASH: its own hashes, on a worker, never a batch's query — and only for
+                 * a set read within about a frame (~3.5 doorbells). A query's bitmap costs ~26 ns a
+                 * page, so the batch keeps `od_hot` (24) epochs of sets; a hash costs ~0.3-0.5 us a
+                 * page, and n177 hashed 2 TB a boot (13 GB/s, ~1.7 cores) re-hashing sets read
+                 * frames ago at every doorbell. A colder set is hashed by its next read instead.
+                 */
+                if (set->synced_epoch < epoch &&
+                    set->last_query_epoch + REIMS_VGPU_DIRTY_HASH_HOT >= epoch) {
+                    ReimsVgpuDirtyOrdered ho = { set->read_order, *(uint64_t *)key };
+
+                    g_array_append_val(hot_ord, ho);
                 }
                 continue;
             }
@@ -6605,6 +6621,17 @@ void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
     g_array_sort(order, reims_vgpu_dirty_cmp_ordered);
     for (t = 0; t < order->len; t++) {
         g_array_append_val(tokens, g_array_index(order, ReimsVgpuDirtyOrdered, t).token);
+    }
+    /*
+     * Lab DIRTY_HASH: the workers take the hashed sets in the order the drain first read them last
+     * time, as the batch below takes the queried ones — in hash-table order the drain's first reads
+     * waited for hashes the workers ran last.
+     */
+    g_array_sort(hot_ord, reims_vgpu_dirty_cmp_ordered);
+    for (t = 0; t < hot_ord->len; t++) {
+        uint64_t tk = g_array_index(hot_ord, ReimsVgpuDirtyOrdered, t).token;
+
+        g_array_append_val(hot_hash, tk);
     }
     d->lab_hash_pf += hot_hash->len;
     if (hot_hash->len && d->od_pbatch && d->od_nworkers > 0) {
