@@ -159,6 +159,21 @@ struct ReimsVGPUPCIState {
     bool harvest_started;
     /* The drain was told "not settled" and left work; wake it on catch-up. */
     bool harvest_rearm;
+    /*
+     * TEMP lab REIMS_VGPU_LAB_DIRTY_PEEK_MS=<1..16> (with DIRTY_HOLE=tail): a thread reads every
+     * child ring's tail that often and, for one the guest moved without ringing (it appends to a
+     * ring the device has not drained, ~80 times a second under load), does what that doorbell
+     * would have: reads the tail, then opens an epoch, then wakes the prefetch. The drain, still
+     * busy with older packets, later finds the tail covered (DIRTY_HOLE=tail opens no epoch of its
+     * own) and the sets those packets read already synced for it (DIRTY_FRONTIER).
+     */
+    QemuThread peek_thread;
+    QemuMutex peek_mutex;
+    QemuCond peek_cond;
+    int peek_ms;
+    bool peek_stopping;
+    bool peek_started;
+    uint64_t lab_peeks;
     /* HostOps.irq_pulse may raise MSIs off the BQL (lab A/B: REIMS_VGPU_IRQ_DIRECT=on). */
     bool irq_direct;
     Notifier shutdown_notifier;
@@ -767,6 +782,64 @@ static void reims_vgpu_pci_bh(void *opaque)
  * the drain. Holds only the BQL and the tracker's own lock — never the device —
  * so the drain waiting on it cannot close a cycle.
  */
+/* TEMP lab DIRTY_PEEK: one pass over the child rings' tails. */
+static void reims_vgpu_pci_peek_tails(ReimsVGPUPCIState *s)
+{
+    bool want = false;
+    uint32_t ch;
+
+    for (ch = 1; ch < 16; ch++) {
+        uint64_t gpa = reims_vgpu_qemu_child_tail_gpa(s->rust_handle, ch);
+        uint32_t tail;
+
+        if (!gpa || address_space_read(&address_space_memory, gpa, MEMTXATTRS_UNSPECIFIED,
+                                       &tail, 4) != MEMTX_OK) {
+            continue;
+        }
+        tail = le32_to_cpu(tail);
+        if (!reims_vgpu_dirty_tail_unnoted(s->dirty, ch, tail)) {
+            continue;
+        }
+        /* The doorbell's order: the tail first, then the epoch that covers it. */
+        want |= reims_vgpu_dirty_note_doorbell(s->dirty, (int)ch);
+        reims_vgpu_dirty_note_child_tail(s->dirty, (int)ch, tail, true);
+        qatomic_inc(&s->lab_peeks);
+    }
+    if (want && s->harvest_started) {
+        qemu_mutex_lock(&s->harvest_mutex);
+        s->harvest_asked++;
+        qemu_cond_signal(&s->harvest_cond);
+        qemu_mutex_unlock(&s->harvest_mutex);
+    }
+}
+
+static void *reims_vgpu_pci_peek_thread(void *opaque)
+{
+    ReimsVGPUPCIState *s = opaque;
+    int64_t last = get_clock();
+
+    rcu_register_thread();
+    qemu_mutex_lock(&s->peek_mutex);
+    while (!s->peek_stopping) {
+        qemu_cond_timedwait(&s->peek_cond, &s->peek_mutex, s->peek_ms);
+        if (s->peek_stopping) {
+            break;
+        }
+        qemu_mutex_unlock(&s->peek_mutex);
+        if (s->rust_handle != 0) {
+            reims_vgpu_pci_peek_tails(s);
+        }
+        if (get_clock() - last >= NANOSECONDS_PER_SECOND * 5) {
+            fprintf(stderr, "reims-peek peeks=%" PRIu64 "\n", qatomic_xchg(&s->lab_peeks, 0));
+            last = get_clock();
+        }
+        qemu_mutex_lock(&s->peek_mutex);
+    }
+    qemu_mutex_unlock(&s->peek_mutex);
+    rcu_unregister_thread();
+    return NULL;
+}
+
 static void *reims_vgpu_pci_harvest_thread(void *opaque)
 {
     ReimsVGPUPCIState *s = opaque;
@@ -1416,6 +1489,14 @@ static void reims_vgpu_pci_stop_backend(ReimsVGPUPCIState *s)
         qemu_thread_join(&s->heartbeat_thread);
         s->heartbeat_started = false;
     }
+    if (s->peek_started) {   /* TEMP lab DIRTY_PEEK */
+        qemu_mutex_lock(&s->peek_mutex);
+        s->peek_stopping = true;
+        qemu_cond_signal(&s->peek_cond);
+        qemu_mutex_unlock(&s->peek_mutex);
+        qemu_thread_join(&s->peek_thread);
+        s->peek_started = false;
+    }
     if (s->harvest_started) {
         qemu_mutex_lock(&s->harvest_mutex);
         s->harvest_stopping = true;
@@ -1662,6 +1743,18 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
                                reims_vgpu_pci_harvest_thread, s,
                                QEMU_THREAD_JOINABLE);
             s->harvest_started = true;
+        }
+        {
+            const char *pk = getenv("REIMS_VGPU_LAB_DIRTY_PEEK_MS");   /* TEMP lab DIRTY_PEEK */
+
+            s->peek_ms = pk ? atoi(pk) : 0;
+            if (s->dirty_ondemand && s->peek_ms >= 1 && s->peek_ms <= 16) {
+                qemu_mutex_init(&s->peek_mutex);
+                qemu_cond_init(&s->peek_cond);
+                qemu_thread_create(&s->peek_thread, "reims-vgpu-peek",
+                                   reims_vgpu_pci_peek_thread, s, QEMU_THREAD_JOINABLE);
+                s->peek_started = true;
+            }
         }
     }
 #if defined(_WIN32)

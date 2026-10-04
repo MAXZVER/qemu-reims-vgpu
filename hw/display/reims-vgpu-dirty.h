@@ -102,5 +102,10 @@ void reims_vgpu_dirty_note_child_tail(ReimsVgpuDirty *d, int channel, uint32_t t
 /* Lab DIRTY_HOLE=tail: the drain read this child-ring tail; open an epoch unless one covers it. */
 /* Returns true when it opened an epoch the prefetch should be woken for (DIRTY_TAILWAKE). */
 bool reims_vgpu_dirty_note_ring_tail(ReimsVgpuDirty *d, uint32_t channel, uint32_t tail);
+/*
+ * TEMP lab DIRTY_PEEK: whether `tail` (just read from child ring `channel`'s registers) is one no
+ * epoch is known to cover yet — the guest appended packets without ringing. Only with DIRTY_HOLE=tail.
+ */
+bool reims_vgpu_dirty_tail_unnoted(ReimsVgpuDirty *d, uint32_t channel, uint32_t tail);
 
 #endif /* REIMS_VGPU_DIRTY_H */
