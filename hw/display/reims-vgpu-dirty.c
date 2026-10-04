@@ -486,6 +486,24 @@ struct ReimsVgpuDirty {
     bool split_busy;          /* a job is published and its owner not yet done */
     QemuCond split_cond;
     /*
+     * Lab DIRTY_HASH: one set's hash cut into page chunks that the prefetch workers and any waiter
+     * take in turn (`next`), the owner (the sync holding the set's `hash_busy`) taking its share and
+     * waiting for `done == total` on `split_cond`. Fields are written by the owner before `busy` and
+     * not again until every chunk is done; a chunk writes only its own pages' `hash` and `moved`.
+     * Under `lock`.
+     */
+    struct {
+        ReimsVgpuDirtySet *s;
+        const ReimsVgpuDirtySlice *slices;
+        int n;
+        uint8_t *moved;       /* per page: 1 = its content moved, or it is outside guest RAM */
+        bool base;
+        size_t chunk;
+        guint next, done, total;
+        bool busy;
+    } hjob;
+    uint64_t lab_hash_split, lab_hash_split_helped;
+    /*
      * TEMP lab DIRTY_FGSLOT (on unless =off): a large foreground sync gets a
      * split job of its own, which every helper serves before the batch's.
      * With one job a prefetch batch held it through most of a transition, and
@@ -4818,6 +4836,66 @@ static size_t reims_vgpu_dirty_page_list(ReimsVgpuDirty *d, const uint64_t *spag
 }
 
 /*
+ * Lab DIRTY_HASH: hash pages [p0, p1) of `s` into its `hash`, flagging in `moved` the pages whose
+ * content moved (when `base`) or that lie outside guest RAM. The caller holds the RCU read lock and
+ * owns these pages' slots (the set's `hash_busy` holder, or a chunk of its job).
+ */
+static void reims_vgpu_dirty_hash_range(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
+                                        const ReimsVgpuDirtySlice *slices, int n,
+                                        size_t p0, size_t p1, bool base, uint8_t *moved)
+{
+    int si = -1;
+    size_t p;
+
+    for (p = p0; p < p1; p++) {
+        uint64_t gpa = s->pages[p], h;
+
+        if (si < 0 || gpa < slices[si].gpa || gpa + s->page_size > slices[si].gpa + slices[si].len) {
+            si = reims_vgpu_dirty_slice_of(slices, n, gpa);
+            if (si >= 0 && gpa + s->page_size > slices[si].gpa + slices[si].len) {
+                si = -1;   /* a page straddling two ranges: not one host mapping */
+            }
+        }
+        if (si < 0) {
+            qatomic_inc(&d->lab_hash_noram);
+            moved[p] = 1;
+            continue;
+        }
+        h = reims_vgpu_dirty_hash_bytes((const uint8_t *)memory_region_get_ram_ptr(slices[si].mr) +
+                                        slices[si].offset + (gpa - slices[si].gpa),
+                                        s->page_size);
+        if (base && h != s->hash[p]) {
+            moved[p] = 1;
+        }
+        s->hash[p] = h;
+    }
+}
+
+/* Lab DIRTY_HASH: take chunks of the running hash job until none is left. d->lock held. */
+static void reims_vgpu_dirty_hash_help(ReimsVgpuDirty *d)
+{
+    while (d->hjob.busy && d->hjob.next < d->hjob.total) {
+        guint k = d->hjob.next++;
+        size_t p0 = (size_t)k * d->hjob.chunk;
+        size_t p1 = MIN(p0 + d->hjob.chunk, d->hjob.s->count);
+
+        qemu_mutex_unlock(&d->lock);
+        rcu_read_lock();
+        reims_vgpu_dirty_hash_range(d, d->hjob.s, d->hjob.slices, d->hjob.n, p0, p1, d->hjob.base,
+                                    d->hjob.moved);
+        rcu_read_unlock();
+        qemu_mutex_lock(&d->lock);
+        if (++d->hjob.done == d->hjob.total) {
+            qemu_cond_broadcast(&d->split_cond);
+        }
+    }
+}
+
+/* Pages past which a set's hash is cut into chunks for the workers, and the chunk. */
+#define REIMS_VGPU_DIRTY_HASH_SPLIT_MIN 256
+#define REIMS_VGPU_DIRTY_HASH_CHUNK 128
+
+/*
  * Lab DIRTY_HASH: bring hashed set `s` (claimed for `epoch` by the caller) up to date by comparing
  * its pages' content hashes with those of its last sync. Called and returning with `lock` held.
  *
@@ -4833,10 +4911,11 @@ static void reims_vgpu_dirty_hash_sync(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
     const int shift = qemu_target_page_bits();
     ReimsVgpuDirtySlice *slices = NULL;
     g_autoptr(GArray) moved = NULL;
-    int cap = 0, n, si = -1;
+    uint8_t *flags;
+    int cap = 0, n;
     int64_t t0;
     size_t p;
-    bool base;
+    bool base, split;
 
     while (s && s->hash_busy) {
         d->lab_hash_waits++;
@@ -4863,32 +4942,47 @@ static void reims_vgpu_dirty_hash_sync(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
 
     t0 = get_clock();
     moved = g_array_new(FALSE, FALSE, sizeof(size_t));
+    flags = g_malloc0(MAX(s->count, 1));
     n = reims_vgpu_dirty_ram_slices_into(&slices, &cap);
     rcu_read_lock();   /* the set (RCU-freed) and guest RAM stay put while hashing */
-    for (p = 0; p < s->count; p++) {
-        uint64_t gpa = s->pages[p], h;
-
-        if (si < 0 || gpa < slices[si].gpa || gpa + s->page_size > slices[si].gpa + slices[si].len) {
-            si = reims_vgpu_dirty_slice_of(slices, n, gpa);
-            if (si >= 0 && gpa + s->page_size > slices[si].gpa + slices[si].len) {
-                si = -1;   /* a page straddling two ranges: not one host mapping */
+    split = false;
+    if (s->count * (s->page_size >> shift) >= REIMS_VGPU_DIRTY_HASH_SPLIT_MIN && d->od_nworkers > 0) {
+        qemu_mutex_lock(&d->lock);
+        if (!d->hjob.busy) {
+            /* The workers and any waiter take chunks while this thread takes its own share. */
+            d->hjob.s = s;
+            d->hjob.slices = slices;
+            d->hjob.n = n;
+            d->hjob.moved = flags;
+            d->hjob.base = base;
+            d->hjob.chunk = REIMS_VGPU_DIRTY_HASH_CHUNK;
+            d->hjob.next = d->hjob.done = 0;
+            d->hjob.total = (s->count + REIMS_VGPU_DIRTY_HASH_CHUNK - 1) / REIMS_VGPU_DIRTY_HASH_CHUNK;
+            d->hjob.busy = true;
+            split = true;
+            d->lab_hash_split++;
+            qemu_cond_broadcast(&d->od_work_cond);
+            reims_vgpu_dirty_hash_help(d);
+            while (d->hjob.done < d->hjob.total) {
+                qemu_cond_wait(&d->split_cond, &d->lock);
             }
+            d->hjob.busy = false;
+            d->hjob.s = NULL;
+            d->hjob.total = d->hjob.done = d->hjob.next = 0;
         }
-        if (si < 0) {
-            qatomic_inc(&d->lab_hash_noram);
-            g_array_append_val(moved, p);
-            continue;
-        }
-        h = reims_vgpu_dirty_hash_bytes((const uint8_t *)memory_region_get_ram_ptr(slices[si].mr) +
-                                        slices[si].offset + (gpa - slices[si].gpa),
-                                        s->page_size);
-        if (base && h != s->hash[p]) {
-            g_array_append_val(moved, p);
-        }
-        s->hash[p] = h;
+        qemu_mutex_unlock(&d->lock);
+    }
+    if (!split) {
+        reims_vgpu_dirty_hash_range(d, s, slices, n, 0, s->count, base, flags);
     }
     rcu_read_unlock();
     g_free(slices);
+    for (p = 0; p < s->count; p++) {
+        if (flags[p]) {
+            g_array_append_val(moved, p);
+        }
+    }
+    g_free(flags);
     if (lab_query) {   /* TEMP lab (FGTRACE): the hash time stands for the query */
         *lab_query = get_clock() - t0;
     }
@@ -5695,6 +5789,11 @@ static void *reims_vgpu_dirty_od_worker(void *opaque)
     while (!d->od_stop) {
         uint64_t epoch = d->od_work_epoch;
 
+        if (d->hjob.busy && d->hjob.next < d->hjob.total) {
+            d->lab_hash_split_helped++;
+            reims_vgpu_dirty_hash_help(d);   /* lab DIRTY_HASH */
+            continue;
+        }
         if (reims_vgpu_dirty_split_pending(d)) {
             reims_vgpu_dirty_split_help(d);
             continue;
@@ -6525,11 +6624,12 @@ static void reims_vgpu_dirty_hash_report(ReimsVgpuDirty *d)
     d->lab_hash_last = now;
     fprintf(stderr, "reims-dirty-hash sets=%" PRIu64 " syncs=%" PRIu64 " pages=%" PRIu64
             " us=%" PRIu64 " dirty=%" PRIu64 " fg=%" PRIu64 " fg_us=%" PRIu64
-            " waits=%" PRIu64 " noram=%" PRIu64 " pf=%" PRIu64 "\n",
+            " waits=%" PRIu64 " noram=%" PRIu64 " pf=%" PRIu64 " split=%" PRIu64 " helped=%" PRIu64 "\n",
             d->lab_hash_sets, d->lab_hash_syncs, d->lab_hash_pages,
             d->lab_hash_ns / 1000, d->lab_hash_dirty, d->lab_hash_fg,
             d->lab_hash_fg_ns / 1000, d->lab_hash_waits, qatomic_read(&d->lab_hash_noram),
-            d->lab_hash_pf);
+            d->lab_hash_pf, d->lab_hash_split, d->lab_hash_split_helped);
+    d->lab_hash_split = d->lab_hash_split_helped = 0;
     d->lab_hash_syncs = d->lab_hash_pages = d->lab_hash_ns = d->lab_hash_dirty = 0;
     d->lab_hash_fg = d->lab_hash_fg_ns = d->lab_hash_waits = d->lab_hash_pf = 0;
     qatomic_set(&d->lab_hash_noram, 0);
