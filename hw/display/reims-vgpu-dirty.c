@@ -627,6 +627,13 @@ struct ReimsVgpuDirty {
      * hypervisor with every dirty query).
      */
     bool wp_thread_mode;
+    /*
+     * The last step found read-only runs still to give back (a dropping set, orphans): the thread
+     * then takes the next step at once instead of resting by the duty, because every vCPU store
+     * into one of those pages is an exit and a remap of its own until the step gets there.
+     */
+    bool wp_giving_back;
+    bool wp_run_ticket;   /* REIMS_VGPU_LAB_DIRTY_WP_RUN_TICKET (on unless =off): see protect_chunk */
     uint32_t wp_thread_duty;
     QemuThread wp_thread;
     QemuEvent wp_ev;
@@ -641,6 +648,9 @@ struct ReimsVgpuDirty {
     uint64_t lab_wp_rej_state, lab_wp_rej_gen, lab_wp_rej_bits, lab_wp_rej_ro, lab_wp_requeued;
     /* TEMP lab (n148): target pages a sync left out of its query because they are read-only. */
     uint64_t lab_ro_skipped;
+    /* TEMP lab (PREP_SYNC): merged syncs the drain asked for ahead of a pass's planned binds. */
+    uint64_t lab_prep_n, lab_prep_sets, lab_prep_pages, lab_prep_ns, lab_prep_asked;
+    uint64_t lab_prep_query_ns, lab_prep_settle_ns, lab_prep_fold_ns, lab_prep_lock_ns;
     /*
      * TEMP lab REIMS_VGPU_LAB_DIRTY_WP_RETRY (on unless =off): a clean set past its streak is queued
      * again every `wp_streak_need` clean syncs, not only when the streak equals the need.
@@ -1581,6 +1591,8 @@ static int64_t reims_vgpu_dirty_wp_protect_chunk(ReimsVgpuDirty *d, uint64_t tok
         /* The ticket is taken before the first remap and returned after the last mark. */
         uint64_t pt = reims_vgpu_dirty_query_begin(d);
 
+        bool gone = false;
+
         qemu_mutex_unlock(&d->lock);
         for (p = p0, runs = 0; p < s->count && runs < budget && !rc; runs++) {
             uint64_t end;
@@ -1589,11 +1601,52 @@ static int64_t reims_vgpu_dirty_wp_protect_chunk(ReimsVgpuDirty *d, uint64_t tok
             rc = reims_vgpu_dirty_wp_remap(d, s->pages[p], end - s->pages[p], false);
             reims_vgpu_dirty_wp_mark(d->wp_slices, n, s->pages[p], end);
             p = q;
+            if (d->wp_thread_mode && d->wp_run_ticket) {
+                /*
+                 * TEMP lab DIRTY_WP_THREAD: a ticket per run, not per chunk. The ticket makes a
+                 * sync that settles after it began wait for the marks; held across a whole chunk
+                 * (32 runs, ~13 ms) it held every foreground sync's settle that long. The marks of
+                 * a run cover the stores before that run's remap, so its own ticket is enough.
+                 */
+                qemu_mutex_lock(&d->lock);
+                reims_vgpu_dirty_query_end(d, pt);
+                pt = (!rc && p < s->count && runs + 1 < budget) ? reims_vgpu_dirty_query_begin(d) : 0;
+                qemu_mutex_unlock(&d->lock);
+            }
+            if (d->wp_thread_mode && !rc && p < s->count && runs + 1 < budget) {
+                /*
+                 * TEMP lab DIRTY_WP_THREAD: `wp_mutex` is given up between runs, so a vCPU whose
+                 * store faulted on a read-only page waits for one remap (~0.4 ms), not a whole
+                 * chunk (32 runs, ~13 ms). The set is looked up again: the fault may have started
+                 * dropping it (its read-only runs are then given back from the first), or an
+                 * untrack freed it (its runs are on the orphan list).
+                 */
+                bool ok;
+
+                qemu_mutex_unlock(&d->wp_mutex);
+                qemu_mutex_lock(&d->wp_mutex);
+                qemu_mutex_lock(&d->lock);
+                s = g_hash_table_lookup(d->sets, &token);
+                ok = s && s->wp_state == WP_PROTECTING && d->wp_cur == token;
+                qemu_mutex_unlock(&d->lock);
+                if (!ok) {
+                    gone = true;
+                    runs++;
+                    break;
+                }
+            }
         }
         p_end = p;
-        qemu_mutex_lock(&d->lock);
-        reims_vgpu_dirty_query_end(d, pt);
-        qemu_mutex_unlock(&d->lock);
+        if (pt) {
+            qemu_mutex_lock(&d->lock);
+            reims_vgpu_dirty_query_end(d, pt);
+            qemu_mutex_unlock(&d->lock);
+        }
+        if (gone) {
+            budget -= runs;
+            d->lab_wp_chunks++;
+            goto done;
+        }
         goto remapped;
     }
     for (p = p0, runs = 0; p < s->count && runs < budget; runs++) {
@@ -1753,6 +1806,7 @@ static bool reims_vgpu_dirty_wp_step(ReimsVgpuDirty *d)
         qemu_mutex_unlock(&d->lock);
     }
     more = more || d->wp_orphans->len;
+    d->wp_giving_back = more;
     /*
      * The duty gate is checked here and not only in the pacing timer: the step
      * is also scheduled straight away by faults, untracks and a set reaching its
@@ -1827,6 +1881,10 @@ static void *reims_vgpu_dirty_wp_thread_fn(void *opaque)
 
             if (!more) {
                 break;
+            }
+            if (d->wp_giving_back) {
+                g_usleep(50);   /* give back first: pages a guest is writing fault one by one */
+                continue;
             }
             rest_us = spent * (100 - d->wp_thread_duty) / d->wp_thread_duty / 1000;
             g_usleep(MAX(rest_us, MAX((int64_t)d->wp_delay_ms * 1000, 250)));
@@ -4055,6 +4113,188 @@ static bool reims_vgpu_dirty_sync_batch(ReimsVgpuDirty *d, uint64_t token)
 }
 
 /*
+ * TEMP lab REIMS_VGPU_LAB_PREP_SYNC: sync_batch for the sets a caller names — the ones the reads it
+ * is about to make will ask for (the drain, ahead of a pass's planned binds, whose plan items would
+ * otherwise each sync their own set on their own thread, every one of them settling behind the
+ * others' queries; n156: 20 % of the drain inside those items, and n159 found one merged list costs
+ * a third of the hypervisor time of per-set queries). Brought up to date for the current epoch in
+ * one merged range list, one ticket, one settle. Skipped: unknown tokens, unarmed sets (their
+ * arming sync stays per set, with its log flush), protected or already synced ones, and read-only
+ * pages (DIRTY_RO_SKIP's argument).
+ */
+void reims_vgpu_dirty_sync_tokens(ReimsVgpuDirty *d, const uint64_t *want, size_t count)
+{
+    uint64_t qticket;
+    const int shift = qemu_target_page_bits();
+    const uint64_t target = 1ULL << shift;
+    ReimsVgpuDirtySlice *slices = NULL;
+    int cap = 0, n, i;
+    g_autoptr(GArray) tokens = g_array_new(FALSE, FALSE, sizeof(uint64_t));
+    g_autoptr(GArray) pages = g_array_new(FALSE, FALSE, sizeof(uint64_t));
+    g_autoptr(GArray) ranges = NULL;
+    g_autoptr(GArray) written = NULL;
+    g_autoptr(GArray) hit = NULL;
+    uint64_t epoch;
+    bool ro_skip;
+    guint t, pi;
+    size_t k;
+    int64_t t0 = get_clock();
+
+    int64_t tq0, tq1, ts1, tl0;
+
+    if (!d || !want || count == 0 || !qatomic_read(&d->ondemand)) {
+        return;
+    }
+    tl0 = get_clock();
+    qemu_mutex_lock(&d->lock);
+    d->lab_prep_lock_ns += get_clock() - tl0;
+    d->lab_prep_asked += count;
+    epoch = d->epoch;
+    ro_skip = d->ro_skip && qatomic_read(&d->wp_bits);
+    for (k = 0; k < count; k++) {
+        uint64_t tk = want[k] & ~REIMS_VGPU_DIRTY_TOKEN_LAGGED;
+        ReimsVgpuDirtySet *set;
+        size_t p;
+        uint64_t off;
+        bool dup = false;
+
+        if (tk == 0) {
+            continue;
+        }
+        set = g_hash_table_lookup(d->sets, &tk);
+        if (!set || set->gen == 0 || set->synced_epoch >= epoch || set->wp_state == WP_ON) {
+            continue;
+        }
+        for (t = 0; t < tokens->len; t++) {
+            if (g_array_index(tokens, uint64_t, t) == tk) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) {
+            continue;
+        }
+        g_array_append_val(tokens, tk);
+        for (p = 0; p < set->count; p++) {
+            for (off = 0; off < set->page_size; off += target) {
+                uint64_t g = set->pages[p] + off;
+
+                if (ro_skip && reims_vgpu_dirty_wp_ro(d, g)) {
+                    continue;
+                }
+                g_array_append_val(pages, g);
+            }
+        }
+    }
+    qemu_mutex_unlock(&d->lock);
+    if (tokens->len == 0) {
+        return;
+    }
+    g_array_sort(pages, reims_vgpu_dirty_cmp_u64_asc);
+
+    n = reims_vgpu_dirty_ram_slices_into(&slices, &cap);
+    qemu_mutex_lock(&d->lock);
+    for (i = 0; i < n; i++) {
+        slices[i].logged = g_hash_table_contains(d->logged, slices[i].mr);
+    }
+    qticket = reims_vgpu_dirty_query_begin(d);
+    qemu_mutex_unlock(&d->lock);
+    tq0 = get_clock();
+
+    ranges = g_array_new(FALSE, FALSE, sizeof(MemoryRegionRange));
+    for (i = 0; i < n; i++) {
+        bool seen = false;
+        int j;
+
+        for (j = 0; j < i; j++) {
+            seen |= slices[j].logged && slices[j].mr == slices[i].mr;
+        }
+        if (!slices[i].logged || seen) {
+            continue;
+        }
+        g_array_set_size(ranges, 0);
+        for (j = i; j < n; j++) {
+            const ReimsVgpuDirtySlice *sj = &slices[j];
+            MemoryRegionRange r = { 0, 0 };
+            bool open = false;
+
+            if (!sj->logged || sj->mr != slices[i].mr) {
+                continue;
+            }
+            for (pi = 0; pi < pages->len; pi++) {
+                uint64_t gpa = g_array_index(pages, uint64_t, pi);
+                uint64_t o;
+
+                if (gpa < sj->gpa || gpa - sj->gpa >= sj->len) {
+                    continue;
+                }
+                o = sj->offset + (gpa - sj->gpa);
+                if (open && o < r.start + r.len) {
+                    continue;   /* the same page, from a second set */
+                }
+                if (open && r.start + r.len +
+                    REIMS_VGPU_DIRTY_SYNC_GAP_PAGES * target >= o) {
+                    r.len = o + target - r.start;
+                    continue;
+                }
+                if (open) {
+                    g_array_append_val(ranges, r);
+                }
+                r.start = o;
+                r.len = target;
+                open = true;
+            }
+            if (open) {
+                g_array_append_val(ranges, r);
+            }
+        }
+        if (ranges->len) {
+            memory_region_sync_dirty_ranges(slices[i].mr,
+                                            (MemoryRegionRange *)ranges->data,
+                                            ranges->len);
+        }
+    }
+
+    written = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyWritten));
+    hit = g_array_new(FALSE, FALSE, sizeof(size_t));
+    tq1 = get_clock();
+    qemu_mutex_lock(&d->lock);
+    reims_vgpu_dirty_query_settle(d, qticket);
+    ts1 = get_clock();
+    {
+        uint64_t pass_seq = d->global_seq;
+
+        for (t = 0; t < tokens->len; t++) {
+            ReimsVgpuDirtySet *set = g_hash_table_lookup(d->sets,
+                                        &g_array_index(tokens, uint64_t, t));
+            if (set) {
+                reims_vgpu_dirty_consume_set(d, set, slices, n, pass_seq, written);
+            }
+        }
+    }
+    for (t = 0; t < tokens->len; t++) {
+        ReimsVgpuDirtySet *set = g_hash_table_lookup(d->sets,
+                                    &g_array_index(tokens, uint64_t, t));
+        if (set) {
+            if (reims_vgpu_dirty_eval_set(d, set, slices, n, hit, false)) {
+                d->log_wanted = true;
+            }
+            qatomic_store_release(&set->synced_epoch, MAX(set->synced_epoch, epoch));
+        }
+    }
+    d->lab_prep_query_ns += tq1 - tq0;
+    d->lab_prep_settle_ns += ts1 - tq1;
+    d->lab_prep_fold_ns += get_clock() - ts1;
+    d->lab_prep_n++;
+    d->lab_prep_sets += tokens->len;
+    d->lab_prep_pages += pages->len;
+    d->lab_prep_ns += get_clock() - t0;
+    qemu_mutex_unlock(&d->lock);
+    reims_vgpu_dirty_clear_written(written, slices, n);
+    g_free(slices);
+}
+
+/*
  * The pages of a set a sync for `epoch` queries: all of `spages` but those
  * already queried in `epoch` or later (all of them when `arming`: an arming
  * sync queries every page itself, after its own flush). Returns how many, in a
@@ -4670,6 +4910,18 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
             d->lab_od_n = d->lab_od_ns = d->lab_od_pages = d->lab_od_skipped = 0;
             d->lab_od_epochs = d->lab_od_fg_n = d->lab_od_fg_ns = 0;
             d->lab_od_last = now;
+            if (d->lab_prep_asked) {   /* TEMP lab PREP_SYNC */
+                fprintf(stderr, "reims-dirty-prep n=%" PRIu64 " asked=%" PRIu64 " sets=%" PRIu64
+                        " pages=%" PRIu64 " us=%" PRIu64 " lock_us=%" PRIu64 " query_us=%" PRIu64
+                        " settle_us=%" PRIu64 " fold_us=%" PRIu64 "\n", d->lab_prep_n,
+                        d->lab_prep_asked, d->lab_prep_sets, d->lab_prep_pages, d->lab_prep_ns / 1000,
+                        d->lab_prep_lock_ns / 1000, d->lab_prep_query_ns / 1000,
+                        d->lab_prep_settle_ns / 1000, d->lab_prep_fold_ns / 1000);
+                d->lab_prep_n = d->lab_prep_asked = d->lab_prep_sets = 0;
+                d->lab_prep_pages = d->lab_prep_ns = 0;
+                d->lab_prep_lock_ns = d->lab_prep_query_ns = 0;
+                d->lab_prep_settle_ns = d->lab_prep_fold_ns = 0;
+            }
             if (d->arm_flush && (d->lab_arm_flushes || d->lab_pb_arm_flushes)) {
                 /* TEMP lab ARM_FLUSH */
                 fprintf(stderr, "reims-dirty-armflush epoch_ms=%" PRId64 " n=%" PRIu64
@@ -4965,6 +5217,8 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
             d->wp_thread_mode = !(getenv("REIMS_VGPU_LAB_DIRTY_WP_THREAD") &&
                                   strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_THREAD"), "off") == 0);
 #endif
+            d->wp_run_ticket = !(getenv("REIMS_VGPU_LAB_DIRTY_WP_RUN_TICKET") &&
+                                 strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_RUN_TICKET"), "off") == 0);
             d->wp_thread_duty = getenv("REIMS_VGPU_LAB_DIRTY_WP_THREAD_DUTY") ?
                                 MIN(100, MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_THREAD_DUTY")))) : 30;
             if (d->wp_thread_mode) {
