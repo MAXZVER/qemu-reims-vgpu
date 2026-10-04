@@ -387,6 +387,51 @@ void (*whpx_wp_invalidate_hook)(void);
 static int whpx_wp_busy;
 static unsigned whpx_wp_gen;
 
+/*
+ * TEMP (lab, REIMS_VGPU_LAB_WP_POPULATE=read|write): refill the second-level translation of a range DIRTY_WP
+ * just remapped, on the WP thread, instead of leaving it to the guest's next touch. A remap drops the range's
+ * entries like an unmap does, so every page of it costs the guest a hypervisor fault again - which undoes
+ * RAM_POPULATE for exactly the pages WindowServer reuses for new surfaces: n210 (Intel, 40 GB), wiring
+ * 4.4 us a page with DIRTY_WP (60 020 remaps in the run) against 1.1 with it off. `read` populates for read
+ * (a write still upgrades the entry), `write` for write (may log the pages dirty). One line a second.
+ */
+static void whpx_lab_wp_populate(uint64_t gpa, uint64_t size, bool writable)
+{
+    static int mode = -1;   /* 0 off, 1 read, 2 write */
+    static uint64_t n, pages, ns, fails;
+    static int64_t last;
+    WHV_MEMORY_RANGE_ENTRY range = { .GuestAddress = gpa, .SizeInBytes = size };
+    WHV_ADVISE_GPA_RANGE advice = { 0 };
+    int64_t t0, now, was;
+    HRESULT hr;
+
+    if (mode < 0) {
+        const char *e = getenv("REIMS_VGPU_LAB_WP_POPULATE");
+        mode = !e ? 0 : strcmp(e, "write") == 0 ? 2 : strcmp(e, "read") == 0 ? 1 : 0;
+    }
+    if (!mode || !whp_dispatch.WHvAdviseGpaRange) {
+        return;
+    }
+    advice.Populate.AccessType = (mode == 2 && writable) ? WHvMemoryAccessWrite : WHvMemoryAccessRead;
+    t0 = get_clock();
+    hr = whp_dispatch.WHvAdviseGpaRange(whpx_global.partition, &range, 1, WHvAdviseGpaRangeCodePopulate,
+                                        &advice, sizeof(advice));
+    now = get_clock();
+    qatomic_add(&n, 1);
+    qatomic_add(&pages, size >> 12);
+    qatomic_add(&ns, (uint64_t)(now - t0));
+    if (FAILED(hr)) {
+        qatomic_add(&fails, 1);
+    }
+    was = qatomic_read(&last);
+    if (now - was >= NANOSECONDS_PER_SECOND && qatomic_cmpxchg(&last, was, now) == was) {
+        uint64_t cn = qatomic_xchg(&n, 0), cp = qatomic_xchg(&pages, 0), cns = qatomic_xchg(&ns, 0);
+        uint64_t cf = qatomic_xchg(&fails, 0);
+        fprintf(stderr, "reims-lab: wp-populate mode=%d n=%" PRIu64 " pages=%" PRIu64 " us=%" PRIu64
+                " fails=%" PRIu64 "\n", mode, cn, cp, cns / 1000, cf);
+    }
+}
+
 int whpx_wp_remap(uint64_t gpa, uint64_t size, bool writable)
 {
     struct whpx_state *whpx = &whpx_global;
@@ -438,6 +483,9 @@ int whpx_wp_remap(uint64_t gpa, uint64_t size, bool writable)
             }
             rc = -3;
         }
+    }
+    if (rc == 0) {
+        whpx_lab_wp_populate(gpa, size, writable);
     }
     qatomic_inc(&whpx_wp_gen);
     qatomic_dec(&whpx_wp_busy);
