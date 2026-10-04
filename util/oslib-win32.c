@@ -52,6 +52,10 @@ static int get_allocation_granularity(void)
  * instead of per 4 KiB) and is never trimmed out of the working set (large pages are not pageable). Needs the
  * account's "Lock pages in memory" right (SeLockMemoryPrivilege), which this only enables in the process token;
  * without it, or without enough contiguous free memory, the block falls back to ordinary pages. One line a block.
+ * On by default (n209, Intel, 40 GB guest, x2 interleaved: a guest memcpy of 1 GiB through a reused buffer 0.015 s
+ * against 0.022 s; full-screen transitions and stripes unchanged within noise; a fresh guest page costs the same,
+ * the guest's own pages stay 4 KiB). REIMS_VGPU_LAB_RAM_LARGE=off turns it off. whpx_lab_resident's VirtualLock
+ * then refuses (87) and needs not succeed: large pages are never paged.
  */
 static void *qemu_lab_large_ram_alloc(size_t size)
 {
@@ -67,7 +71,7 @@ static void *qemu_lab_large_ram_alloc(size_t size)
         const char *e = getenv("REIMS_VGPU_LAB_RAM_LARGE");
         HANDLE tok;
 
-        on = e && strcmp(e, "on") == 0;
+        on = !(e && strcmp(e, "off") == 0);
         if (on && OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) {
             TOKEN_PRIVILEGES tp = { .PrivilegeCount = 1 };
 
