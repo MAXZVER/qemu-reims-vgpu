@@ -536,6 +536,12 @@ struct ReimsVgpuDirty {
      */
     uint32_t ticket_batch;
     uint64_t lab_tb_syncs, lab_tb_batches;
+    /*
+     * TEMP lab REIMS_VGPU_LAB_DIRTY_FG_SPLIT_MIN=<pages> (default 4096): the walk past which a
+     * foreground sync splits its queries across the helpers. FGTRACE (n166): the scroll scene's
+     * costliest syncs are 504-page sets walking ~1-3k pages in ~60 calls, ~0.5 ms of query alone.
+     */
+    uint64_t fg_split_min;
     uint64_t lab_settle_skips, lab_settle_skip_cand;
     uint64_t lab_od_epochs, lab_od_fg_n, lab_od_fg_ns;   /* TEMP lab */
     uint64_t lab_fg_ahead, lab_fg_missed, lab_fg_cold, lab_pb_epoch;  /* TEMP lab */
@@ -1033,6 +1039,7 @@ ReimsVgpuDirty *reims_vgpu_dirty_new(void)
     qemu_cond_init(&d->q_cond);
     qemu_cond_init(&d->split_cond);
     d->split_chunks = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyChunk));
+    d->fg_split_min = 4096;   /* until set_ondemand reads the lab switch */
     d->pstamps = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyPstamp));
     for (int k = 0; k < REIMS_VGPU_DIRTY_FGSLOTS_MAX; k++) {
         d->fjob[k].chunks = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyChunk));
@@ -4984,7 +4991,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
     reims_vgpu_dirty_query_footprint(d, qticket, (const ReimsVgpuDirtyChunk *)chunks->data,
                                      chunks->len);
     slot = -1;
-    if (fg && d->fgslots && d->od_split && d->od_nworkers > 0 && walked_pages >= 4096) {
+    if (fg && d->fgslots && d->od_split && d->od_nworkers > 0 && walked_pages >= d->fg_split_min) {
         /* Lab DIRTY_FGSLOTS: a free foreground job, else the batch's, else alone. */
         for (i = 0; i < (int)d->fgslots; i++) {
             if (!d->fjob[i].busy) {
@@ -5030,7 +5037,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
         d->lab_fg_split++;   /* TEMP lab (FGTRACE) */
         d->lab_fg_split_slot++;
         qemu_mutex_unlock(&d->lock);
-    } else if (d->od_split && d->od_nworkers > 0 && walked_pages >= 4096 &&
+    } else if (d->od_split && d->od_nworkers > 0 && walked_pages >= d->fg_split_min &&
         !d->split_busy && (fg || !d->bigsplit_mode)) {
         /* The pieces carry their own tickets; this one has queried nothing. */
         if (!d->od_nopticket) {
@@ -5060,7 +5067,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
         bool tb = d->ticket_batch && qticket && !d->rsettle_mode &&
                   chunks->len > d->ticket_batch;   /* TEMP lab DIRTY_TICKET_BATCH */
 
-        if (fg && walked_pages >= 4096) {
+        if (fg && walked_pages >= d->fg_split_min) {
             d->lab_fg_big_alone++;   /* TEMP lab: a large foreground sync not split */
         }
         lk_split = get_clock() - lk_t;
@@ -5570,6 +5577,8 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
         /* Opt-in: n170 +8 % glass, n172 -2 % (PSTAMP=off 87.6 / 101.6 against 97.7 / 87.1) — noise. */
         d->pstamp = getenv("REIMS_VGPU_LAB_DIRTY_PSTAMP") &&   /* lab A/B */
                     strcmp(getenv("REIMS_VGPU_LAB_DIRTY_PSTAMP"), "on") == 0;
+        d->fg_split_min = getenv("REIMS_VGPU_LAB_DIRTY_FG_SPLIT_MIN") ?   /* lab A/B */
+                          MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_FG_SPLIT_MIN"))) : 4096;
         d->ticket_batch = getenv("REIMS_VGPU_LAB_DIRTY_TICKET_BATCH") ?   /* lab A/B */
                           MAX(0, atoi(getenv("REIMS_VGPU_LAB_DIRTY_TICKET_BATCH"))) : 0;
         d->settle_skip = !(getenv("REIMS_VGPU_LAB_DIRTY_SETTLE_SKIP") &&   /* lab A/B */
