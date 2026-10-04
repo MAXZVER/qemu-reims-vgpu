@@ -445,11 +445,15 @@ int whpx_wp_remap(uint64_t gpa, uint64_t size, bool writable)
 }
 
 /*
- * TEMP (lab, n128): REIMS_VGPU_LAB_RAM_POPULATE=on asks the hypervisor to fill
- * in its second-level translation for a freshly mapped stretch of guest RAM
- * at once (WHvAdviseGpaRange Populate), instead of one exit per page on the
- * guest's first touch (~7.5 us a page measured in the guest, n126; host-side
- * prealloc did not change it). Big RAM sections only; one line per call.
+ * TEMP (lab, n128): the hypervisor fills in its second-level translation for a
+ * freshly mapped stretch of guest RAM at once (WHvAdviseGpaRange Populate),
+ * instead of one exit per page on the guest's first touch. On by default with
+ * whpx_lab_resident below (hq031, AMD, 40 GB guest, guest dd faulting in 1 GiB
+ * of pages it never touched since boot: 15.3 us a page without, 1.7 us with
+ * both; 0.8 us for pages it had touched). Alone it does not last: n128/hq028
+ * populated without locking and Windows trimmed the pages back out, 9.2 us a
+ * page on 24 GB. REIMS_VGPU_LAB_RAM_POPULATE=off turns it off. Big RAM
+ * sections only; one line per call.
  */
 static void whpx_lab_populate(uint64_t gpa, uint64_t size, bool ram)
 {
@@ -461,7 +465,7 @@ static void whpx_lab_populate(uint64_t gpa, uint64_t size, bool ram)
 
     if (on < 0) {
         const char *e = getenv("REIMS_VGPU_LAB_RAM_POPULATE");
-        on = e && strcmp(e, "on") == 0;
+        on = !(e && strcmp(e, "off") == 0);
     }
     if (!on || !ram || size < (64ULL << 20) || !whp_dispatch.WHvAdviseGpaRange) {
         return;
@@ -474,6 +478,46 @@ static void whpx_lab_populate(uint64_t gpa, uint64_t size, bool ram)
     fprintf(stderr, "reims-lab: populate gpa=0x%" PRIx64 " size_mb=%" PRIu64
             " hr=0x%lx ms=%" PRId64 "\n", gpa, size >> 20, hr,
             (get_clock() - t0) / 1000000);
+}
+
+/*
+ * TEMP (lab, REIMS_VGPU_LAB_RAM_RESIDENT): guest RAM kept resident in this process. The guest touches its
+ * RAM through the hypervisor's second-level translation, which Windows' working-set aging does not see, so it
+ * trims guest RAM out of QEMU's working set as if unused (AMD host, 49 GB free: working set 2.27 GB of 12.88 GB
+ * private) and every page the guest takes back - zeroing a new surface - is a fault back in on the host. Full-
+ * screen transitions wire ~400 MB of fresh surfaces each, at 2.3 us a page with 12 GB of guest RAM and 9 us with
+ * 24 GB (hq024-hq028). A hard working-set minimum covering guest RAM (SeIncreaseWorkingSetPrivilege, which
+ * ordinary users hold) and VirtualLock of each big RAM section keep it in. One line per section.
+ * On by default (hq030: 12 GB guest 2.1 -> 1.6 us a page; with whpx_lab_populate it is what makes a 40-48 GB
+ * guest's fresh pages cheap, hq031); REIMS_VGPU_LAB_RAM_RESIDENT=off turns it off. A host that cannot hold the
+ * minimum (another big VM already locked) refuses it and the section stays ordinary (set=0 in the line).
+ */
+static void whpx_lab_resident(void *mem, uint64_t size, bool ram)
+{
+    static int on = -1;
+    static uint64_t locked;
+    SIZE_T cur_min = 0, cur_max = 0, want;
+    BOOL set, lk;
+    int64_t t0;
+
+    if (on < 0) {
+        const char *e = getenv("REIMS_VGPU_LAB_RAM_RESIDENT");
+        on = !(e && strcmp(e, "off") == 0);
+    }
+    if (!on || !ram || size < (64ULL << 20)) {
+        return;
+    }
+    t0 = get_clock();
+    GetProcessWorkingSetSize(GetCurrentProcess(), &cur_min, &cur_max);
+    locked += size;
+    want = (SIZE_T)(locked + (1ULL << 30));   /* guest RAM so far, plus 1 GiB for QEMU's own pages */
+    set = SetProcessWorkingSetSizeEx(GetCurrentProcess(), MAX(want, cur_min), MAX(want * 2, cur_max),
+                                     QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+    DWORD set_err = set ? 0 : GetLastError();
+    lk = set && VirtualLock(mem, size);
+    fprintf(stderr, "reims-lab: resident size_mb=%" PRIu64 " ws_min_mb=%" PRIu64 " set=%d err=%lu lock=%d "
+            "lock_err=%lu ms=%" PRId64 "\n", size >> 20, (uint64_t)want >> 20, set, set_err, lk,
+            lk ? 0UL : GetLastError(), (get_clock() - t0) / 1000000);
 }
 
 static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
@@ -541,6 +585,7 @@ static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
                                          WHvMapGpaRangeFlagTrackDirtyPages);
         if (SUCCEEDED(hr)) {
             whpx_lab_populate(gva, size, writable && memory_region_is_ram(area));
+            whpx_lab_resident(mem, size, writable && memory_region_is_ram(area));
             return;
         }
         whpx_dirty_tracking_disable("tracked mapping refused", hr);
@@ -553,6 +598,7 @@ static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
         abort();
     }
     whpx_lab_populate(gva, size, writable && memory_region_is_ram(area));
+    whpx_lab_resident(mem, size, writable && memory_region_is_ram(area));
 }
 
 static void whpx_region_add(MemoryListener *listener,

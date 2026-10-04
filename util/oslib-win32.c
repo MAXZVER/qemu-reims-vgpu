@@ -35,6 +35,7 @@
 #include "qemu/sockets.h"
 #include "qemu/cutils.h"
 #include "qemu/error-report.h"
+#include "qemu/timer.h"
 #include <malloc.h>
 
 static int get_allocation_granularity(void)
@@ -43,6 +44,53 @@ static int get_allocation_granularity(void)
 
     GetSystemInfo(&system_info);
     return system_info.dwAllocationGranularity;
+}
+
+/*
+ * TEMP (lab): REIMS_VGPU_LAB_RAM_LARGE=on backs each guest RAM block of 1 GiB or more with large pages. Guest
+ * RAM then sits in the hypervisor's second-level tables as 2 MiB mappings (one walk and one TLB entry per 2 MiB
+ * instead of per 4 KiB) and is never trimmed out of the working set (large pages are not pageable). Needs the
+ * account's "Lock pages in memory" right (SeLockMemoryPrivilege), which this only enables in the process token;
+ * without it, or without enough contiguous free memory, the block falls back to ordinary pages. One line a block.
+ */
+static void *qemu_lab_large_ram_alloc(size_t size)
+{
+    static int on = -1;
+    static bool priv;
+    SIZE_T large = GetLargePageMinimum();
+    size_t want;
+    int64_t t0;
+    void *ptr;
+    DWORD err;
+
+    if (on < 0) {
+        const char *e = getenv("REIMS_VGPU_LAB_RAM_LARGE");
+        HANDLE tok;
+
+        on = e && strcmp(e, "on") == 0;
+        if (on && OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) {
+            TOKEN_PRIVILEGES tp = { .PrivilegeCount = 1 };
+
+            if (LookupPrivilegeValueA(NULL, "SeLockMemoryPrivilege", &tp.Privileges[0].Luid)) {
+                tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                /* Succeeds with ERROR_NOT_ALL_ASSIGNED when the account does not hold the right. */
+                priv = AdjustTokenPrivileges(tok, FALSE, &tp, 0, NULL, NULL) &&
+                       GetLastError() == ERROR_SUCCESS;
+            }
+            CloseHandle(tok);
+        }
+    }
+    if (!on || size < (1ULL << 30) || large == 0) {
+        return NULL;
+    }
+    want = ROUND_UP(size, large);
+    t0 = get_clock();
+    ptr = priv ? VirtualAlloc(NULL, want, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE) : NULL;
+    err = ptr ? 0 : GetLastError();
+    fprintf(stderr, "reims-lab: large-page RAM size_mb=%zu page_kb=%zu priv=%d ok=%d err=%lu ms=%" PRId64 "\n",
+            size >> 20, (size_t)(large >> 10), priv, ptr != NULL, priv ? err : 1314UL,
+            (get_clock() - t0) / 1000000);
+    return ptr;
 }
 
 void *qemu_anon_ram_alloc(size_t size, uint64_t *align, bool shared,
@@ -59,7 +107,10 @@ void *qemu_anon_ram_alloc(size_t size, uint64_t *align, bool shared,
         return NULL;
     }
 
-    ptr = VirtualAlloc(NULL, size, MEM_COMMIT, PAGE_READWRITE);
+    ptr = qemu_lab_large_ram_alloc(size);
+    if (!ptr) {
+        ptr = VirtualAlloc(NULL, size, MEM_COMMIT, PAGE_READWRITE);
+    }
     trace_qemu_anon_ram_alloc(size, ptr);
 
     if (ptr && align) {
