@@ -138,6 +138,15 @@ typedef struct ReimsVgpuDirtySet {
     uint32_t wp_streak;
     uint32_t wp_lost;
     uint32_t wp_holes;      /* TEMP lab DIRTY_WP_HOLE: pages faults opened since the set was last whole */
+    /*
+     * Lab DIRTY_WP_CALM: when the set was tracked and how many runs it spans (a protection costs a
+     * remap per run, and as many again when it is given back), and whether its token is on
+     * `wp_list` — written under `lock` as well as `wp_mutex`, so an untrack that reads it under
+     * `lock` knows whether the WP step may still be holding the set.
+     */
+    int64_t born_ns;
+    uint32_t nruns;
+    bool wp_listed;
     uint32_t lab_fg_n;      /* TEMP lab: foreground syncs since the last fgtop line */
     /*
      * Lab DIRTY_HASH: a set scattered over many runs of guest RAM is brought up to date by
@@ -799,6 +808,31 @@ struct ReimsVgpuDirty {
     uint64_t lab_wp_holed, lab_wp_heal_queued, lab_wp_heals, lab_wp_heal_skipped, lab_wp_hole_drops;
     uint64_t lab_wp_lost, lab_wp_dropped, lab_wp_remap_ns, lab_wp_pause_ns, lab_wp_pause_max_ns;
     /*
+     * Lab DIRTY_WP_CALM (on unless =off). Full-screen transitions create 5K surfaces scattered over
+     * ~2 000 runs that live a few seconds; protecting one cost a remap per run (~0.35 ms) and giving
+     * it back as much again (n185 fsz0: 30.8k remaps, 11.9 s of them, in 80 s of scenario), while
+     * the step held `wp_mutex` across 32 runs and vCPU store faults and the drain's untracks waited
+     * for it (43 % of the drain's map/unmap handling). Calm: a set is queued only once it has lived
+     * longer than its protection costs; the step lets a waiting fault in between the runs it gives
+     * back; and an untrack of a set still on `wp_list` hands the set to the step (`wp_dead`) instead
+     * of waiting for `wp_mutex`. (A fault still opens only its page: see the fault hook.)
+     */
+    bool wp_calm;
+    /*
+     * Lab DIRTY_HASH_DUE (opt-in, =on): the background hashes a hashed set when its next read is
+     * due — 4 doorbells from its shortest recent read gap past its last read — instead of at every
+     * doorbell for the 4 doorbells right after any read. A set read once a frame (~5 doorbells
+     * apart) was hashed up to 4 times for nothing and then, outside the window by its next read,
+     * hashed again on the drain; n185: 210-224 s of hashing a boot (~1 core, ~9 GB/s), 20 s of it
+     * on the drain. Without a gap history the 4-doorbell window stays.
+     */
+    bool hash_due;
+    uint64_t lab_hash_due_skipped;
+    uint32_t wp_age_ms, wp_age_run_us;   /* the age floor and its share per run (DIRTY_WP_AGE_MS) */
+    GPtrArray *wp_dead;           /* untracked sets still on `wp_list`, for the step (under `lock`) */
+    int wp_waiters;               /* store faults waiting for `wp_mutex` (atomic) */
+    uint64_t lab_wp_young, lab_wp_dead, lab_wp_yields;
+    /*
      * REIMS_VGPU_LAB_DIRTY_PERIOD=on: a set of at least `period_big` pages joins
      * a prefetch batch only when the batch's epoch is at least its shortest
      * recent read gap past its last read. A set read once a frame spans ~3
@@ -1329,6 +1363,11 @@ uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
     s->arm_at = d->harvests + 1;
     s->seen_seq = d->global_seq;
     s->lab_created_epoch = d->epoch;   /* TEMP lab (FGTRACE) */
+    s->born_ns = get_clock();          /* lab DIRTY_WP_CALM */
+    s->nruns = n ? 1 : 0;
+    for (i = 1; i < n; i++) {
+        s->nruns += pages[i] != pages[i - 1] + page_size;
+    }
     /*
      * TEMP lab REIMS_VGPU_LAB_DIRTY_HOT_NEW=on: a new set counts as read this
      * epoch, so the next prefetch arms it on a worker instead of the drain's
@@ -1574,6 +1613,67 @@ static void reims_vgpu_dirty_wp_orphan(ReimsVgpuDirty *d, const ReimsVgpuDirtySe
     }
 }
 
+/* Lab DIRTY_WP_CALM: how long a set must have lived before protecting it is worth its remaps. */
+static int64_t reims_vgpu_dirty_wp_age_need(const ReimsVgpuDirty *d, const ReimsVgpuDirtySet *s)
+{
+    return (int64_t)d->wp_age_ms * SCALE_MS + (int64_t)d->wp_age_run_us * s->nruns * SCALE_US;
+}
+
+/*
+ * Lab DIRTY_WP_CALM: untracked sets the drain left on `wp_list` — their read-only runs become
+ * orphans, then the sets are freed. `wp_mutex` held, `lock` not.
+ */
+static void reims_vgpu_dirty_wp_bury(ReimsVgpuDirty *d)
+{
+    GPtrArray *dead;
+    guint k, i;
+
+    qemu_mutex_lock(&d->lock);
+    if (!d->wp_dead->len) {
+        qemu_mutex_unlock(&d->lock);
+        return;
+    }
+    dead = d->wp_dead;
+    d->wp_dead = g_ptr_array_new();
+    qemu_mutex_unlock(&d->lock);
+    for (k = 0; k < dead->len; k++) {
+        ReimsVgpuDirtySet *ds = g_ptr_array_index(dead, k);
+
+        for (i = 0; i < d->wp_list->len; i++) {
+            if (g_array_index(d->wp_list, uint64_t, i) == ds->token) {
+                g_array_remove_index_fast(d->wp_list, i);
+                break;
+            }
+        }
+        if (d->wp_cur == ds->token) {
+            d->wp_cur = 0;
+        }
+        reims_vgpu_dirty_wp_orphan(d, ds);
+        reims_vgpu_dirty_wp_holes_clear(d, ds);   /* TEMP lab DIRTY_WP_HOLE */
+        call_rcu(ds, reims_vgpu_dirty_set_free_rcu, rcu);
+    }
+    g_ptr_array_free(dead, TRUE);
+}
+
+/*
+ * Lab DIRTY_WP_CALM: give `wp_mutex` up for a store fault waiting on it (the lock lets its holder
+ * take it straight back, so a plain unlock and lock lets nobody in). `wp_mutex` held.
+ */
+static void reims_vgpu_dirty_wp_yield(ReimsVgpuDirty *d)
+{
+    int spins;
+
+    if (!qatomic_read(&d->wp_waiters)) {
+        return;
+    }
+    d->lab_wp_yields++;
+    qemu_mutex_unlock(&d->wp_mutex);
+    for (spins = 0; qatomic_read(&d->wp_waiters) && spins < 200; spins++) {
+        g_usleep(10);
+    }
+    qemu_mutex_lock(&d->wp_mutex);
+}
+
 /*
  * vCPU thread, a store exit at `gpa` (whpx_handle_mmio). The set holding the page stops being
  * protected (reads stop trusting it before anything is writable); only the page is made writable
@@ -1587,7 +1687,9 @@ static bool reims_vgpu_dirty_wp_fault(uint64_t gpa)
     if (!d || !qatomic_read(&d->wp_bits) || !reims_vgpu_dirty_wp_ro(d, gpa)) {
         return false;
     }
+    qatomic_inc(&d->wp_waiters);
     qemu_mutex_lock(&d->wp_mutex);
+    qatomic_dec(&d->wp_waiters);
     if (reims_vgpu_dirty_wp_ro(d, gpa)) {
         for (i = 0; i < d->wp_list->len; i++) {
             uint64_t token = g_array_index(d->wp_list, uint64_t, i);
@@ -1643,6 +1745,11 @@ static bool reims_vgpu_dirty_wp_fault(uint64_t gpa)
                 break;   /* protected sets never share a page without holes */
             }
         }
+        /*
+         * Only the page, also under DIRTY_WP_CALM: a whole run made writable here would open pages a
+         * concurrent sync is leaving out of its query as read-only (RO_SKIP) while the guest is
+         * storing into that very region — the stress gate's wp_hole rows lost writes that way.
+         */
         reims_vgpu_dirty_wp_remap(d, gpa & ~(uint64_t)4095, 4096, true);
     }
     d->lab_wp_faults++;
@@ -1678,6 +1785,11 @@ static void reims_vgpu_dirty_wp_invalidate(void)
         if (s && d->wp_bits) {
             reims_vgpu_dirty_wp_orphan(d, s);
             reims_vgpu_dirty_wp_holes_clear(d, s);   /* TEMP lab DIRTY_WP_HOLE */
+        }
+        if (s) {
+            qemu_mutex_lock(&d->lock);
+            s->wp_listed = false;   /* lab DIRTY_WP_CALM: an untrack may free it from here on */
+            qemu_mutex_unlock(&d->lock);
         }
     }
     g_array_set_size(d->wp_list, 0);
@@ -1766,6 +1878,7 @@ static bool reims_vgpu_dirty_wp_pick_hot(ReimsVgpuDirty *d)
             }
             c->wp_state = WP_PROTECTING;
             c->wp_next = 0;
+            c->wp_listed = true;
             d->wp_cur = token;
             g_array_append_val(d->wp_list, token);
         }
@@ -1803,6 +1916,7 @@ static bool reims_vgpu_dirty_wp_pick(ReimsVgpuDirty *d)
         } else {
             c->wp_state = WP_PROTECTING;
             c->wp_next = 0;
+            c->wp_listed = true;
             d->wp_cur = token;
             g_array_append_val(d->wp_list, token);
         }
@@ -2106,11 +2220,17 @@ static bool reims_vgpu_dirty_wp_step(ReimsVgpuDirty *d)
         }
     }
     qemu_mutex_lock(&d->wp_mutex);
+    if (d->wp_calm) {
+        reims_vgpu_dirty_wp_bury(d);   /* lab DIRTY_WP_CALM */
+    }
     while (budget > 0 && d->wp_orphans->len) {
         ReimsVgpuDirtyRun r = g_array_index(d->wp_orphans, ReimsVgpuDirtyRun, d->wp_orphans->len - 1);
 
         g_array_set_size(d->wp_orphans, d->wp_orphans->len - 1);
         reims_vgpu_dirty_wp_release(d, r.gpa, r.gpa + r.size, &budget);
+        if (d->wp_calm) {
+            reims_vgpu_dirty_wp_yield(d);   /* a fault waits for one run, not 32 */
+        }
     }
     for (i = 0; i < d->wp_list->len && budget > 0;) {
         uint64_t token = g_array_index(d->wp_list, uint64_t, i);
@@ -2133,6 +2253,31 @@ static bool reims_vgpu_dirty_wp_step(ReimsVgpuDirty *d)
 
             reims_vgpu_dirty_wp_release(d, s->pages[s->wp_next], end, &budget);
             s->wp_next = q;
+            if (d->wp_calm && qatomic_read(&d->wp_waiters)) {
+                /*
+                 * Lab DIRTY_WP_CALM: let the fault in; the list may be emptied meanwhile (an
+                 * invalidate) and the set then freed by an untrack, so both are looked up again.
+                 */
+                reims_vgpu_dirty_wp_yield(d);
+                if (i >= d->wp_list->len || g_array_index(d->wp_list, uint64_t, i) != token) {
+                    s = NULL;
+                    break;
+                }
+                qemu_mutex_lock(&d->lock);
+                s = g_hash_table_lookup(d->sets, &token);
+                qemu_mutex_unlock(&d->lock);
+                if (!s || s->wp_state != WP_DROPPING) {
+                    break;
+                }
+            }
+        }
+        if (!s) {
+            i = 0;   /* the list changed under the yield: look again from the start */
+            continue;
+        }
+        if (s->wp_state != WP_DROPPING) {
+            i++;
+            continue;
         }
         if (s->wp_next >= s->count) {
             qemu_mutex_lock(&d->lock);
@@ -2140,6 +2285,9 @@ static bool reims_vgpu_dirty_wp_step(ReimsVgpuDirty *d)
             s->wp_holes = 0;
             qemu_mutex_unlock(&d->lock);
             reims_vgpu_dirty_wp_holes_clear(d, s);   /* TEMP lab DIRTY_WP_HOLE */
+            qemu_mutex_lock(&d->lock);
+            s->wp_listed = false;   /* lab DIRTY_WP_CALM: not touched again below */
+            qemu_mutex_unlock(&d->lock);
             g_array_remove_index_fast(d->wp_list, i);
             d->lab_wp_dropped++;
             continue;
@@ -2262,10 +2410,12 @@ static void reims_vgpu_dirty_wp_bh(void *opaque)
 
 void reims_vgpu_dirty_untrack(ReimsVgpuDirty *d, uint64_t token)
 {
+    bool bury = false;
+
     if (!d || token == 0) {
         return;
     }
-    if (d->wp_list) {   /* lab DIRTY_WP: its read-only runs outlive it, the step makes them writable */
+    if (d->wp_list && !d->wp_calm) {   /* lab DIRTY_WP: its read-only runs outlive it, the step makes them writable */
         guint i;
 
         qemu_mutex_lock(&d->wp_mutex);
@@ -2324,11 +2474,24 @@ void reims_vgpu_dirty_untrack(ReimsVgpuDirty *d, uint64_t token)
             }
             g_free(okey);
             d->lab_hash_sets -= ((ReimsVgpuDirtySet *)oval)->hash != NULL;   /* lab DIRTY_HASH */
-            call_rcu((ReimsVgpuDirtySet *)oval, reims_vgpu_dirty_set_free_rcu, rcu);
+            if (d->wp_calm && d->wp_dead && ((ReimsVgpuDirtySet *)oval)->wp_listed) {
+                /*
+                 * Lab DIRTY_WP_CALM: the WP step may be holding it; it orphans the set's read-only
+                 * runs and frees it. Unpublished already, so no reader or fault finds it again.
+                 */
+                g_ptr_array_add(d->wp_dead, oval);
+                d->lab_wp_dead++;
+                bury = true;
+            } else {
+                call_rcu((ReimsVgpuDirtySet *)oval, reims_vgpu_dirty_set_free_rcu, rcu);
+            }
         }
     }
     qemu_mutex_unlock(&d->sets_lock);
     qemu_mutex_unlock(&d->lock);
+    if (bury) {
+        REIMS_WP_BH_SCHEDULE(d->wp_bh);
+    }
 }
 
 
@@ -2664,7 +2827,7 @@ static inline void reims_vgpu_dirty_note_read_epoch(ReimsVgpuDirty *d,
     uint64_t last;
 
     reims_vgpu_dirty_note_read_chan(d, s);
-    if (!d->period_mode || needed == 0) {
+    if ((!d->period_mode && !(d->hash_due && s->hash)) || needed == 0) {
         return;
     }
     last = qatomic_read(&s->rd_epoch);
@@ -2700,6 +2863,31 @@ static bool reims_vgpu_dirty_period_due(const ReimsVgpuDirtySet *s, uint64_t epo
         }
     }
     return epoch >= last + floor;
+}
+
+/*
+ * Lab DIRTY_HASH_DUE: whether the background should hash `s` for `epoch`: the old window's width
+ * (REIMS_VGPU_DIRTY_HASH_HOT doorbells), starting at its shortest recent read gap past its last
+ * read. `-1` when it has no history (the caller keeps the window right after the read then).
+ * n188: a window reaching twice the longest gap hashed rarely read sets for up to ~500 doorbells
+ * in a row — twice the hashing of the old window.
+ */
+static int reims_vgpu_dirty_hash_due(const ReimsVgpuDirtySet *s, uint64_t epoch)
+{
+    uint32_t gaps = qatomic_read(&s->rd_gaps), lo = 255, g;
+    uint64_t last = qatomic_read(&s->rd_epoch);
+    int k;
+
+    if (gaps == 0 || last == 0) {
+        return -1;
+    }
+    for (k = 0; k < 4; k++) {
+        g = (gaps >> (8 * k)) & 0xff;
+        if (g) {
+            lo = MIN(lo, g);
+        }
+    }
+    return epoch >= last + lo && epoch < last + lo + REIMS_VGPU_DIRTY_HASH_HOT;
 }
 
 static void reims_vgpu_dirty_gen_hit(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
@@ -3633,12 +3821,16 @@ static bool reims_vgpu_dirty_eval_set(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
          * were 5K surfaces clean for 5 300 syncs in a row and never protected.
          */
         if (s->wp_streak == need ||
-            (d->wp_retry && s->wp_streak > need && (s->wp_streak - need) % need == 0)) {
-            if (s->wp_streak != need) {
-                d->lab_wp_requeued++;
+            ((d->wp_retry || d->wp_calm) && s->wp_streak > need && (s->wp_streak - need) % need == 0)) {
+            if (d->wp_calm && get_clock() - s->born_ns < reims_vgpu_dirty_wp_age_need(d, s)) {
+                d->lab_wp_young++;   /* lab DIRTY_WP_CALM: asked again `need` clean syncs later */
+            } else {
+                if (s->wp_streak != need) {
+                    d->lab_wp_requeued++;
+                }
+                g_array_append_val(d->wp_queue, s->token);
+                REIMS_WP_BH_SCHEDULE(d->wp_bh);
             }
-            g_array_append_val(d->wp_queue, s->token);
-            REIMS_WP_BH_SCHEDULE(d->wp_bh);
         }
     } else if (d->wp_hole && d->wp_active && !by_harvest && s->wp_state == WP_HOLED) {
         /* TEMP lab DIRTY_WP_HOLE: the heal's streak, doubled per fault up to 8x. */
@@ -5592,7 +5784,8 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                         " rej_state=%" PRIu64 " rej_gen=%" PRIu64 " rej_bits=%" PRIu64
                         " rej_ro=%" PRIu64 " requeued=%" PRIu64 " ro_skipped=%" PRIu64
                         " hole=%u holed=%" PRIu64 " heal_queued=%" PRIu64 " heals=%" PRIu64
-                        " heal_skipped=%" PRIu64 " hole_drops=%" PRIu64 "\n",
+                        " heal_skipped=%" PRIu64 " hole_drops=%" PRIu64 " calm=%u young=%" PRIu64
+                        " dead=%" PRIu64 " yields=%" PRIu64 "\n",
                         d->wp_active, d->wp_list ? d->wp_list->len : 0, d->wp_cur != 0,
                         d->lab_wp_protects, d->lab_wp_chunks, d->lab_wp_faults, d->lab_wp_lost,
                         d->lab_wp_dropped, d->wp_orphans ? d->wp_orphans->len : 0, d->lab_wp_remaps,
@@ -5601,7 +5794,9 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                         d->lab_wp_rej_state, d->lab_wp_rej_gen, d->lab_wp_rej_bits, d->lab_wp_rej_ro,
                         d->lab_wp_requeued, qatomic_xchg(&d->lab_ro_skipped, 0), d->wp_hole,
                         d->lab_wp_holed, d->lab_wp_heal_queued, d->lab_wp_heals,
-                        d->lab_wp_heal_skipped, d->lab_wp_hole_drops);
+                        d->lab_wp_heal_skipped, d->lab_wp_hole_drops, d->wp_calm, d->lab_wp_young,
+                        d->lab_wp_dead, d->lab_wp_yields);
+                d->lab_wp_young = d->lab_wp_dead = d->lab_wp_yields = 0;
                 d->lab_wp_holed = d->lab_wp_heal_queued = d->lab_wp_heals = 0;
                 d->lab_wp_heal_skipped = d->lab_wp_hole_drops = 0;
                 d->lab_wp_rej_state = d->lab_wp_rej_gen = d->lab_wp_rej_bits = 0;
@@ -5902,6 +6097,8 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                      MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_HASH_NS"))) : 250;
         d->hash_max = getenv("REIMS_VGPU_LAB_DIRTY_HASH_MAX") ?
                       MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_HASH_MAX"))) : 4096;
+        d->hash_due = getenv("REIMS_VGPU_LAB_DIRTY_HASH_DUE") &&   /* opt-in until its A/B */
+                      strcmp(getenv("REIMS_VGPU_LAB_DIRTY_HASH_DUE"), "on") == 0;
         d->hash_all = getenv("REIMS_VGPU_LAB_DIRTY_HASH_ALL") &&
                       strcmp(getenv("REIMS_VGPU_LAB_DIRTY_HASH_ALL"), "on") == 0;
         /*
@@ -6019,6 +6216,16 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
             d->wp_queue = g_array_new(FALSE, FALSE, sizeof(uint64_t));
             d->wp_list = g_array_new(FALSE, FALSE, sizeof(uint64_t));
             d->wp_orphans = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyRun));
+            d->wp_dead = g_ptr_array_new();
+            d->wp_calm = !(getenv("REIMS_VGPU_LAB_DIRTY_WP_CALM") &&
+                           strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_CALM"), "off") == 0);
+            /* 1 s plus 2 ms a run (its protect and give-back cost ~0.7 ms); the stress rows use 0. */
+            d->wp_age_ms = 1000;
+            d->wp_age_run_us = 2000;
+            if (getenv("REIMS_VGPU_LAB_DIRTY_WP_AGE_MS")) {
+                d->wp_age_ms = atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_AGE_MS"));
+                d->wp_age_run_us = 0;
+            }
             if (d->wp_mode) {
 #ifndef REIMS_DIRTY_STRESS
                 d->wp_timer = timer_new_ms(QEMU_CLOCK_REALTIME, reims_vgpu_dirty_wp_bh, d);
@@ -6624,12 +6831,13 @@ static void reims_vgpu_dirty_hash_report(ReimsVgpuDirty *d)
     d->lab_hash_last = now;
     fprintf(stderr, "reims-dirty-hash sets=%" PRIu64 " syncs=%" PRIu64 " pages=%" PRIu64
             " us=%" PRIu64 " dirty=%" PRIu64 " fg=%" PRIu64 " fg_us=%" PRIu64
-            " waits=%" PRIu64 " noram=%" PRIu64 " pf=%" PRIu64 " split=%" PRIu64 " helped=%" PRIu64 "\n",
+            " waits=%" PRIu64 " noram=%" PRIu64 " pf=%" PRIu64 " split=%" PRIu64 " helped=%" PRIu64
+            " due_skipped=%" PRIu64 "\n",
             d->lab_hash_sets, d->lab_hash_syncs, d->lab_hash_pages,
             d->lab_hash_ns / 1000, d->lab_hash_dirty, d->lab_hash_fg,
             d->lab_hash_fg_ns / 1000, d->lab_hash_waits, qatomic_read(&d->lab_hash_noram),
-            d->lab_hash_pf, d->lab_hash_split, d->lab_hash_split_helped);
-    d->lab_hash_split = d->lab_hash_split_helped = 0;
+            d->lab_hash_pf, d->lab_hash_split, d->lab_hash_split_helped, d->lab_hash_due_skipped);
+    d->lab_hash_split = d->lab_hash_split_helped = d->lab_hash_due_skipped = 0;
     d->lab_hash_syncs = d->lab_hash_pages = d->lab_hash_ns = d->lab_hash_dirty = 0;
     d->lab_hash_fg = d->lab_hash_fg_ns = d->lab_hash_waits = d->lab_hash_pf = 0;
     qatomic_set(&d->lab_hash_noram, 0);
@@ -6683,11 +6891,17 @@ void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
                  * page, and n177 hashed 2 TB a boot (13 GB/s, ~1.7 cores) re-hashing sets read
                  * frames ago at every doorbell. A colder set is hashed by its next read instead.
                  */
-                if (set->synced_epoch < epoch &&
-                    set->last_query_epoch + REIMS_VGPU_DIRTY_HASH_HOT >= epoch) {
-                    ReimsVgpuDirtyOrdered ho = { set->read_order, *(uint64_t *)key };
+                if (set->synced_epoch < epoch) {
+                    int due = d->hash_due ? reims_vgpu_dirty_hash_due(set, epoch) : -1;
 
-                    g_array_append_val(hot_ord, ho);
+                    if (due < 0 ? set->last_query_epoch + REIMS_VGPU_DIRTY_HASH_HOT >= epoch
+                                : due > 0) {
+                        ReimsVgpuDirtyOrdered ho = { set->read_order, *(uint64_t *)key };
+
+                        g_array_append_val(hot_ord, ho);
+                    } else if (due == 0 && set->last_query_epoch + REIMS_VGPU_DIRTY_HASH_HOT >= epoch) {
+                        d->lab_hash_due_skipped++;   /* the old window would have hashed it */
+                    }
                 }
                 continue;
             }
