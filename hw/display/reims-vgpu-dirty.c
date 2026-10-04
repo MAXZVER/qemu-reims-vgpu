@@ -139,6 +139,22 @@ typedef struct ReimsVgpuDirtySet {
     uint32_t wp_lost;
     uint32_t wp_holes;      /* TEMP lab DIRTY_WP_HOLE: pages faults opened since the set was last whole */
     uint32_t lab_fg_n;      /* TEMP lab: foreground syncs since the last fgtop line */
+    /*
+     * Lab DIRTY_HASH: a set scattered over many runs of guest RAM is brought up to date by
+     * hashing each page's content and comparing with the hash its last sync took, instead of
+     * hypervisor queries: a query costs a call per run plus every page of the gaps it bridges, a
+     * hash costs the set's own bytes. fgt-glass (n166): 98k of 133k foreground syncs were
+     * 129-256-page sets at ~736 us each (2.9 us per page), 2.6 % of them written; a hash of 1 MiB
+     * is ~60-100 us and needs no ticket and no settle. NULL: a set the hypervisor answers for.
+     *
+     * Hashes see content, not stores, so a store of the bytes a page already held is not a write
+     * here; nothing downstream can tell the two apart, since what a reader re-gathers would be the
+     * same bytes. `hash` is touched only by the sync holding `hash_busy` (under `lock`), with
+     * `hash_base` set once it holds a baseline.
+     */
+    uint64_t *hash;
+    bool hash_base;
+    bool hash_busy;
 } ReimsVgpuDirtySet;
 
 /*
@@ -415,6 +431,21 @@ struct ReimsVgpuDirty {
      * the All scope every read is bit 63 and the batch is what it was.
      */
     bool chan_prefetch;
+    /*
+     * Lab REIMS_VGPU_LAB_DIRTY_HASH=on (see `hash` in ReimsVgpuDirtySet): which sets are hashed is
+     * decided at track by a cost model — the hypervisor's (calls x 5 us + walked pages x 26 ns,
+     * the gap bridge included) against `hash_ns` per own page — for sets of at most `hash_max`
+     * target pages (REIMS_VGPU_LAB_DIRTY_HASH_NS, _MAX; _ALL=on hashes every set up to the max,
+     * for the stress harness). A hashed set never enters a prefetch batch, a harvest or a merged
+     * sync: its generation moves only on what its own hashes show.
+     */
+    bool hash_mode;
+    bool hash_all;
+    uint32_t hash_ns;
+    uint64_t hash_max;
+    uint64_t lab_hash_sets, lab_hash_syncs, lab_hash_pages, lab_hash_ns, lab_hash_dirty;
+    uint64_t lab_hash_waits, lab_hash_noram, lab_hash_fg, lab_hash_fg_ns, lab_hash_pf;
+    int64_t lab_hash_last;
     uint32_t work_chan;             /* channel of the drain's work scope; 63 = All */
     uint64_t db_chans;              /* channels rung since the last batch took them; bit 63 = unnamed */
     uint64_t lab_cpf_taken, lab_cpf_skipped;
@@ -901,6 +932,7 @@ static void reims_vgpu_dirty_set_free(gpointer p)
 
     g_free(s->pages);
     g_free(s->page_gen);
+    g_free(s->hash);
     g_free(s);
 }
 
@@ -1141,6 +1173,69 @@ static int reims_vgpu_dirty_cmp_written(gconstpointer a, gconstpointer b)
     return x->page_size > y->page_size ? -1 : (x->page_size < y->page_size);
 }
 
+/* Lab DIRTY_HASH ------------------------------------------------------- */
+static uint64_t reims_vgpu_dirty_gap_pages(void);
+
+/*
+ * Whether a set of these (sorted, distinct) pages is cheaper to hash than to query: the
+ * hypervisor's price is a call per bridged run (runs closer than the gap bridge share one call
+ * and walk the pages between) plus every page walked; a hash's is the set's own bytes.
+ */
+static bool reims_vgpu_dirty_hash_pick(ReimsVgpuDirty *d, const uint64_t *pages, size_t n,
+                                       size_t page_size)
+{
+    const int shift = qemu_target_page_bits();
+    const uint64_t bridge = reims_vgpu_dirty_gap_pages() << shift;
+    uint64_t own = n * (page_size >> shift), walked = 0, calls = 0, start = 0, end = 0;
+    size_t i;
+
+    if (own > d->hash_max) {
+        return false;
+    }
+    if (d->hash_all) {
+        return true;
+    }
+    for (i = 0; i < n; i++) {
+        if (calls && pages[i] <= end + bridge) {
+            end = pages[i] + page_size;
+            continue;
+        }
+        if (calls) {
+            walked += (end - start) >> shift;
+        }
+        calls++;
+        start = pages[i];
+        end = pages[i] + page_size;
+    }
+    walked += (end - start) >> shift;
+    return own * d->hash_ns < calls * 5000 + walked * 26;
+}
+
+/* A 64-bit hash of `len` bytes (a multiple of 32): four independent multiply-rotate lanes. */
+static uint64_t reims_vgpu_dirty_hash_bytes(const uint8_t *p, size_t len)
+{
+    const uint64_t k1 = 0x9E3779B185EBCA87ULL, k2 = 0xC2B2AE3D27D4EB4FULL;
+    uint64_t a = k1 + k2, b = k2, c = 0, e = -k1, h;
+    size_t i;
+
+    for (i = 0; i < len; i += 32) {
+        uint64_t w[4];
+
+        memcpy(w, p + i, sizeof(w));
+        a = rol64(a + w[0] * k2, 31) * k1;
+        b = rol64(b + w[1] * k2, 31) * k1;
+        c = rol64(c + w[2] * k2, 31) * k1;
+        e = rol64(e + w[3] * k2, 31) * k1;
+    }
+    h = rol64(a, 1) + rol64(b, 7) + rol64(c, 12) + rol64(e, 18) + len;
+    h ^= h >> 33;
+    h *= k2;
+    h ^= h >> 29;
+    h *= k1;
+    h ^= h >> 32;
+    return h;
+}
+
 uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
                                 size_t count, size_t page_size)
 {
@@ -1180,6 +1275,9 @@ uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
     s->page_gen = g_new0(uint64_t, n);
     s->count = n;
     s->page_size = page_size;
+    if (qatomic_read(&d->hash_mode) && reims_vgpu_dirty_hash_pick(d, pages, n, page_size)) {
+        s->hash = g_new0(uint64_t, n);   /* lab DIRTY_HASH */
+    }
 
     qemu_mutex_lock(&d->lock);
     /*
@@ -1225,6 +1323,7 @@ uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
     token = d->next_token;
     s->token = token;   /* lab DIRTY_WP */
     d->lab_ntrack++;
+    d->lab_hash_sets += s->hash != NULL;   /* lab DIRTY_HASH */
     if (d->lab_tr) {
         ReimsVgpuLabRec r = { .t_ns = get_clock() - d->lab_t0, .token = token,
                               .needed = d->epoch, .epoch = d->epoch,
@@ -2205,6 +2304,7 @@ void reims_vgpu_dirty_untrack(ReimsVgpuDirty *d, uint64_t token)
                 reims_vgpu_dirty_tab_del(d, token);
             }
             g_free(okey);
+            d->lab_hash_sets -= ((ReimsVgpuDirtySet *)oval)->hash != NULL;   /* lab DIRTY_HASH */
             call_rcu((ReimsVgpuDirtySet *)oval, reims_vgpu_dirty_set_free_rcu, rcu);
         }
     }
@@ -4241,6 +4341,9 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
         while (g_hash_table_iter_next(&it, &key, &val)) {
             ReimsVgpuDirtySet *set = val;
 
+            if (set->hash && d->hash_mode) {
+                continue;   /* lab DIRTY_HASH: answered by its own hashes */
+            }
             reims_vgpu_dirty_eval_set(d, set, slices, n, hit, true);
             qatomic_store_release(&set->synced_epoch, MAX(set->synced_epoch, epoch));
         }
@@ -4369,7 +4472,8 @@ static bool reims_vgpu_dirty_sync_batch(ReimsVgpuDirty *d, uint64_t token)
         uint64_t off;
 
         if (set->synced_epoch >= epoch ||
-            (tk != token && set->last_query_epoch + 1 < epoch)) {
+            (tk != token && set->last_query_epoch + 1 < epoch) ||
+            (set->hash && d->hash_mode)) {   /* lab DIRTY_HASH */
             continue;
         }
         g_array_append_val(tokens, tk);
@@ -4713,6 +4817,117 @@ static size_t reims_vgpu_dirty_page_list(ReimsVgpuDirty *d, const uint64_t *spag
 }
 
 /*
+ * Lab DIRTY_HASH: bring hashed set `s` (claimed for `epoch` by the caller) up to date by comparing
+ * its pages' content hashes with those of its last sync. Called and returning with `lock` held.
+ *
+ * Every store ordered before the doorbell that opened `epoch` is in guest RAM before the hashes
+ * are taken (the doorbell is a trapping write the tracker saw first), so a page whose content
+ * moved since the previous sync shows a new hash; a store racing the walk shows now or at the next
+ * sync. One sync of a set at a time (`hash_busy`): a second, for a newer epoch, waits for it and
+ * then hashes again. A page outside guest RAM reads as written, as in an evaluation.
+ */
+static void reims_vgpu_dirty_hash_sync(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
+                                       uint64_t token, uint64_t epoch, int64_t *lab_query)
+{
+    const int shift = qemu_target_page_bits();
+    ReimsVgpuDirtySlice *slices = NULL;
+    g_autoptr(GArray) moved = NULL;
+    int cap = 0, n, si = -1;
+    int64_t t0;
+    size_t p;
+    bool base;
+
+    while (s && s->hash_busy) {
+        d->lab_hash_waits++;
+        qemu_cond_wait(&d->synced_cond, &d->lock);
+        s = g_hash_table_lookup(d->sets, &token);
+    }
+    if (!s) {
+        return;
+    }
+    if (s->synced_epoch >= epoch) {
+        /* A sync for this epoch or a newer one finished while this one waited. */
+        if (s->claim_epoch == epoch) {
+            s->claim_epoch = 0;
+        }
+        if (s->tclaim == epoch) {
+            s->tclaim = 0;
+        }
+        qemu_cond_broadcast(&d->synced_cond);
+        return;
+    }
+    s->hash_busy = true;
+    base = s->hash_base;
+    qemu_mutex_unlock(&d->lock);
+
+    t0 = get_clock();
+    moved = g_array_new(FALSE, FALSE, sizeof(size_t));
+    n = reims_vgpu_dirty_ram_slices_into(&slices, &cap);
+    rcu_read_lock();   /* the set (RCU-freed) and guest RAM stay put while hashing */
+    for (p = 0; p < s->count; p++) {
+        uint64_t gpa = s->pages[p], h;
+
+        if (si < 0 || gpa < slices[si].gpa || gpa + s->page_size > slices[si].gpa + slices[si].len) {
+            si = reims_vgpu_dirty_slice_of(slices, n, gpa);
+            if (si >= 0 && gpa + s->page_size > slices[si].gpa + slices[si].len) {
+                si = -1;   /* a page straddling two ranges: not one host mapping */
+            }
+        }
+        if (si < 0) {
+            qatomic_inc(&d->lab_hash_noram);
+            g_array_append_val(moved, p);
+            continue;
+        }
+        h = reims_vgpu_dirty_hash_bytes((const uint8_t *)memory_region_get_ram_ptr(slices[si].mr) +
+                                        slices[si].offset + (gpa - slices[si].gpa),
+                                        s->page_size);
+        if (base && h != s->hash[p]) {
+            g_array_append_val(moved, p);
+        }
+        s->hash[p] = h;
+    }
+    rcu_read_unlock();
+    g_free(slices);
+    if (lab_query) {   /* TEMP lab (FGTRACE): the hash time stands for the query */
+        *lab_query = get_clock() - t0;
+    }
+
+    qemu_mutex_lock(&d->lock);
+    s = g_hash_table_lookup(d->sets, &token);
+    if (s) {
+        guint m;
+
+        /* Stored atomically: the generation fast path reads it without `lock`. */
+        qatomic_set(&s->eval_seq, s->eval_seq + 1);   /* odd: rewriting gen and the stamps */
+        smp_wmb();
+        if (s->gen == 0) {
+            qatomic_set(&s->gen, 1);   /* the baseline: what a reader gathers from now on */
+        } else if (moved->len) {
+            qatomic_set(&s->gen, s->gen + 1);
+            for (m = 0; m < moved->len; m++) {
+                qatomic_set(&s->page_gen[g_array_index(moved, size_t, m)], s->gen);
+            }
+        }
+        smp_wmb();
+        qatomic_set(&s->eval_seq, s->eval_seq + 1);   /* even again */
+        s->hash_base = true;
+        s->hash_busy = false;
+        qatomic_store_release(&s->synced_epoch, MAX(s->synced_epoch, epoch));
+        if (s->claim_epoch == epoch) {
+            s->claim_epoch = 0;
+        }
+        if (s->tclaim == epoch) {
+            s->tclaim = 0;
+        }
+        d->lab_hash_syncs++;
+        d->lab_hash_pages += s->count * (s->page_size >> shift);
+        d->lab_hash_dirty += moved->len != 0;
+    }
+    d->lab_hash_ns += get_clock() - t0;
+    qemu_cond_broadcast(&d->synced_cond);
+}
+
+/*
  * Bring one set up to date: on return it is synced for `needed` or later (or
  * gone). `needed` is the epoch the caller's read must see (0 = the epoch at
  * entry); a sync this one starts is for the epoch at entry, never older. A sync
@@ -4828,7 +5043,18 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
         d->lab_ov_older++;
     }
     s->tclaim = MAX(s->tclaim, epoch);
-    d->epoch_queried = true;
+    d->epoch_queried = true;   /* a hash sync observes this epoch too: no coalescing past it */
+    if (s->hash && d->hash_mode) {   /* lab DIRTY_HASH: no hypervisor call, no ticket */
+        int64_t h0 = get_clock();
+
+        reims_vgpu_dirty_hash_sync(d, s, token, epoch, lab_query);
+        if (fg) {
+            d->lab_hash_fg++;
+            d->lab_hash_fg_ns += get_clock() - h0;
+        }
+        qemu_mutex_unlock(&d->lock);
+        return;
+    }
     page_size = s->page_size;
     set_pages = s->count * (page_size >> shift);
     arming = d->arm_flush && qatomic_read(&s->gen) == 0 && memory_dirty_log_flush_hook;
@@ -5572,6 +5798,14 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                      ? reims_vgpu_dirty_lab_mode("REIMS_VGPU_LAB_GEN_LOCKFREE") : 1;
         d->period_mode = getenv("REIMS_VGPU_LAB_DIRTY_PERIOD") &&     /* lab A/B */
                          strcmp(getenv("REIMS_VGPU_LAB_DIRTY_PERIOD"), "on") == 0;
+        d->hash_ns = getenv("REIMS_VGPU_LAB_DIRTY_HASH_NS") ?
+                     MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_HASH_NS"))) : 250;
+        d->hash_max = getenv("REIMS_VGPU_LAB_DIRTY_HASH_MAX") ?
+                      MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_HASH_MAX"))) : 4096;
+        d->hash_all = getenv("REIMS_VGPU_LAB_DIRTY_HASH_ALL") &&
+                      strcmp(getenv("REIMS_VGPU_LAB_DIRTY_HASH_ALL"), "on") == 0;
+        qatomic_set(&d->hash_mode, getenv("REIMS_VGPU_LAB_DIRTY_HASH") &&   /* lab A/B */
+                                   strcmp(getenv("REIMS_VGPU_LAB_DIRTY_HASH"), "on") == 0);
         d->chan_prefetch = getenv("REIMS_VGPU_LAB_DIRTY_CHAN_PREFETCH") &&   /* lab A/B */
                            strcmp(getenv("REIMS_VGPU_LAB_DIRTY_CHAN_PREFETCH"), "on") == 0;
         /* Opt-in: n170 +8 % glass, n172 -2 % (PSTAMP=off 87.6 / 101.6 against 97.7 / 87.1) — noise. */
@@ -6275,10 +6509,32 @@ static void reims_vgpu_dirty_prefetch_phased(ReimsVgpuDirty *d, GArray *tokens,
     }
 }
 
+/* Lab DIRTY_HASH: the per-second line (hash syncs rarely pass the query path's report). d->lock held. */
+static void reims_vgpu_dirty_hash_report(ReimsVgpuDirty *d)
+{
+    int64_t now = get_clock();
+
+    if (!d->hash_mode || now - d->lab_hash_last < NANOSECONDS_PER_SECOND) {
+        return;
+    }
+    d->lab_hash_last = now;
+    fprintf(stderr, "reims-dirty-hash sets=%" PRIu64 " syncs=%" PRIu64 " pages=%" PRIu64
+            " us=%" PRIu64 " dirty=%" PRIu64 " fg=%" PRIu64 " fg_us=%" PRIu64
+            " waits=%" PRIu64 " noram=%" PRIu64 " pf=%" PRIu64 "\n",
+            d->lab_hash_sets, d->lab_hash_syncs, d->lab_hash_pages,
+            d->lab_hash_ns / 1000, d->lab_hash_dirty, d->lab_hash_fg,
+            d->lab_hash_fg_ns / 1000, d->lab_hash_waits, qatomic_read(&d->lab_hash_noram),
+            d->lab_hash_pf);
+    d->lab_hash_syncs = d->lab_hash_pages = d->lab_hash_ns = d->lab_hash_dirty = 0;
+    d->lab_hash_fg = d->lab_hash_fg_ns = d->lab_hash_waits = d->lab_hash_pf = 0;
+    qatomic_set(&d->lab_hash_noram, 0);
+}
+
 void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
 {
     g_autoptr(GArray) tokens = NULL;
     g_autoptr(GArray) order = NULL;
+    g_autoptr(GArray) hot_hash = NULL;   /* lab DIRTY_HASH */
     GHashTableIter it;
     gpointer key, val;
     uint64_t epoch;
@@ -6290,6 +6546,7 @@ void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
     }
     qemu_mutex_lock(&d->lock);
     reims_vgpu_lab_flush(d, false);   /* TEMP lab (FGTRACE) */
+    reims_vgpu_dirty_hash_report(d);   /* lab DIRTY_HASH */
     full = !d->ondemand || !d->od_prefetch || d->log_wanted ||
            g_hash_table_size(d->logged) == 0;
     qemu_mutex_unlock(&d->lock);
@@ -6299,6 +6556,7 @@ void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
     }
     tokens = g_array_new(FALSE, FALSE, sizeof(uint64_t));
     order = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyOrdered));
+    hot_hash = g_array_new(FALSE, FALSE, sizeof(uint64_t));
     qemu_mutex_lock(&d->lock);
     epoch = d->epoch;
     {
@@ -6310,6 +6568,13 @@ void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
         while (g_hash_table_iter_next(&it, &key, &val)) {
             ReimsVgpuDirtySet *set = val;
 
+            if (set->hash && d->hash_mode) {
+                /* Lab DIRTY_HASH: its own hashes, on a worker, never a batch's query. */
+                if (set->synced_epoch < epoch && set->last_query_epoch + d->od_hot >= epoch) {
+                    g_array_append_val(hot_hash, *(uint64_t *)key);
+                }
+                continue;
+            }
             if (d->chan_prefetch && set->rd_chans && !(set->rd_chans & rung) &&
                 set->rd_chans_epoch + d->od_hot >= epoch) {
                 d->lab_cpf_skipped++;   /* its readers' channels did not ring */
@@ -6341,11 +6606,23 @@ void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
     for (t = 0; t < order->len; t++) {
         g_array_append_val(tokens, g_array_index(order, ReimsVgpuDirtyOrdered, t).token);
     }
+    d->lab_hash_pf += hot_hash->len;
+    if (hot_hash->len && d->od_pbatch && d->od_nworkers > 0) {
+        /* Lab DIRTY_HASH: published before the batch, so the workers hash while it walks. */
+        g_array_set_size(d->od_work, 0);
+        g_array_append_vals(d->od_work, hot_hash->data, hot_hash->len);
+        d->od_work_next = 0;
+        d->od_work_epoch = epoch;
+        qemu_cond_broadcast(&d->od_work_cond);
+    } else if (hot_hash->len && !d->od_pbatch) {
+        g_array_append_vals(tokens, hot_hash->data, hot_hash->len);
+    }
     if (d->od_pbatch && d->bigsplit_mode && d->od_nworkers > 0) {
         g_autoptr(GArray) small = g_array_new(FALSE, FALSE, sizeof(uint64_t));
         guint nbig = 0;
 
         g_array_set_size(d->od_work, 0);
+        g_array_append_vals(d->od_work, hot_hash->data, hot_hash->len);   /* lab DIRTY_HASH */
         for (t = 0; t < tokens->len; t++) {
             uint64_t tk = g_array_index(tokens, uint64_t, t);
             ReimsVgpuDirtySet *set = g_hash_table_lookup(d->sets, &tk);
@@ -6358,7 +6635,7 @@ void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
                 g_array_append_val(small, tk);
             }
         }
-        if (nbig) {
+        if (nbig || hot_hash->len) {
             d->od_work_next = 0;
             d->od_work_epoch = epoch;
             d->lab_bigsplit_sets += nbig;
