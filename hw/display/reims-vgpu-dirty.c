@@ -215,6 +215,13 @@ typedef struct ReimsVgpuDirtyQep {
     uint64_t e[];
 } ReimsVgpuDirtyQep;
 
+/* TEMP lab DIRTY_TIGHT: tracked sets per target page frame (see `trk`), saturating. */
+typedef struct ReimsVgpuDirtyTrk {
+    struct rcu_head rcu;      /* first: call_rcu needs offset 0 */
+    uint64_t n;
+    uint16_t c[];
+} ReimsVgpuDirtyTrk;
+
 /*
  * TEMP lab (REIMS_VGPU_LAB_FGTRACE=<file>): one 72-byte record per traced event,
  * appended to <file> about once a second. Kinds:
@@ -877,6 +884,22 @@ struct ReimsVgpuDirty {
     uint64_t lab_up_sets, lab_up_runs, lab_up_pages, lab_up_calls, lab_up_fail, lab_up_ns, lab_up_dropped;
     int64_t lab_up_last_ns;
     /*
+     * TEMP lab REIMS_VGPU_LAB_DIRTY_TIGHT=on (live through REIMS_VGPU_LAB_LIVE_FILE): a sync bridges a gap
+     * between two runs of the pages it queries only when every page of the gap belongs to a tracked set.
+     * A hypervisor query write-protects every page it walks again, the bridged gaps included, and the
+     * gaps of the 256-page bridge are mostly not surfaces: the guest's free pages, heaps, other
+     * processes' memory (a busy desktop's ~60k tracked pages were walked as ~360k). The guest's next
+     * store to each faults into the hypervisor - and the free pages next to a surface just released are
+     * the ones the kernel hands out next: at 5K WindowServer zeroes ~1.6M fresh pages a phase at
+     * ~3 GB/s (hq062/hq072, AMD: 46-65k queries a second over 15.7M pages). `trk` counts the tracked
+     * sets holding each target page frame (written under `lock` by track and untrack, read lock-free
+     * under RCU; grown by copy, like `qep`), kept whenever the switch may be on.
+     */
+    struct ReimsVgpuDirtyTrk *trk;
+    bool trk_on;                  /* `trk` is kept (the switch set, or a live file that may set it) */
+    bool tight;                   /* the switch's environment value */
+    uint64_t lab_tight_kept, lab_tight_cut, lab_tight_cut_pages;
+    /*
      * REIMS_VGPU_LAB_DIRTY_PERIOD=on: a set of at least `period_big` pages joins
      * a prefetch batch only when the batch's epoch is at least its shortest
      * recent read gap past its last read. A set read once a frame spans ~3
@@ -1088,6 +1111,105 @@ static int reims_vgpu_lab_live(const char *name)
     }
     g_mutex_unlock(&lock);
     return r;
+}
+
+/* TEMP lab DIRTY_TIGHT: whether a sync bridges only gaps of tracked pages (one look a sync). */
+static bool reims_vgpu_dirty_tight_on(ReimsVgpuDirty *d)
+{
+    int v;
+
+    if (!d->trk_on) {
+        return false;
+    }
+    v = reims_vgpu_lab_live("DIRTY_TIGHT");
+    return v < 0 ? d->tight : v == 1;
+}
+
+static void reims_vgpu_dirty_trk_free(ReimsVgpuDirtyTrk *t)
+{
+    g_free(t);
+}
+
+/*
+ * TEMP lab DIRTY_TIGHT: count `s`'s target page frames in (`delta` 1, at track) or out (-1, at
+ * untrack) of `trk`. d->lock held.
+ */
+static void reims_vgpu_dirty_trk_add(ReimsVgpuDirty *d, const ReimsVgpuDirtySet *s, int delta)
+{
+    const int shift = qemu_target_page_bits();
+    ReimsVgpuDirtyTrk *t = d->trk;
+    uint64_t per, end_pfn;
+    size_t i;
+
+    if (!d->trk_on || s->count == 0) {
+        return;
+    }
+    per = s->page_size >> shift;
+    end_pfn = (s->pages[s->count - 1] >> shift) + per;
+    if (delta > 0 && (!t || end_pfn > t->n)) {
+        uint64_t n = MAX(end_pfn, t ? t->n * 2 : end_pfn);
+        ReimsVgpuDirtyTrk *nt = g_malloc0(sizeof(*nt) + n * sizeof(uint16_t));
+
+        nt->n = n;
+        if (t) {
+            memcpy(nt->c, t->c, t->n * sizeof(uint16_t));
+        }
+        qatomic_rcu_set(&d->trk, nt);
+        if (t) {
+            call_rcu(t, reims_vgpu_dirty_trk_free, rcu);
+        }
+        t = nt;
+    }
+    if (!t) {
+        return;
+    }
+    for (i = 0; i < s->count; i++) {
+        uint64_t pfn = s->pages[i] >> shift, k;
+
+        for (k = 0; k < per && pfn + k < t->n; k++) {
+            uint16_t v = t->c[pfn + k];
+
+            if (delta > 0 ? v < UINT16_MAX : v > 0) {
+                qatomic_set(&t->c[pfn + k], (uint16_t)(v + delta));
+            }
+        }
+    }
+}
+
+/*
+ * TEMP lab DIRTY_TIGHT: whether a sync may bridge target page frames [from, to) between two runs it
+ * queries - always without the switch; with it, only when a tracked set holds every one of them. Any
+ * thread; a count read while a set is being tracked or untracked only moves where a range ends.
+ */
+static bool reims_vgpu_dirty_bridge_ok(ReimsVgpuDirty *d, bool tight, uint64_t from, uint64_t to)
+{
+    const ReimsVgpuDirtyTrk *t;
+    bool ok = true;
+    uint64_t p;
+
+    if (!tight || from >= to) {
+        return true;
+    }
+    WITH_RCU_READ_LOCK_GUARD() {
+        t = qatomic_rcu_read(&d->trk);
+        if (!t || to > t->n) {
+            ok = false;
+        } else {
+            for (p = from; p < to; p++) {
+                if (!qatomic_read(&t->c[p])) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+    }
+    if (ok) {
+        qatomic_inc(&d->lab_tight_kept);
+    } else {
+        qatomic_inc(&d->lab_tight_cut);
+        qatomic_add(&d->lab_tight_cut_pages, to - from);
+    }
+    return ok;
 }
 
 static void reims_vgpu_dirty_set_free(gpointer p)
@@ -1503,6 +1625,7 @@ uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
 
         reims_vgpu_lab_rec(d, &r);
     }
+    reims_vgpu_dirty_trk_add(d, s, 1);   /* TEMP lab DIRTY_TIGHT */
     qemu_mutex_lock(&d->sets_lock);
     g_hash_table_insert(d->sets, g_memdup2(&token, sizeof(token)), s);
     qemu_mutex_unlock(&d->sets_lock);
@@ -2899,6 +3022,7 @@ void reims_vgpu_dirty_untrack(ReimsVgpuDirty *d, uint64_t token)
             if (d->lf_mode) {
                 reims_vgpu_dirty_tab_del(d, token);
             }
+            reims_vgpu_dirty_trk_add(d, oval, -1);   /* TEMP lab DIRTY_TIGHT */
             g_free(okey);
             d->lab_hash_sets -= ((ReimsVgpuDirtySet *)oval)->hash != NULL;   /* lab DIRTY_HASH */
             if (d->up_ready && (reims_vgpu_lab_live("UNTRACK_POPULATE") < 0 ? d->up_on
@@ -4721,6 +4845,7 @@ static void reims_vgpu_dirty_sync_tracked(ReimsVgpuDirty *d,
 {
     uint64_t qticket;
     const int shift = qemu_target_page_bits();
+    const bool tight = reims_vgpu_dirty_tight_on(d);   /* TEMP lab DIRTY_TIGHT */
     GHashTableIter it;
     gpointer key, val;
     uint64_t bits = 0;
@@ -4794,7 +4919,8 @@ static void reims_vgpu_dirty_sync_tracked(ReimsVgpuDirty *d,
                 for (;;) {
                     next = find_next_bit(d->sync_pages, end, last + 1);
                     if (next >= end ||
-                        next - last - 1 > REIMS_VGPU_DIRTY_SYNC_GAP_PAGES) {
+                        next - last - 1 > REIMS_VGPU_DIRTY_SYNC_GAP_PAGES ||
+                        !reims_vgpu_dirty_bridge_ok(d, tight, last + 1, next)) {
                         break;
                     }
                     last = next;
@@ -5085,6 +5211,7 @@ static bool reims_vgpu_dirty_sync_batch(ReimsVgpuDirty *d, uint64_t token)
 {
     uint64_t qticket;
     const int shift = qemu_target_page_bits();
+    const bool tight = reims_vgpu_dirty_tight_on(d);   /* TEMP lab DIRTY_TIGHT */
     const uint64_t target = 1ULL << shift;
     ReimsVgpuDirtySlice *slices = NULL;
     int cap = 0, n, i;
@@ -5175,7 +5302,9 @@ static bool reims_vgpu_dirty_sync_batch(ReimsVgpuDirty *d, uint64_t token)
                     continue;   /* the same page, from a second set */
                 }
                 if (open && r.start + r.len +
-                    REIMS_VGPU_DIRTY_SYNC_GAP_PAGES * target >= off) {
+                    REIMS_VGPU_DIRTY_SYNC_GAP_PAGES * target >= off &&
+                    reims_vgpu_dirty_bridge_ok(d, tight, (sj->gpa + (r.start + r.len - sj->offset)) >> shift,
+                                               gpa >> shift)) {
                     r.len = off + target - r.start;
                     continue;
                 }
@@ -5244,6 +5373,7 @@ void reims_vgpu_dirty_sync_tokens(ReimsVgpuDirty *d, const uint64_t *want, size_
 {
     uint64_t qticket;
     const int shift = qemu_target_page_bits();
+    const bool tight = reims_vgpu_dirty_tight_on(d);   /* TEMP lab DIRTY_TIGHT */
     const uint64_t target = 1ULL << shift;
     ReimsVgpuDirtySlice *slices = NULL;
     int cap = 0, n, i;
@@ -5351,7 +5481,9 @@ void reims_vgpu_dirty_sync_tokens(ReimsVgpuDirty *d, const uint64_t *want, size_
                     continue;   /* the same page, from a second set */
                 }
                 if (open && r.start + r.len +
-                    REIMS_VGPU_DIRTY_SYNC_GAP_PAGES * target >= o) {
+                    REIMS_VGPU_DIRTY_SYNC_GAP_PAGES * target >= o &&
+                    reims_vgpu_dirty_bridge_ok(d, tight, (sj->gpa + (r.start + r.len - sj->offset)) >> shift,
+                                               gpa >> shift)) {
                     r.len = o + target - r.start;
                     continue;
                 }
@@ -5658,6 +5790,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                                       int64_t *lab_query)
 {
     const int shift = qemu_target_page_bits();
+    const bool tight = reims_vgpu_dirty_tight_on(d);   /* TEMP lab DIRTY_TIGHT */
     ReimsVgpuDirtySlice *slices = NULL;
     int cap = 0, n, i;
     ReimsVgpuDirtySet *s;
@@ -5882,7 +6015,9 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                     continue;
                 }
                 if (open && r.start + r.len + REIMS_VGPU_DIRTY_SYNC_GAP_PAGES *
-                    (1ULL << shift) >= sj->offset + (gpa - sj->gpa)) {
+                    (1ULL << shift) >= sj->offset + (gpa - sj->gpa) &&
+                    reims_vgpu_dirty_bridge_ok(d, tight, (sj->gpa + (r.start + r.len - sj->offset)) >> shift,
+                                               gpa >> shift)) {
                     r.len = sj->offset + (gpa - sj->gpa) + page_size - r.start;
                     continue;
                 }
@@ -6186,6 +6321,12 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                     d->lab_dup_inflight, d->lab_ov_older, d->settle_skip,
                     d->lab_settle_skips, d->lab_settle_skip_cand, d->ticket_batch,
                     d->lab_tb_syncs, d->lab_tb_batches);
+            if (d->trk_on) {   /* TEMP lab DIRTY_TIGHT */
+                fprintf(stderr, "reims-dirty-tight on=%d kept=%" PRIu64 " cut=%" PRIu64
+                        " cut_pages=%" PRIu64 "\n", reims_vgpu_dirty_tight_on(d),
+                        qatomic_xchg(&d->lab_tight_kept, 0), qatomic_xchg(&d->lab_tight_cut, 0),
+                        qatomic_xchg(&d->lab_tight_cut_pages, 0));
+            }
             d->lab_settle_skips = d->lab_settle_skip_cand = 0;
             d->lab_tb_syncs = d->lab_tb_batches = 0;
             d->lab_frontier_child = 0;
@@ -6617,6 +6758,10 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                      MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_HASH_NS"))) : 250;
         d->hash_max = getenv("REIMS_VGPU_LAB_DIRTY_HASH_MAX") ?
                       MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_HASH_MAX"))) : 4096;
+        /* TEMP lab DIRTY_TIGHT (opt-in for its A/B; the counts are kept when a live file may set it). */
+        d->tight = getenv("REIMS_VGPU_LAB_DIRTY_TIGHT") &&
+                   strcmp(getenv("REIMS_VGPU_LAB_DIRTY_TIGHT"), "on") == 0;
+        d->trk_on = d->tight || getenv("REIMS_VGPU_LAB_LIVE_FILE");
 #ifndef REIMS_DIRTY_STRESS
         /* TEMP lab UNTRACK_POPULATE (opt-in for its A/B). */
         d->up_on = getenv("REIMS_VGPU_LAB_UNTRACK_POPULATE") &&
@@ -6980,6 +7125,7 @@ static void reims_vgpu_dirty_prefetch_phase(ReimsVgpuDirty *d, GArray *tokens,
                                             bool no_steal)
 {
     const int shift = qemu_target_page_bits();
+    const bool tight = reims_vgpu_dirty_tight_on(d);   /* TEMP lab DIRTY_TIGHT */
     const uint64_t target = 1ULL << shift;
     ReimsVgpuDirtySlice *slices = NULL;
     int cap = 0, n, i;
@@ -7094,7 +7240,9 @@ static void reims_vgpu_dirty_prefetch_phase(ReimsVgpuDirty *d, GArray *tokens,
             }
             if (last && last->mr == slices[i].mr && off >= last->r.start &&
                 last->r.start + last->r.len +
-                REIMS_VGPU_DIRTY_SYNC_GAP_PAGES * target >= off) {
+                REIMS_VGPU_DIRTY_SYNC_GAP_PAGES * target >= off &&
+                reims_vgpu_dirty_bridge_ok(d, tight, (slices[i].gpa + (last->r.start + last->r.len -
+                                                      slices[i].offset)) >> shift, gpa >> shift)) {
                 uint64_t nend = MAX(last->r.start + last->r.len, off + (send - gpa));
 
                 npages += (nend - (last->r.start + last->r.len)) >> shift;
