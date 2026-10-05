@@ -902,6 +902,7 @@ struct ReimsVgpuDirty {
     bool trk_on;                  /* `trk` is kept (the switch set, or a live file that may set it) */
     bool tight;                   /* the switch's environment value */
     uint64_t tight_slack;         /* REIMS_VGPU_LAB_DIRTY_TIGHT_SLACK: untracked pages a bridge may still cross (0) */
+    bool host_intel;              /* an Intel host (drain-paced): picks the hash defaults, see set_ondemand */
     uint64_t lab_tight_kept, lab_tight_cut, lab_tight_cut_pages;
     /* TEMP lab: foreground syncs of large sets (>= 4096 pages) and their time, by the drain's work channel (7 = All). */
     uint64_t lab_fgbig_n[8], lab_fgbig_ns[8];
@@ -7063,14 +7064,28 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
          * The call stays priced at the host's ~5 us (DIRTY_CALL_NS): at 50 us the mid-size sets went to hashing
          * too and Safari's transitions lost a quarter of their frames (hq082/hq084).
          */
+        /*
+         * Not one number for both lab hosts. The hash moves work from the guest (the re-protection a query leaves
+         * behind) onto the device, which pays off where the guest is the limiter (AMD 7950X, hq085: +17 % transition
+         * frames) and not where the drain is (Intel 14700K, p009/p010, a boot an arm): there the guest's fresh page
+         * got cheaper too (0.88 against 1.46 us) but the drain's foreground syncs grew (41 against 18 ms a second),
+         * windowed glass ran 160.9-175.1 Hz over seven hashed boots against 192.5 / 178.4 with the sets queried,
+         * transitions equal. The CPU vendor stands for that measured split; an Intel host keeps the old bounds
+         * (4096, no background bound). REIMS_VGPU_LAB_DIRTY_HASH_MAX / _HASH_BG_MAX still override either way.
+         */
+        d->host_intel = __builtin_cpu_is("intel");
         d->hash_max = getenv("REIMS_VGPU_LAB_DIRTY_HASH_MAX") ?
-                      MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_HASH_MAX"))) : 16384;
+                      MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_HASH_MAX"))) : d->host_intel ? 4096 : 16384;
+        if (d->host_intel) {
+            reims_vgpu_dirty_hash_bg_max_default = 0;
+        }
         if (getenv("REIMS_VGPU_LAB_DIRTY_HASH_BG_MAX")) {
             reims_vgpu_dirty_hash_bg_max_default = (uint64_t)MAX(0, atoi(getenv("REIMS_VGPU_LAB_DIRTY_HASH_BG_MAX")));
         }
         qatomic_set(&reims_vgpu_dirty_hash_bg_max_live, reims_vgpu_dirty_hash_bg_max_default);
-        fprintf(stderr, "reims-dirty-hash-config hash_max=%" PRIu64 " bg_max=%" PRIu64 " hash_ns=%" PRIu64 "\n",
-                (uint64_t)d->hash_max, reims_vgpu_dirty_hash_bg_max_default, (uint64_t)d->hash_ns);
+        fprintf(stderr, "reims-dirty-hash-config hash_max=%" PRIu64 " bg_max=%" PRIu64 " hash_ns=%" PRIu64
+                " host=%s\n", (uint64_t)d->hash_max, reims_vgpu_dirty_hash_bg_max_default, (uint64_t)d->hash_ns,
+                d->host_intel ? "intel" : "other");
         /* TEMP lab DIRTY_TIGHT (opt-in for its A/B; the counts are kept when a live file may set it). */
         d->tight = getenv("REIMS_VGPU_LAB_DIRTY_TIGHT") &&
                    strcmp(getenv("REIMS_VGPU_LAB_DIRTY_TIGHT"), "on") == 0;
