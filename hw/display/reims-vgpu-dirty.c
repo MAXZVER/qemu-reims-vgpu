@@ -1169,6 +1169,11 @@ static uint64_t reims_vgpu_dirty_wp_streak_live, reims_vgpu_dirty_wp_age_live;
  */
 static uint64_t reims_vgpu_dirty_hash_bg_max_live;
 /*
+ * TEMP lab: DIRTY_HASH_BG_MAX when the live file does not name it - 4096 by default (hq085), set at init from
+ * REIMS_VGPU_LAB_DIRTY_HASH_BG_MAX (0 = no bound).
+ */
+static uint64_t reims_vgpu_dirty_hash_bg_max_default = 4096;
+/*
  * TEMP lab live DIRTY_HASH_BG_ONCE=on: a hashed set past DIRTY_HASH_BG_MAX is still hashed by the background,
  * but once a predicted read - in its DIRTY_HASH_DUE window, while nothing has synced it since the window
  * opened - so its reader finds it synced instead of hashing 44 MB on the drain (hq082: fg sync time
@@ -1204,7 +1209,7 @@ static void reims_vgpu_dirty_gap_refresh(void)
     v = reims_vgpu_lab_live_num("DIRTY_WP_AGE_MS");
     qatomic_set(&reims_vgpu_dirty_wp_age_live, v > 0 ? (uint64_t)v : 0);
     v = reims_vgpu_lab_live_num("DIRTY_HASH_BG_MAX");
-    qatomic_set(&reims_vgpu_dirty_hash_bg_max_live, v > 0 ? (uint64_t)v : 0);
+    qatomic_set(&reims_vgpu_dirty_hash_bg_max_live, v < 0 ? reims_vgpu_dirty_hash_bg_max_default : (uint64_t)v);
     qatomic_set(&reims_vgpu_dirty_hash_bg_once_live, reims_vgpu_lab_live("DIRTY_HASH_BG_ONCE") == 1);
     qatomic_set(&reims_vgpu_dirty_wp_hashed_live, reims_vgpu_lab_live("DIRTY_WP_HASHED") == 1);
 }
@@ -7037,8 +7042,21 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                          strcmp(getenv("REIMS_VGPU_LAB_DIRTY_PERIOD"), "on") == 0;
         d->hash_ns = getenv("REIMS_VGPU_LAB_DIRTY_HASH_NS") ?
                      MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_HASH_NS"))) : 250;
+        /*
+         * 16384 by default (was 4096; hq085, AMD, 5K, a boot an arm x2): the 5K surfaces (10.8k pages) are hashed
+         * instead of queried - a hypervisor dirty query write-protects every page it walks again and changes nested
+         * page tables the guest pays for (35 phases: WindowServer's __bzero ~ query count r=0.54, ~ WP remap time
+         * 0.66), while a hash touches nothing of the guest's. Hypervisor calls 27k -> 3k a second, __bzero 1880 ->
+         * 1499; with DIRTY_HASH_BG_MAX's 4096 a large hashed set is hashed when read, not at every doorbell.
+         * The call stays priced at the host's ~5 us (DIRTY_CALL_NS): at 50 us the mid-size sets went to hashing
+         * too and Safari's transitions lost a quarter of their frames (hq082/hq084).
+         */
         d->hash_max = getenv("REIMS_VGPU_LAB_DIRTY_HASH_MAX") ?
-                      MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_HASH_MAX"))) : 4096;
+                      MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_HASH_MAX"))) : 16384;
+        if (getenv("REIMS_VGPU_LAB_DIRTY_HASH_BG_MAX")) {
+            reims_vgpu_dirty_hash_bg_max_default = (uint64_t)MAX(0, atoi(getenv("REIMS_VGPU_LAB_DIRTY_HASH_BG_MAX")));
+        }
+        qatomic_set(&reims_vgpu_dirty_hash_bg_max_live, reims_vgpu_dirty_hash_bg_max_default);
         /* TEMP lab DIRTY_TIGHT (opt-in for its A/B; the counts are kept when a live file may set it). */
         d->tight = getenv("REIMS_VGPU_LAB_DIRTY_TIGHT") &&
                    strcmp(getenv("REIMS_VGPU_LAB_DIRTY_TIGHT"), "on") == 0;
