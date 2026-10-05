@@ -7057,6 +7057,8 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
             reims_vgpu_dirty_hash_bg_max_default = (uint64_t)MAX(0, atoi(getenv("REIMS_VGPU_LAB_DIRTY_HASH_BG_MAX")));
         }
         qatomic_set(&reims_vgpu_dirty_hash_bg_max_live, reims_vgpu_dirty_hash_bg_max_default);
+        fprintf(stderr, "reims-dirty-hash-config hash_max=%" PRIu64 " bg_max=%" PRIu64 " hash_ns=%" PRIu64 "\n",
+                (uint64_t)d->hash_max, reims_vgpu_dirty_hash_bg_max_default, (uint64_t)d->hash_ns);
         /* TEMP lab DIRTY_TIGHT (opt-in for its A/B; the counts are kept when a live file may set it). */
         d->tight = getenv("REIMS_VGPU_LAB_DIRTY_TIGHT") &&
                    strcmp(getenv("REIMS_VGPU_LAB_DIRTY_TIGHT"), "on") == 0;
