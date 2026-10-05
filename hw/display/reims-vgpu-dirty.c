@@ -1166,6 +1166,13 @@ static uint64_t reims_vgpu_dirty_wp_streak_live, reims_vgpu_dirty_wp_age_live;
  * ~4 GB/s of hashing and put ch5's serve at 15 ms.
  */
 static uint64_t reims_vgpu_dirty_hash_bg_max_live;
+/*
+ * TEMP lab live DIRTY_HASH_BG_ONCE=on: a hashed set past DIRTY_HASH_BG_MAX is still hashed by the background,
+ * but once a predicted read - in its DIRTY_HASH_DUE window, while nothing has synced it since the window
+ * opened - so its reader finds it synced instead of hashing 44 MB on the drain (hq082: fg sync time
+ * 89 -> 281 ms a second with the large sets hashed only when read).
+ */
+static int reims_vgpu_dirty_hash_bg_once_live;
 
 static uint64_t reims_vgpu_dirty_call_ns(void)
 {
@@ -1189,6 +1196,7 @@ static void reims_vgpu_dirty_gap_refresh(void)
     qatomic_set(&reims_vgpu_dirty_wp_age_live, v > 0 ? (uint64_t)v : 0);
     v = reims_vgpu_lab_live_num("DIRTY_HASH_BG_MAX");
     qatomic_set(&reims_vgpu_dirty_hash_bg_max_live, v > 0 ? (uint64_t)v : 0);
+    qatomic_set(&reims_vgpu_dirty_hash_bg_once_live, reims_vgpu_lab_live("DIRTY_HASH_BG_ONCE") == 1);
 }
 
 /* TEMP lab DIRTY_TIGHT: whether a sync bridges only gaps of tracked pages (one look a sync). */
@@ -3599,6 +3607,29 @@ static int reims_vgpu_dirty_hash_due(const ReimsVgpuDirtySet *s, uint64_t epoch)
         }
     }
     return epoch >= last + lo && epoch < last + lo + REIMS_VGPU_DIRTY_HASH_HOT;
+}
+
+/*
+ * TEMP lab DIRTY_HASH_BG_ONCE: whether `s` is in its DIRTY_HASH_DUE window for `epoch` and nothing has
+ * synced it since the window opened - the one background hash a predicted read gets.
+ */
+static bool reims_vgpu_dirty_hash_due_open(const ReimsVgpuDirtySet *s, uint64_t epoch)
+{
+    uint32_t gaps = qatomic_read(&s->rd_gaps), lo = 255, g;
+    uint64_t last = qatomic_read(&s->rd_epoch);
+    int k;
+
+    if (gaps == 0 || last == 0) {
+        return false;
+    }
+    for (k = 0; k < 4; k++) {
+        g = (gaps >> (8 * k)) & 0xff;
+        if (g) {
+            lo = MIN(lo, g);
+        }
+    }
+    return epoch >= last + lo && epoch < last + lo + REIMS_VGPU_DIRTY_HASH_HOT &&
+           qatomic_read(&s->synced_epoch) < last + lo;
 }
 
 static void reims_vgpu_dirty_gen_hit(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
@@ -7797,8 +7828,10 @@ void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
             if (set->hash && d->hash_mode) {
                 uint64_t bgmax = qatomic_read(&reims_vgpu_dirty_hash_bg_max_live);
 
-                if (bgmax && set->count * (set->page_size >> qemu_target_page_bits()) > bgmax) {
-                    continue;   /* TEMP lab live DIRTY_HASH_BG_MAX: hashed when read */
+                if (bgmax && set->count * (set->page_size >> qemu_target_page_bits()) > bgmax &&
+                    !(qatomic_read(&reims_vgpu_dirty_hash_bg_once_live) &&
+                      reims_vgpu_dirty_hash_due_open(set, epoch))) {
+                    continue;   /* TEMP lab live DIRTY_HASH_BG_MAX: hashed when read (or BG_ONCE) */
                 }
                 /*
                  * Lab DIRTY_HASH: its own hashes, on a worker, never a batch's query — and only for
