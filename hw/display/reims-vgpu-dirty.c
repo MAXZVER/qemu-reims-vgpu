@@ -1187,6 +1187,14 @@ static int reims_vgpu_dirty_hash_bg_once_live;
  * protected set reads as synced with no hash and no hypervisor call.
  */
 static int reims_vgpu_dirty_wp_hashed_live;
+/*
+ * TEMP lab live DIRTY_WP_HASHED_STREAK=<syncs>: the clean hash syncs a hashed set needs before WP_HASHED
+ * protects it, apart from DIRTY_WP_STREAK (the queried sets'). p009 (Intel, 5K sets hashed): the drain's
+ * foreground syncs took 245 ms a second, nearly all of it hashing 5K sets the guest leaves alone; hq084/hq085
+ * (AMD): WP_HASHED at the queried sets' streak (16) protected sets the guest wrote again soon, and the remaps
+ * cost the guest more than the hashes. 0 = DIRTY_WP_STREAK's need.
+ */
+static uint64_t reims_vgpu_dirty_wp_hashed_streak_live;
 
 static uint64_t reims_vgpu_dirty_call_ns(void)
 {
@@ -1212,6 +1220,8 @@ static void reims_vgpu_dirty_gap_refresh(void)
     qatomic_set(&reims_vgpu_dirty_hash_bg_max_live, v < 0 ? reims_vgpu_dirty_hash_bg_max_default : (uint64_t)v);
     qatomic_set(&reims_vgpu_dirty_hash_bg_once_live, reims_vgpu_lab_live("DIRTY_HASH_BG_ONCE") == 1);
     qatomic_set(&reims_vgpu_dirty_wp_hashed_live, reims_vgpu_lab_live("DIRTY_WP_HASHED") == 1);
+    v = reims_vgpu_lab_live_num("DIRTY_WP_HASHED_STREAK");
+    qatomic_set(&reims_vgpu_dirty_wp_hashed_streak_live, v > 0 ? (uint64_t)v : 0);
 }
 
 /* TEMP lab DIRTY_TIGHT: whether a sync bridges only gaps of tracked pages (one look a sync). */
@@ -6023,7 +6033,8 @@ static void reims_vgpu_dirty_hash_sync(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
         if (qatomic_read(&reims_vgpu_dirty_wp_hashed_live) && d->wp_mode && d->wp_active &&
             s->wp_state == WP_NONE && s->count * (s->page_size >> shift) >= d->wp_min_pages) {
             /* TEMP lab live DIRTY_WP_HASHED: the clean streak and the queueing of the query path. */
-            uint32_t need = (uint32_t)(qatomic_read(&reims_vgpu_dirty_wp_streak_live) ?: d->wp_streak_need)
+            uint32_t need = (uint32_t)(qatomic_read(&reims_vgpu_dirty_wp_hashed_streak_live) ?:
+                                       qatomic_read(&reims_vgpu_dirty_wp_streak_live) ?: d->wp_streak_need)
                             << MIN(s->wp_lost, 6);
 
             s->wp_streak = moved->len ? 0 : s->wp_streak + 1;
