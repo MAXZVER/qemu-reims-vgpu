@@ -31,6 +31,9 @@ typedef struct ReimsVgpuDirty ReimsVgpuDirty;
 ReimsVgpuDirty *reims_vgpu_dirty_new(void);
 void reims_vgpu_dirty_free(ReimsVgpuDirty *d);
 
+/* TEMP (lab, REIMS_VGPU_LAB_DEVICE_PRIO=on): the calling device thread at above-normal priority. */
+void reims_vgpu_lab_device_prio(const char *who);
+
 /*
  * Register `count` page-aligned GPAs of `page_size` bytes as one tracked set.
  * Returns a non-zero opaque token, or 0 when the set cannot be tracked.

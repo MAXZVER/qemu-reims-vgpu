@@ -818,6 +818,8 @@ static void *reims_vgpu_pci_peek_thread(void *opaque)
     ReimsVGPUPCIState *s = opaque;
     int64_t last = get_clock();
 
+    reims_vgpu_lab_device_prio("peek");
+
     rcu_register_thread();
     qemu_mutex_lock(&s->peek_mutex);
     while (!s->peek_stopping) {
@@ -843,6 +845,8 @@ static void *reims_vgpu_pci_peek_thread(void *opaque)
 static void *reims_vgpu_pci_harvest_thread(void *opaque)
 {
     ReimsVGPUPCIState *s = opaque;
+
+    reims_vgpu_lab_device_prio("harvest");
 
     /*
      * This thread reads the FlatView under RCU (the dirty tracker's RAM walk,
@@ -1086,6 +1090,8 @@ static void *reims_vgpu_pci_drain_thread(void *opaque)
 {
     ReimsVGPUPCIState *s = opaque;
 
+    reims_vgpu_lab_device_prio("drain");
+
 #if defined(_WIN32)
     reims_vgpu_hiqos_apply(false);
     whpx_lab_pin_pcores("drain");
@@ -1220,6 +1226,8 @@ static bool reims_vgpu_pci_heartbeat_hires(ReimsVGPUPCIState *s)
 static void *reims_vgpu_pci_heartbeat_thread(void *opaque)
 {
     ReimsVGPUPCIState *s = opaque;
+
+    reims_vgpu_lab_device_prio("heartbeat");
 
     int period_ms = REIMS_VGPU_PCI_HEARTBEAT_MS;
     const char *hb = getenv("REIMS_VGPU_HEARTBEAT_MS");   /* lab A/B */

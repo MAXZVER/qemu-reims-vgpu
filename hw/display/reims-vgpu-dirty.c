@@ -2363,11 +2363,36 @@ static bool reims_vgpu_dirty_wp_step(ReimsVgpuDirty *d)
 }
 
 /* TEMP lab DIRTY_WP_THREAD: the thread that runs the protect step, woken by the BH. */
+/*
+ * TEMP (lab, REIMS_VGPU_LAB_DEVICE_PRIO=on): run the calling device thread above normal priority, ahead of the
+ * vCPU threads. With 24 vCPUs on a 28-thread host the device's helpers compete with the guest for cores; n217's
+ * heavy-glass profile had the drain waiting on them a quarter of its time. The Rust side does the same for its
+ * pool, recorder, submit and stamp threads (lab_cores::device_thread_priority).
+ */
+void reims_vgpu_lab_device_prio(const char *who)
+{
+#if defined(_WIN32)
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("REIMS_VGPU_LAB_DEVICE_PRIO");
+
+        on = e && strcmp(e, "on") == 0;
+    }
+    if (on && SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL)) {
+        fprintf(stderr, "reims-lab: device-prio %s" "\n", who);
+    }
+#else
+    (void)who;
+#endif
+}
+
 static void *reims_vgpu_dirty_wp_thread_fn(void *opaque)
 {
     ReimsVgpuDirty *d = opaque;
 
     rcu_register_thread();
+    reims_vgpu_lab_device_prio("wp");
     for (;;) {
         qemu_event_wait(&d->wp_ev);
         qemu_event_reset(&d->wp_ev);   /* before the step: a wake during it runs another */
@@ -5980,6 +6005,7 @@ static void *reims_vgpu_dirty_od_worker(void *opaque)
     uint64_t done = 0;
 
     rcu_register_thread();   /* sync_one walks the FlatView under RCU */
+    reims_vgpu_lab_device_prio("dirty-od");
     qemu_mutex_lock(&d->lock);
     while (!d->od_stop) {
         uint64_t epoch = d->od_work_epoch;
