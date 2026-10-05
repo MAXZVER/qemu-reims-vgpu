@@ -1052,7 +1052,7 @@ static uint32_t reims_vgpu_dirty_lab_mode(const char *name)
  * variable is unset or the file is missing or does not name it. So an A/B runs as phases inside one boot instead of a
  * boot an arm. Re-read at most every 200 ms. Any thread.
  */
-static int reims_vgpu_lab_live(const char *name)
+static int reims_vgpu_lab_live_get(const char *name, long *num)
 {
     static GMutex lock;
     static int state;            /* 0 not looked, 1 no file variable, 2 file variable set */
@@ -1060,6 +1060,7 @@ static int reims_vgpu_lab_live(const char *name)
     static gint64 checked_us;
     static char *keys[32];
     static int vals[32];
+    static long nums[32];        /* the value as a number (strtol), for a numeric switch */
     static int n;
     gint64 now;
     int i, r = -1;
@@ -1097,6 +1098,7 @@ static int reims_vgpu_lab_live(const char *name)
                     }
                     keys[n] = g_strdup(g_strstrip(ln));
                     vals[n] = strcmp(g_strstrip(eq + 1), "on") == 0;
+                    nums[n] = strtol(g_strstrip(eq + 1), NULL, 10);
                     n++;
                 }
                 g_strfreev(lines);
@@ -1106,12 +1108,44 @@ static int reims_vgpu_lab_live(const char *name)
         for (i = 0; i < n; i++) {
             if (strcmp(keys[i], name) == 0) {
                 r = vals[i];
+                if (num) {
+                    *num = nums[i];
+                }
                 break;
             }
         }
     }
     g_mutex_unlock(&lock);
     return r;
+}
+
+static int reims_vgpu_lab_live(const char *name)
+{
+    return reims_vgpu_lab_live_get(name, NULL);
+}
+
+/* The live value of numeric lab switch `name`, or -1 when the file does not name it. */
+static long reims_vgpu_lab_live_num(const char *name)
+{
+    long v = -1;
+
+    return reims_vgpu_lab_live_get(name, &v) < 0 ? -1 : v;
+}
+
+/*
+ * TEMP lab live DIRTY_GAP=<pages>: the sync gap bridge (REIMS_VGPU_DIRTY_GAP) from the live file, 0 = not
+ * set. Refreshed once a second by the on-demand stats (a lookup takes the live file's lock, and the bridge
+ * is read for every run of every sync). hq078: the hypervisor's price is the call, not the page walked -
+ * DIRTY_TIGHT cut the pages walked 17x and tripled the calls, and the guest got slower (Safari 39 -> 27
+ * frames a transition, WindowServer's __bzero 1754 -> 4365 samples).
+ */
+static uint64_t reims_vgpu_dirty_gap_live;
+
+static void reims_vgpu_dirty_gap_refresh(void)
+{
+    long v = reims_vgpu_lab_live_num("DIRTY_GAP");
+
+    qatomic_set(&reims_vgpu_dirty_gap_live, v > 0 ? (uint64_t)v : 0);
 }
 
 /* TEMP lab DIRTY_TIGHT: whether a sync bridges only gaps of tracked pages (one look a sync). */
@@ -4464,7 +4498,11 @@ static void reims_vgpu_dirty_clear_written(GArray *written,
 static uint64_t reims_vgpu_dirty_gap_pages(void)
 {
     static uint64_t gap;
+    uint64_t live = qatomic_read(&reims_vgpu_dirty_gap_live);
 
+    if (live) {
+        return live;   /* TEMP lab live DIRTY_GAP */
+    }
     if (!gap) {
         const char *e = getenv("REIMS_VGPU_DIRTY_GAP");
         long v = e ? atol(e) : 0;
@@ -6325,9 +6363,11 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                     d->lab_dup_inflight, d->lab_ov_older, d->settle_skip,
                     d->lab_settle_skips, d->lab_settle_skip_cand, d->ticket_batch,
                     d->lab_tb_syncs, d->lab_tb_batches);
+            reims_vgpu_dirty_gap_refresh();   /* TEMP lab live DIRTY_GAP */
             if (d->trk_on) {   /* TEMP lab DIRTY_TIGHT */
-                fprintf(stderr, "reims-dirty-tight on=%d kept=%" PRIu64 " cut=%" PRIu64
+                fprintf(stderr, "reims-dirty-tight on=%d gap=%" PRIu64 " kept=%" PRIu64 " cut=%" PRIu64
                         " cut_pages=%" PRIu64 "\n", reims_vgpu_dirty_tight_on(d),
+                        reims_vgpu_dirty_gap_pages(),
                         qatomic_xchg(&d->lab_tight_kept, 0), qatomic_xchg(&d->lab_tight_cut, 0),
                         qatomic_xchg(&d->lab_tight_cut_pages, 0));
             }
