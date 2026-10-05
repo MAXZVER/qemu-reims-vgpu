@@ -383,6 +383,48 @@ void whpx_lab_pin_pcores(const char *who)
         fprintf(stderr, "reims-pcores %s: %lu performance cpu sets\n", who, (unsigned long)n);
     }
 }
+/*
+ * TEMP lab REIMS_VGPU_LAB_DEVICE_CCD=N: the calling device thread prefers the logical processors sharing
+ * last-level cache N - one CCD of the home rig's Ryzen 9 7950X (crates/reims-vgpu/src/lab_cores.rs
+ * pin_device_ccd, the Rust half). The drain, its recorder and the pool hand work across for every draw.
+ */
+void whpx_lab_pin_ccd(const char *who)
+{
+    static int ccd = -2;
+    ULONG need = 0, ids[256], n = 0;
+    uint8_t *buf;
+    size_t off;
+
+    if (ccd == -2) {
+        const char *e = getenv("REIMS_VGPU_LAB_DEVICE_CCD");
+        ccd = e && *e ? atoi(e) : -1;
+    }
+    if (ccd < 0) {
+        return;
+    }
+    GetSystemCpuSetInformation(NULL, 0, &need, NULL, 0);
+    buf = need ? g_malloc0(need) : NULL;
+    if (!buf || !GetSystemCpuSetInformation((PSYSTEM_CPU_SET_INFORMATION)buf, need, &need,
+                                            NULL, 0)) {
+        g_free(buf);
+        return;
+    }
+    for (off = 0; off + 19 <= need && n < G_N_ELEMENTS(ids);) {
+        PSYSTEM_CPU_SET_INFORMATION r = (PSYSTEM_CPU_SET_INFORMATION)(buf + off);
+        if (!r->Size) {
+            break;
+        }
+        if (r->CpuSet.Group == 0 && r->CpuSet.LastLevelCacheIndex == ccd) {
+            ids[n++] = r->CpuSet.Id;
+        }
+        off += r->Size;
+    }
+    g_free(buf);
+    if (n && SetThreadSelectedCpuSets(GetCurrentThread(), ids, n)) {
+        fprintf(stderr, "reims-lab: device-ccd %s ccd=%d sets=%lu\n", who, ccd, (unsigned long)n);
+    }
+}
+
 void (*whpx_wp_invalidate_hook)(void);
 static int whpx_wp_busy;
 static unsigned whpx_wp_gen;

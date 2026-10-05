@@ -2673,6 +2673,9 @@ void reims_vgpu_lab_device_prio(const char *who)
 #if defined(_WIN32)
     static int on = -1;
 
+#ifndef REIMS_DIRTY_STRESS
+    whpx_lab_pin_ccd(who);   /* TEMP lab DEVICE_CCD */
+#endif
     if (on < 0) {
         const char *e = getenv("REIMS_VGPU_LAB_DEVICE_PRIO");
 
