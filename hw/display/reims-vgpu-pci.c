@@ -945,6 +945,16 @@ static void reims_vgpu_pci_guest_write_sync_many(void *ctx, const uint64_t *toke
     }
 }
 
+/* HostOps.guest_write_sync_ahead (TEMP lab SYNC_AHEAD): queue the named sets for the workers. */
+static void reims_vgpu_pci_guest_write_sync_ahead(void *ctx, const uint64_t *tokens, size_t count)
+{
+    ReimsVGPUPCIState *s = ctx;
+
+    if (s->dirty_ondemand) {
+        reims_vgpu_dirty_sync_ahead(s->dirty, tokens, count);
+    }
+}
+
 /* HostOps.note_work_scope: which doorbells bind the reads that follow. */
 static void reims_vgpu_pci_note_work_scope(void *ctx, uint32_t scope)
 {
@@ -1678,6 +1688,7 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         .thread_detach = reims_vgpu_shim_thread_detach,
         .note_ring_tail = reims_vgpu_pci_note_ring_tail,
         .guest_write_sync_many = reims_vgpu_pci_guest_write_sync_many,
+        .guest_write_sync_ahead = reims_vgpu_pci_guest_write_sync_ahead,
         .track_guest_writes = reims_vgpu_pci_track_guest_writes,
         .untrack_guest_writes = reims_vgpu_pci_untrack_guest_writes,
         .guest_write_gen = reims_vgpu_pci_guest_write_gen,

@@ -380,6 +380,15 @@ struct ReimsVgpuDirty {
     GArray *od_work;          /* uint64_t tokens of the current prefetch */
     guint od_work_next;
     uint64_t od_work_epoch;   /* epoch the list was built for; 0 = none */
+    /*
+     * TEMP lab SYNC_AHEAD (reims_vgpu_dirty_sync_ahead): tokens the device named as about to be
+     * read — a pass's later chunks — for the workers to sync now, ahead of the prefetch list.
+     * Under `lock`; reset to empty when its last token is taken.
+     */
+    GArray *ahead;
+    guint ahead_next;
+    uint64_t lab_ahead_req, lab_ahead_q, lab_ahead_done, lab_ahead_hit, lab_ahead_busy,
+             lab_ahead_full;
     uint64_t read_counter;    /* first reads of a set in an epoch, in order */
     /* Generation reads may skip `lock` for synced sets (lab A/B
      * REIMS_VGPU_DIRTY_GEN_FAST=off restores the locked read). */
@@ -819,8 +828,8 @@ struct ReimsVgpuDirty {
      */
     bool wp_calm;
     /*
-     * Lab DIRTY_HASH_DUE (opt-in, =on): the background hashes a hashed set when its next read is
-     * due — 4 doorbells from its shortest recent read gap past its last read — instead of at every
+     * Lab DIRTY_HASH_DUE (on by default; =off restores the old window): the background hashes a
+     * hashed set when its next read is due — 4 doorbells from its shortest recent read gap past its last read — instead of at every
      * doorbell for the 4 doorbells right after any read. A set read once a frame (~5 doorbells
      * apart) was hashed up to 4 times for nothing and then, outside the window by its next read,
      * hashed again on the drain; n185: 210-224 s of hashing a boot (~1 core, ~9 GB/s), 20 s of it
@@ -1129,6 +1138,7 @@ ReimsVgpuDirty *reims_vgpu_dirty_new(void)
         d->fjob[k].chunks = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyChunk));
     }
     d->od_work = g_array_new(FALSE, FALSE, sizeof(uint64_t));
+    d->ahead = g_array_new(FALSE, FALSE, sizeof(uint64_t));   /* lab SYNC_AHEAD */
     d->sets = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free,
                                     reims_vgpu_dirty_set_free);
     d->logged = g_hash_table_new(NULL, NULL);
@@ -1156,6 +1166,7 @@ void reims_vgpu_dirty_free(ReimsVgpuDirty *d)
         g_free(d->od_workers);
     }
     g_array_free(d->od_work, TRUE);
+    g_array_free(d->ahead, TRUE);   /* lab SYNC_AHEAD */
     g_array_free(d->split_chunks, TRUE);
     g_array_free(d->pstamps, TRUE);
     for (int k = 0; k < REIMS_VGPU_DIRTY_FGSLOTS_MAX; k++) {
@@ -5988,6 +5999,23 @@ static void reims_vgpu_dirty_prefetch_drain(ReimsVgpuDirty *d, uint64_t epoch)
         uint64_t token;
 
         qemu_mutex_lock(&d->lock);
+        if (!d->od_stop && d->ahead_next < d->ahead->len) {
+            /*
+             * Lab SYNC_AHEAD: a set the device named is read sooner than a guessed hot one, so
+             * the named queue goes first even in the middle of an epoch's list.
+             */
+            token = g_array_index(d->ahead, uint64_t, d->ahead_next++);
+            if (d->ahead_next == d->ahead->len) {
+                g_array_set_size(d->ahead, 0);
+                d->ahead_next = 0;
+            }
+            qemu_mutex_unlock(&d->lock);
+            reims_vgpu_dirty_sync_one(d, token, false, 0, NULL, NULL);
+            qemu_mutex_lock(&d->lock);
+            d->lab_ahead_done++;
+            qemu_mutex_unlock(&d->lock);
+            continue;
+        }
         if (d->od_stop || d->od_work_epoch != epoch || d->epoch != epoch ||
             d->od_work_next >= d->od_work->len) {
             qemu_mutex_unlock(&d->lock);
@@ -6019,6 +6047,19 @@ static void *reims_vgpu_dirty_od_worker(void *opaque)
             reims_vgpu_dirty_split_help(d);
             continue;
         }
+        if (d->ahead_next < d->ahead->len) {   /* lab SYNC_AHEAD: named reads first */
+            uint64_t token = g_array_index(d->ahead, uint64_t, d->ahead_next++);
+
+            if (d->ahead_next == d->ahead->len) {
+                g_array_set_size(d->ahead, 0);
+                d->ahead_next = 0;
+            }
+            qemu_mutex_unlock(&d->lock);
+            reims_vgpu_dirty_sync_one(d, token, false, 0, NULL, NULL);
+            qemu_mutex_lock(&d->lock);
+            d->lab_ahead_done++;
+            continue;
+        }
         if (epoch == done || epoch == 0) {
             qemu_cond_wait(&d->od_work_cond, &d->lock);
             continue;
@@ -6031,6 +6072,59 @@ static void *reims_vgpu_dirty_od_worker(void *opaque)
     qemu_mutex_unlock(&d->lock);
     rcu_unregister_thread();
     return NULL;
+}
+
+/* Most tokens the ahead queue holds; past it a pass's names wait for its own reads. */
+#define REIMS_VGPU_DIRTY_AHEAD_MAX 1024
+
+/*
+ * TEMP lab SYNC_AHEAD: queue the sets of `tokens` for the prefetch workers to sync for the epoch
+ * current when a worker reaches them, and return. The device names the sets a pass's later chunks
+ * are about to read (their planned binds), so by the time those reads run they find the sets synced
+ * — a hash or a query on a worker instead of on the reader, and no wait behind another thread's.
+ * Skipped as sync_tokens skips them: unknown tokens, unarmed sets (their arming sync stays with the
+ * read), sets already synced for the reads' epoch, protected ones; and sets a sync is already
+ * hashing. Never waits; without workers it does nothing. Safe from any thread.
+ */
+void reims_vgpu_dirty_sync_ahead(ReimsVgpuDirty *d, const uint64_t *tokens, size_t count)
+{
+    uint64_t needed;
+    size_t k;
+
+    if (!d || !tokens || count == 0 || !qatomic_read(&d->ondemand)) {
+        return;
+    }
+    qemu_mutex_lock(&d->lock);
+    if (d->od_nworkers == 0 || d->od_stop) {
+        qemu_mutex_unlock(&d->lock);
+        return;
+    }
+    needed = reims_vgpu_dirty_needed_epoch(d);
+    d->lab_ahead_req += count;
+    for (k = 0; k < count; k++) {
+        uint64_t tk = tokens[k] & ~REIMS_VGPU_DIRTY_TOKEN_LAGGED;
+        ReimsVgpuDirtySet *s = tk ? g_hash_table_lookup(d->sets, &tk) : NULL;
+
+        if (!s || s->gen == 0 || s->wp_state == WP_ON) {
+            continue;
+        }
+        if (qatomic_load_acquire(&s->synced_epoch) >= needed) {
+            d->lab_ahead_hit++;
+            continue;
+        }
+        if (s->hash_busy) {
+            d->lab_ahead_busy++;
+            continue;
+        }
+        if (d->ahead->len - d->ahead_next >= REIMS_VGPU_DIRTY_AHEAD_MAX) {
+            d->lab_ahead_full++;
+            break;
+        }
+        g_array_append_val(d->ahead, tk);
+        d->lab_ahead_q++;
+    }
+    qemu_cond_broadcast(&d->od_work_cond);
+    qemu_mutex_unlock(&d->lock);
 }
 
 void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
@@ -6123,8 +6217,15 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                      MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_HASH_NS"))) : 250;
         d->hash_max = getenv("REIMS_VGPU_LAB_DIRTY_HASH_MAX") ?
                       MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_HASH_MAX"))) : 4096;
-        d->hash_due = getenv("REIMS_VGPU_LAB_DIRTY_HASH_DUE") &&   /* opt-in until its A/B */
-                      strcmp(getenv("REIMS_VGPU_LAB_DIRTY_HASH_DUE"), "on") == 0;
+        /*
+         * On by default (2026-10-05, interleaved x2 on both hosts with the scene modes pinned:
+         * Intel n222 glass windowed 155.4/155.3 against 146.1/154.8 Hz and full screen 130.9/146.5
+         * against 131.8/136.7; AMD hq042 193.9/196.3 against 189.0/191.6 and 142.0/123.1 against
+         * 120.2/117.2; transitions alike within a mode; hash syncs -26-35 %, waits -34-46 %);
+         * `=off` restores hashing a hot set at each of the 4 doorbells after a read.
+         */
+        d->hash_due = !(getenv("REIMS_VGPU_LAB_DIRTY_HASH_DUE") &&
+                        strcmp(getenv("REIMS_VGPU_LAB_DIRTY_HASH_DUE"), "off") == 0);
         d->hash_all = getenv("REIMS_VGPU_LAB_DIRTY_HASH_ALL") &&
                       strcmp(getenv("REIMS_VGPU_LAB_DIRTY_HASH_ALL"), "on") == 0;
         /*
@@ -6858,11 +6959,16 @@ static void reims_vgpu_dirty_hash_report(ReimsVgpuDirty *d)
     fprintf(stderr, "reims-dirty-hash sets=%" PRIu64 " syncs=%" PRIu64 " pages=%" PRIu64
             " us=%" PRIu64 " dirty=%" PRIu64 " fg=%" PRIu64 " fg_us=%" PRIu64
             " waits=%" PRIu64 " noram=%" PRIu64 " pf=%" PRIu64 " split=%" PRIu64 " helped=%" PRIu64
-            " due_skipped=%" PRIu64 "\n",
+            " due_skipped=%" PRIu64 " ahead_req=%" PRIu64 " ahead_q=%" PRIu64 " ahead_done=%" PRIu64
+            " ahead_hit=%" PRIu64 " ahead_busy=%" PRIu64 " ahead_full=%" PRIu64 "\n",
             d->lab_hash_sets, d->lab_hash_syncs, d->lab_hash_pages,
             d->lab_hash_ns / 1000, d->lab_hash_dirty, d->lab_hash_fg,
             d->lab_hash_fg_ns / 1000, d->lab_hash_waits, qatomic_read(&d->lab_hash_noram),
-            d->lab_hash_pf, d->lab_hash_split, d->lab_hash_split_helped, d->lab_hash_due_skipped);
+            d->lab_hash_pf, d->lab_hash_split, d->lab_hash_split_helped, d->lab_hash_due_skipped,
+            d->lab_ahead_req, d->lab_ahead_q, d->lab_ahead_done, d->lab_ahead_hit,
+            d->lab_ahead_busy, d->lab_ahead_full);
+    d->lab_ahead_req = d->lab_ahead_q = d->lab_ahead_done = d->lab_ahead_hit = 0;
+    d->lab_ahead_busy = d->lab_ahead_full = 0;
     d->lab_hash_split = d->lab_hash_split_helped = d->lab_hash_due_skipped = 0;
     d->lab_hash_syncs = d->lab_hash_pages = d->lab_hash_ns = d->lab_hash_dirty = 0;
     d->lab_hash_fg = d->lab_hash_fg_ns = d->lab_hash_waits = d->lab_hash_pf = 0;

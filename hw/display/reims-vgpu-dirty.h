@@ -61,6 +61,8 @@ void reims_vgpu_dirty_untrack(ReimsVgpuDirty *d, uint64_t token);
 uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token);
 /* TEMP lab PREP_SYNC: bring the named sets up to date in one merged query (see the .c). */
 void reims_vgpu_dirty_sync_tokens(ReimsVgpuDirty *d, const uint64_t *tokens, size_t count);
+/* TEMP lab SYNC_AHEAD: queue the named sets for the prefetch workers to sync now; never waits. */
+void reims_vgpu_dirty_sync_ahead(ReimsVgpuDirty *d, const uint64_t *tokens, size_t count);
 
 /*
  * Which pages of the set were written, not just whether any were.
