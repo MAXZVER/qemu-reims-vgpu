@@ -1149,6 +1149,13 @@ static uint64_t reims_vgpu_dirty_gap_live;
 static uint64_t reims_vgpu_dirty_call_ns_live;
 /* TEMP lab live DIRTY_HASH_MAX=<pages>: REIMS_VGPU_LAB_DIRTY_HASH_MAX from the live file, 0 = not set. */
 static uint64_t reims_vgpu_dirty_hash_max_live;
+/*
+ * TEMP lab live DIRTY_WP_STREAK=<syncs> and DIRTY_WP_AGE_MS=<ms> (0 = not set): the clean syncs in a row and the age
+ * a set needs before the WP step protects it. The thread mode's 128 syncs and 1 s + 2 ms a run were sized for
+ * transition surfaces that die young; the 5K sets the drain syncs most are long-lived and never written (hq079
+ * fgtop: 10.8k pages, streak 112, gen 1, not protected - every sync of one is hundreds of hypervisor calls).
+ */
+static uint64_t reims_vgpu_dirty_wp_streak_live, reims_vgpu_dirty_wp_age_live;
 
 static uint64_t reims_vgpu_dirty_call_ns(void)
 {
@@ -1166,6 +1173,10 @@ static void reims_vgpu_dirty_gap_refresh(void)
     qatomic_set(&reims_vgpu_dirty_call_ns_live, v > 0 ? (uint64_t)v : 0);
     v = reims_vgpu_lab_live_num("DIRTY_HASH_MAX");
     qatomic_set(&reims_vgpu_dirty_hash_max_live, v > 0 ? (uint64_t)v : 0);
+    v = reims_vgpu_lab_live_num("DIRTY_WP_STREAK");
+    qatomic_set(&reims_vgpu_dirty_wp_streak_live, v > 0 ? (uint64_t)v : 0);
+    v = reims_vgpu_lab_live_num("DIRTY_WP_AGE_MS");
+    qatomic_set(&reims_vgpu_dirty_wp_age_live, v > 0 ? (uint64_t)v : 0);
 }
 
 /* TEMP lab DIRTY_TIGHT: whether a sync bridges only gaps of tracked pages (one look a sync). */
@@ -1911,6 +1922,11 @@ static void reims_vgpu_dirty_wp_orphan(ReimsVgpuDirty *d, const ReimsVgpuDirtySe
 /* Lab DIRTY_WP_CALM: how long a set must have lived before protecting it is worth its remaps. */
 static int64_t reims_vgpu_dirty_wp_age_need(const ReimsVgpuDirty *d, const ReimsVgpuDirtySet *s)
 {
+    uint64_t live = qatomic_read(&reims_vgpu_dirty_wp_age_live);   /* TEMP lab live DIRTY_WP_AGE_MS */
+
+    if (live) {
+        return (int64_t)live * SCALE_MS;
+    }
     return (int64_t)d->wp_age_ms * SCALE_MS + (int64_t)d->wp_age_run_us * s->nruns * SCALE_US;
 }
 
@@ -4424,7 +4440,8 @@ static bool reims_vgpu_dirty_eval_set(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
     s->seen_seq = d->global_seq;
     if (d->wp_mode && d->wp_active && !by_harvest && s->wp_state == WP_NONE && s->gen != 0 &&
         s->count * (s->page_size >> shift) >= d->wp_min_pages) {   /* lab DIRTY_WP */
-        uint32_t need = d->wp_streak_need << MIN(s->wp_lost, 6);
+        uint32_t need = (uint32_t)(qatomic_read(&reims_vgpu_dirty_wp_streak_live) ?: d->wp_streak_need)
+                        << MIN(s->wp_lost, 6);   /* TEMP lab live DIRTY_WP_STREAK */
 
         s->wp_streak = any ? 0 : s->wp_streak + 1;
         /*
