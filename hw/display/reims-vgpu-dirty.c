@@ -869,6 +869,7 @@ struct ReimsVgpuDirty {
      * them so and no write is lost; read-only (DIRTY_WP) pages are left to the WP step.
      */
     bool up_on;
+    bool up_ready;                /* the populate threads exist (on, or a live file that may turn it on) */
     int up_threads;
     QemuMutex up_mutex;
     QemuCond up_cond;
@@ -1019,6 +1020,74 @@ static uint32_t reims_vgpu_dirty_lab_mode(const char *name)
         return 2;
     }
     return 0;
+}
+
+/*
+ * TEMP lab REIMS_VGPU_LAB_LIVE_FILE (crates/reims-vgpu/src/runtime/lab_live.rs): the live value of lab switch `name`
+ * (without the REIMS_VGPU_LAB_ prefix) in the host-written file - 1 for `on`, 0 for any other value, -1 when the
+ * variable is unset or the file is missing or does not name it. So an A/B runs as phases inside one boot instead of a
+ * boot an arm. Re-read at most every 200 ms. Any thread.
+ */
+static int reims_vgpu_lab_live(const char *name)
+{
+    static GMutex lock;
+    static int state;            /* 0 not looked, 1 no file variable, 2 file variable set */
+    static char *path;
+    static gint64 checked_us;
+    static char *keys[32];
+    static int vals[32];
+    static int n;
+    gint64 now;
+    int i, r = -1;
+
+    g_mutex_lock(&lock);
+    if (state == 0) {
+        const char *e = getenv("REIMS_VGPU_LAB_LIVE_FILE");
+
+        state = e && *e ? 2 : 1;
+        path = state == 2 ? g_strdup(e) : NULL;
+    }
+    if (state == 2) {
+        now = g_get_monotonic_time();
+        if (checked_us == 0 || now - checked_us >= 200000) {
+            gchar *text = NULL;
+
+            checked_us = now;
+            for (i = 0; i < n; i++) {
+                g_free(keys[i]);
+            }
+            n = 0;
+            if (g_file_get_contents(path, &text, NULL, NULL)) {
+                gchar **lines = g_strsplit(text, "\n", -1);
+
+                for (i = 0; lines[i] && n < (int)ARRAY_SIZE(keys); i++) {
+                    gchar *ln = g_strstrip(lines[i]);
+                    gchar *eq = strchr(ln, '=');
+
+                    if (!eq || eq == ln) {
+                        continue;
+                    }
+                    *eq = '\0';
+                    if (g_str_has_prefix(ln, "REIMS_VGPU_LAB_")) {
+                        ln += strlen("REIMS_VGPU_LAB_");
+                    }
+                    keys[n] = g_strdup(g_strstrip(ln));
+                    vals[n] = strcmp(g_strstrip(eq + 1), "on") == 0;
+                    n++;
+                }
+                g_strfreev(lines);
+                g_free(text);
+            }
+        }
+        for (i = 0; i < n; i++) {
+            if (strcmp(keys[i], name) == 0) {
+                r = vals[i];
+                break;
+            }
+        }
+    }
+    g_mutex_unlock(&lock);
+    return r;
 }
 
 static void reims_vgpu_dirty_set_free(gpointer p)
@@ -1724,6 +1793,14 @@ static size_t reims_vgpu_dirty_wp_release_merged(ReimsVgpuDirty *d, const ReimsV
 static void reims_vgpu_dirty_wp_set_runs(ReimsVgpuDirty *d, const ReimsVgpuDirtySet *s, size_t p);
 static void reims_vgpu_dirty_wp_release_orphans(ReimsVgpuDirty *d, int *budget);
 
+/* TEMP lab DIRTY_WP_MERGE, its live value when a live file names it. */
+static bool reims_vgpu_dirty_wp_merge_on(ReimsVgpuDirty *d)
+{
+    int v = reims_vgpu_lab_live("DIRTY_WP_MERGE");
+
+    return v < 0 ? d->wp_merge : v;
+}
+
 /* TEMP lab DIRTY_WP_MERGE: spans one store fault gives back before the step takes over. */
 #define REIMS_WP_MERGE_FAULT_SPANS 64
 
@@ -1807,7 +1884,7 @@ static bool reims_vgpu_dirty_wp_fault(uint64_t gpa)
          * storing into that very region — the stress gate's wp_hole rows lost writes that way.
          * DIRTY_WP_MERGE gives more back only under a query ticket with marks, which closes that.
          */
-        if (d->wp_merge && !d->wp_hole) {
+        if (reims_vgpu_dirty_wp_merge_on(d) && !d->wp_hole) {
             int budget = REIMS_WP_MERGE_FAULT_SPANS;
 
             d->lab_wp_merge_fault++;
@@ -2428,7 +2505,7 @@ static bool reims_vgpu_dirty_wp_step(ReimsVgpuDirty *d)
     if (d->wp_calm) {
         reims_vgpu_dirty_wp_bury(d);   /* lab DIRTY_WP_CALM */
     }
-    if (d->wp_merge) {
+    if (reims_vgpu_dirty_wp_merge_on(d)) {
         reims_vgpu_dirty_wp_release_orphans(d, &budget);   /* TEMP lab DIRTY_WP_MERGE */
     }
     while (budget > 0 && d->wp_orphans->len) {
@@ -2455,7 +2532,7 @@ static bool reims_vgpu_dirty_wp_step(ReimsVgpuDirty *d)
             i++;
             continue;
         }
-        if (d->wp_merge && s->wp_next < s->count) {
+        if (reims_vgpu_dirty_wp_merge_on(d) && s->wp_next < s->count) {
             /* TEMP lab DIRTY_WP_MERGE: merged spans, no yield (a span or a few a set). */
             size_t used;
 
@@ -2821,7 +2898,9 @@ void reims_vgpu_dirty_untrack(ReimsVgpuDirty *d, uint64_t token)
             }
             g_free(okey);
             d->lab_hash_sets -= ((ReimsVgpuDirtySet *)oval)->hash != NULL;   /* lab DIRTY_HASH */
-            if (d->up_on && !(((ReimsVgpuDirtySet *)oval)->hash && d->hash_mode)) {
+            if (d->up_ready && (reims_vgpu_lab_live("UNTRACK_POPULATE") < 0 ? d->up_on
+                                : reims_vgpu_lab_live("UNTRACK_POPULATE") == 1) &&
+                !(((ReimsVgpuDirtySet *)oval)->hash && d->hash_mode)) {
                 reims_vgpu_dirty_up_queue(d, oval);   /* TEMP lab UNTRACK_POPULATE */
             }
             if (d->wp_calm && d->wp_dead && ((ReimsVgpuDirtySet *)oval)->wp_listed) {
@@ -6539,8 +6618,10 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
         /* TEMP lab UNTRACK_POPULATE (opt-in for its A/B). */
         d->up_on = getenv("REIMS_VGPU_LAB_UNTRACK_POPULATE") &&
                    strcmp(getenv("REIMS_VGPU_LAB_UNTRACK_POPULATE"), "on") == 0;
-        if (d->up_on) {
+        if (d->up_on || getenv("REIMS_VGPU_LAB_LIVE_FILE")) {
             int t;
+
+            d->up_ready = true;
 
             d->up_threads = getenv("REIMS_VGPU_LAB_UNTRACK_POPULATE_THREADS") ?
                             MIN(8, MAX(1, atoi(getenv("REIMS_VGPU_LAB_UNTRACK_POPULATE_THREADS")))) : 2;
