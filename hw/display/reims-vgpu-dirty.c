@@ -842,6 +842,25 @@ struct ReimsVgpuDirty {
     int wp_waiters;               /* store faults waiting for `wp_mutex` (atomic) */
     uint64_t lab_wp_young, lab_wp_dead, lab_wp_yields;
     /*
+     * TEMP lab REIMS_VGPU_LAB_UNTRACK_POPULATE=on: the queried (not hashed) sets this tracker stops
+     * tracking have their writable pages' second-level entries filled in for write on threads of
+     * their own (`up_threads`, UNTRACK_POPULATE_THREADS, 2), before the guest reuses the pages. A
+     * query leaves its pages write-protected for dirty logging, and on a host without PML (AMD) the
+     * guest's first store into each is a hypervisor exit: WindowServer zeroes the pages of the
+     * surfaces a full-screen transition frees and allocates again at ~2 us a page there - 51 % of
+     * its main thread's CPU in transitions (hq051 wp1: __bzero 4285 of 9667 samples, 2.08M pages
+     * wired in 5.2 s over 24 transitions), and on AMD the guest, not the device, paces the
+     * transition. A populate for write marks its pages dirty, so a set that reads them later finds
+     * them so and no write is lost; read-only (DIRTY_WP) pages are left to the WP step.
+     */
+    bool up_on;
+    int up_threads;
+    QemuMutex up_mutex;
+    QemuCond up_cond;
+    GArray *up_queue;               /* ReimsVgpuDirtyRun, under `up_mutex` */
+    uint64_t lab_up_sets, lab_up_runs, lab_up_pages, lab_up_calls, lab_up_fail, lab_up_ns, lab_up_dropped;
+    int64_t lab_up_last_ns;
+    /*
      * REIMS_VGPU_LAB_DIRTY_PERIOD=on: a set of at least `period_big` pages joins
      * a prefetch batch only when the batch's epoch is at least its shortest
      * recent read gap past its last read. A set read once a frame spans ~3
@@ -2444,6 +2463,106 @@ static void reims_vgpu_dirty_wp_bh(void *opaque)
     }
 }
 
+/* TEMP lab UNTRACK_POPULATE: a thread that fills in writable entries for untracked sets' pages. */
+static void *reims_vgpu_dirty_up_thread_fn(void *opaque)
+{
+    ReimsVgpuDirty *d = opaque;
+    GArray *batch = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyRun));
+
+    rcu_register_thread();
+    for (;;) {
+        GArray *q;
+        guint i;
+        int64_t now, was;
+
+        qemu_mutex_lock(&d->up_mutex);
+        while (!d->up_queue->len) {
+            qemu_cond_wait(&d->up_cond, &d->up_mutex);
+        }
+        q = d->up_queue;
+        d->up_queue = batch;
+        batch = q;
+        qemu_mutex_unlock(&d->up_mutex);
+        for (i = 0; i < batch->len; i += 256) {
+            unsigned n = MIN(256, batch->len - i);
+            uint64_t pages = 0;
+            int64_t t0 = get_clock();
+            guint k;
+            int rc = 0;
+
+            for (k = 0; k < n; k++) {
+                pages += g_array_index(batch, ReimsVgpuDirtyRun, i + k).size >> qemu_target_page_bits();
+            }
+#ifndef REIMS_DIRTY_STRESS
+            rc = whpx_populate_write((const uint64_t *)&g_array_index(batch, ReimsVgpuDirtyRun, i), n);
+#endif
+            qatomic_add(&d->lab_up_ns, (uint64_t)(get_clock() - t0));
+            qatomic_inc(&d->lab_up_calls);
+            qatomic_add(&d->lab_up_runs, n);
+            qatomic_add(&d->lab_up_pages, pages);
+            if (rc < 0) {
+                qatomic_inc(&d->lab_up_fail);
+            }
+        }
+        g_array_set_size(batch, 0);
+        now = get_clock();
+        was = qatomic_read(&d->lab_up_last_ns);
+        if (now - was >= NANOSECONDS_PER_SECOND && qatomic_cmpxchg(&d->lab_up_last_ns, was, now) == was) {
+            fprintf(stderr, "reims-dirty-up sets=%" PRIu64 " runs=%" PRIu64 " pages=%" PRIu64
+                    " calls=%" PRIu64 " fail=%" PRIu64 " us=%" PRIu64 " dropped=%" PRIu64 "\n",
+                    qatomic_xchg(&d->lab_up_sets, 0), qatomic_xchg(&d->lab_up_runs, 0),
+                    qatomic_xchg(&d->lab_up_pages, 0), qatomic_xchg(&d->lab_up_calls, 0),
+                    qatomic_xchg(&d->lab_up_fail, 0), qatomic_xchg(&d->lab_up_ns, 0) / 1000,
+                    qatomic_xchg(&d->lab_up_dropped, 0));
+        }
+    }
+    return NULL;
+}
+
+/*
+ * TEMP lab UNTRACK_POPULATE: queue the writable runs of `s`, a queried set being untracked, for the
+ * populate threads. `lock` held; the WP bits are read without `wp_mutex` - a page a remap turns
+ * read-only meanwhile only gets its populate refused, which loses nothing.
+ */
+static void reims_vgpu_dirty_up_queue(ReimsVgpuDirty *d, const ReimsVgpuDirtySet *s)
+{
+    uint64_t pg = 1ULL << qemu_target_page_bits();
+    size_t p = 0;
+    guint added = 0;
+
+    qemu_mutex_lock(&d->up_mutex);
+    while (p < s->count) {
+        uint64_t end, a, start;
+        size_t q = reims_vgpu_dirty_wp_run(s, p, &end);
+
+        for (a = s->pages[p]; a < end;) {
+            while (a < end && reims_vgpu_dirty_wp_ro(d, a)) {
+                a += pg;
+            }
+            start = a;
+            while (a < end && !reims_vgpu_dirty_wp_ro(d, a)) {
+                a += pg;
+            }
+            if (a > start) {
+                if (d->up_queue->len >= (1u << 20)) {
+                    qatomic_inc(&d->lab_up_dropped);
+                } else {
+                    ReimsVgpuDirtyRun r = { .gpa = start, .size = a - start };
+
+                    g_array_append_val(d->up_queue, r);
+                    added++;
+                }
+            }
+        }
+        p = q;
+    }
+    if (added) {
+        qatomic_inc(&d->lab_up_sets);
+        qemu_cond_broadcast(&d->up_cond);
+    }
+    qemu_mutex_unlock(&d->up_mutex);
+}
+
 void reims_vgpu_dirty_untrack(ReimsVgpuDirty *d, uint64_t token)
 {
     bool bury = false;
@@ -2510,6 +2629,9 @@ void reims_vgpu_dirty_untrack(ReimsVgpuDirty *d, uint64_t token)
             }
             g_free(okey);
             d->lab_hash_sets -= ((ReimsVgpuDirtySet *)oval)->hash != NULL;   /* lab DIRTY_HASH */
+            if (d->up_on && !(((ReimsVgpuDirtySet *)oval)->hash && d->hash_mode)) {
+                reims_vgpu_dirty_up_queue(d, oval);   /* TEMP lab UNTRACK_POPULATE */
+            }
             if (d->wp_calm && d->wp_dead && ((ReimsVgpuDirtySet *)oval)->wp_listed) {
                 /*
                  * Lab DIRTY_WP_CALM: the WP step may be holding it; it orphans the set's read-only
@@ -6217,6 +6339,27 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                      MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_HASH_NS"))) : 250;
         d->hash_max = getenv("REIMS_VGPU_LAB_DIRTY_HASH_MAX") ?
                       MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_HASH_MAX"))) : 4096;
+#ifndef REIMS_DIRTY_STRESS
+        /* TEMP lab UNTRACK_POPULATE (opt-in for its A/B). */
+        d->up_on = getenv("REIMS_VGPU_LAB_UNTRACK_POPULATE") &&
+                   strcmp(getenv("REIMS_VGPU_LAB_UNTRACK_POPULATE"), "on") == 0;
+        if (d->up_on) {
+            int t;
+
+            d->up_threads = getenv("REIMS_VGPU_LAB_UNTRACK_POPULATE_THREADS") ?
+                            MIN(8, MAX(1, atoi(getenv("REIMS_VGPU_LAB_UNTRACK_POPULATE_THREADS")))) : 2;
+            qemu_mutex_init(&d->up_mutex);
+            qemu_cond_init(&d->up_cond);
+            d->up_queue = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyRun));
+            for (t = 0; t < d->up_threads; t++) {
+                QemuThread th;
+
+                qemu_thread_create(&th, "reims-dirty-up", reims_vgpu_dirty_up_thread_fn, d,
+                                   QEMU_THREAD_DETACHED);
+            }
+            fprintf(stderr, "reims-dirty-up on: threads=%d\n", d->up_threads);
+        }
+#endif
         /*
          * On by default (2026-10-05, interleaved x2 on both hosts with the scene modes pinned:
          * Intel n222 glass windowed 155.4/155.3 against 146.1/154.8 Hz and full screen 130.9/146.5

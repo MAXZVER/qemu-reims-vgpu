@@ -432,6 +432,28 @@ static void whpx_lab_wp_populate(uint64_t gpa, uint64_t size, bool writable)
     }
 }
 
+/*
+ * TEMP (lab, REIMS_VGPU_LAB_UNTRACK_POPULATE): writable second-level entries for guest RAM the device stopped
+ * tracking, filled in by a device thread before the guest reuses the pages. See reims-vgpu-dirty.c.
+ */
+int whpx_populate_write(const uint64_t *ranges, unsigned n)
+{
+    WHV_ADVISE_GPA_RANGE advice = { 0 };
+    HRESULT hr;
+
+    if (!n) {
+        return 0;
+    }
+    if (!whp_dispatch.WHvAdviseGpaRange || !whpx_global.partition) {
+        return -1;
+    }
+    QEMU_BUILD_BUG_ON(sizeof(WHV_MEMORY_RANGE_ENTRY) != 2 * sizeof(uint64_t));
+    advice.Populate.AccessType = WHvMemoryAccessWrite;
+    hr = whp_dispatch.WHvAdviseGpaRange(whpx_global.partition, (const WHV_MEMORY_RANGE_ENTRY *)ranges, n,
+                                        WHvAdviseGpaRangeCodePopulate, &advice, sizeof(advice));
+    return FAILED(hr) ? -2 : 0;
+}
+
 int whpx_wp_remap(uint64_t gpa, uint64_t size, bool writable)
 {
     struct whpx_state *whpx = &whpx_global;
