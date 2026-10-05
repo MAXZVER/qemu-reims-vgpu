@@ -1189,10 +1189,11 @@ static int reims_vgpu_dirty_hash_bg_once_live;
 static int reims_vgpu_dirty_wp_hashed_live;
 /*
  * TEMP lab live DIRTY_WP_HASHED_STREAK=<syncs>: the clean hash syncs a hashed set needs before WP_HASHED
- * protects it, apart from DIRTY_WP_STREAK (the queried sets'). p009 (Intel, 5K sets hashed): the drain's
- * foreground syncs took 245 ms a second, nearly all of it hashing 5K sets the guest leaves alone; hq084/hq085
- * (AMD): WP_HASHED at the queried sets' streak (16) protected sets the guest wrote again soon, and the remaps
- * cost the guest more than the hashes. 0 = DIRTY_WP_STREAK's need.
+ * protects it, apart from DIRTY_WP_STREAK (the queried sets'). hq082 (AMD): the readers re-hash 5K sets the guest
+ * leaves alone 40-82 times a second; hq084/hq085 (AMD): WP_HASHED at the queried sets' streak (16) protected sets
+ * the guest wrote again soon, and the remaps cost the guest more than the hashes. (p009, Intel: the drain's
+ * foreground syncs are 23-29 ms a second with the 5K sets hashed - little left to win there.) 0 = DIRTY_WP_STREAK's
+ * need.
  */
 static uint64_t reims_vgpu_dirty_wp_hashed_streak_live;
 
