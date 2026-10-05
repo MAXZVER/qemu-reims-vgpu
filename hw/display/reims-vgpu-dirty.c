@@ -18,6 +18,7 @@
 #include "system/ramlist.h"
 #include "system/cpus.h"
 #include "system/whpx-wp.h"
+#include <immintrin.h>   /* TEMP lab: the AVX2 page hash */
 
 #include "reims-vgpu-dirty.h"
 
@@ -202,6 +203,7 @@ typedef struct ReimsVgpuDirtySplitJob {
     bool busy;                /* published and its owner not yet done */
 } ReimsVgpuDirtySplitJob;
 #define REIMS_VGPU_DIRTY_FGSLOTS_MAX 8
+#define REIMS_VGPU_DIRTY_HJOBS 4   /* TEMP lab: concurrent split hash jobs */
 
 /*
  * The target page frames' query epochs (see `qep`), published through RCU so
@@ -515,7 +517,8 @@ struct ReimsVgpuDirty {
      * take in turn (`next`), the owner (the sync holding the set's `hash_busy`) taking its share and
      * waiting for `done == total` on `split_cond`. Fields are written by the owner before `busy` and
      * not again until every chunk is done; a chunk writes only its own pages' `hash` and `moved`.
-     * Under `lock`.
+     * Under `lock`. TEMP lab: REIMS_VGPU_DIRTY_HJOBS slots (was one), so a second large set's hash
+     * is split across the workers too instead of running alone on its reader.
      */
     struct {
         ReimsVgpuDirtySet *s;
@@ -526,7 +529,7 @@ struct ReimsVgpuDirty {
         size_t chunk;
         guint next, done, total;
         bool busy;
-    } hjob;
+    } hjob[REIMS_VGPU_DIRTY_HJOBS];
     uint64_t lab_hash_split, lab_hash_split_helped;
     /*
      * TEMP lab DIRTY_FGSLOT (on unless =off): a large foreground sync gets a
@@ -1156,6 +1159,13 @@ static uint64_t reims_vgpu_dirty_hash_max_live;
  * fgtop: 10.8k pages, streak 112, gen 1, not protected - every sync of one is hundreds of hypervisor calls).
  */
 static uint64_t reims_vgpu_dirty_wp_streak_live, reims_vgpu_dirty_wp_age_live;
+/*
+ * TEMP lab live DIRTY_HASH_BG_MAX=<pages> (0 = no bound): a hashed set larger than this is not hashed by
+ * the background prefetch at every doorbell, only when a read needs it (split across the workers) or
+ * a pass names it ahead. hq080: hashing the 5K sets (10.8k pages) in the background as well tied up
+ * ~4 GB/s of hashing and put ch5's serve at 15 ms.
+ */
+static uint64_t reims_vgpu_dirty_hash_bg_max_live;
 
 static uint64_t reims_vgpu_dirty_call_ns(void)
 {
@@ -1177,6 +1187,8 @@ static void reims_vgpu_dirty_gap_refresh(void)
     qatomic_set(&reims_vgpu_dirty_wp_streak_live, v > 0 ? (uint64_t)v : 0);
     v = reims_vgpu_lab_live_num("DIRTY_WP_AGE_MS");
     qatomic_set(&reims_vgpu_dirty_wp_age_live, v > 0 ? (uint64_t)v : 0);
+    v = reims_vgpu_lab_live_num("DIRTY_HASH_BG_MAX");
+    qatomic_set(&reims_vgpu_dirty_hash_bg_max_live, v > 0 ? (uint64_t)v : 0);
 }
 
 /* TEMP lab DIRTY_TIGHT: whether a sync bridges only gaps of tracked pages (one look a sync). */
@@ -1569,8 +1581,68 @@ static bool reims_vgpu_dirty_hash_pick(ReimsVgpuDirty *d, const uint64_t *pages,
     return own * d->hash_ns < calls * reims_vgpu_dirty_call_ns() + walked * 26;
 }
 
+/*
+ * TEMP lab: the same question a lane-multiply hash answers, at memory speed - XXH3's accumulate step
+ * (each 64-bit word: its halves swapped, plus the product of the low and high halves of word ^ key)
+ * over two 256-bit accumulators, then a scalar avalanche. 19-21 GB/s a thread on the i7-14700K
+ * against 12 for the scalar lanes (out-of-cache pages); every single-bit change of a 4 KiB page moves
+ * it. `len` a multiple of 64. One kernel for the process's life: hashes are only compared with hashes
+ * the same kernel took (REIMS_VGPU_LAB_DIRTY_HASH_AVX2=off keeps the scalar one).
+ */
+__attribute__((target("avx2")))
+static uint64_t reims_vgpu_dirty_hash_bytes_avx2(const uint8_t *p, size_t len)
+{
+    const __m256i k0 = _mm256_set_epi64x(0x1cad21f72c81017cLL, (long long)0xdb979083e96dd4deULL,
+                                         0x1f67b3b7a4a44072LL, 0x78e5c0cc4ee679cbLL);
+    const __m256i k1 = _mm256_set_epi64x(0x2172ffcc7dd05a82LL, (long long)0x8e2443f7744608b8ULL,
+                                         0x4c263a81e69035e0LL, (long long)0xcb00c391bb52283cULL);
+    __m256i a0 = _mm256_set1_epi64x((long long)0x9E3779B185EBCA87ULL);
+    __m256i a1 = _mm256_set1_epi64x((long long)0xC2B2AE3D27D4EB4FULL);
+    uint64_t l[8], h = len * 0x9E3779B185EBCA87ULL;
+    size_t i;
+    int k;
+
+    for (i = 0; i < len; i += 64) {
+        __m256i d0 = _mm256_loadu_si256((const __m256i *)(p + i));
+        __m256i d1 = _mm256_loadu_si256((const __m256i *)(p + i + 32));
+        __m256i x0 = _mm256_xor_si256(d0, k0), x1 = _mm256_xor_si256(d1, k1);
+        __m256i m0 = _mm256_mul_epu32(x0, _mm256_srli_epi64(x0, 32));
+        __m256i m1 = _mm256_mul_epu32(x1, _mm256_srli_epi64(x1, 32));
+
+        a0 = _mm256_add_epi64(a0, _mm256_add_epi64(_mm256_shuffle_epi32(d0, 0x4E), m0));
+        a1 = _mm256_add_epi64(a1, _mm256_add_epi64(_mm256_shuffle_epi32(d1, 0x4E), m1));
+    }
+    _mm256_storeu_si256((__m256i *)l, a0);
+    _mm256_storeu_si256((__m256i *)(l + 4), a1);
+    for (k = 0; k < 8; k++) {
+        h ^= l[k] * 0xC2B2AE3D27D4EB4FULL;
+        h = rol64(h, 27) * 0x9E3779B185EBCA87ULL + 0x165667B19E3779F9ULL;
+    }
+    h ^= h >> 33;
+    h *= 0xC2B2AE3D27D4EB4FULL;
+    h ^= h >> 29;
+    h *= 0x165667B19E3779F9ULL;
+    h ^= h >> 32;
+    return h;
+}
+
+/* TEMP lab: whether this process hashes with the AVX2 kernel (decided once). */
+static bool reims_vgpu_dirty_hash_avx2(void)
+{
+    static int v = -1;
+
+    if (v < 0) {
+        const char *e = getenv("REIMS_VGPU_LAB_DIRTY_HASH_AVX2");
+
+        __builtin_cpu_init();
+        v = __builtin_cpu_supports("avx2") && !(e && strcmp(e, "off") == 0);
+        fprintf(stderr, "reims-dirty-hash-kernel avx2=%d\n", v);
+    }
+    return v;
+}
+
 /* A 64-bit hash of `len` bytes (a multiple of 32): four independent multiply-rotate lanes. */
-static uint64_t reims_vgpu_dirty_hash_bytes(const uint8_t *p, size_t len)
+static uint64_t reims_vgpu_dirty_hash_bytes_scalar(const uint8_t *p, size_t len)
 {
     const uint64_t k1 = 0x9E3779B185EBCA87ULL, k2 = 0xC2B2AE3D27D4EB4FULL;
     uint64_t a = k1 + k2, b = k2, c = 0, e = -k1, h;
@@ -1592,6 +1664,15 @@ static uint64_t reims_vgpu_dirty_hash_bytes(const uint8_t *p, size_t len)
     h *= k1;
     h ^= h >> 32;
     return h;
+}
+
+/* A page's content hash: the AVX2 kernel where the host has it (TEMP lab), else the scalar lanes. */
+static uint64_t reims_vgpu_dirty_hash_bytes(const uint8_t *p, size_t len)
+{
+    if (len % 64 == 0 && reims_vgpu_dirty_hash_avx2()) {
+        return reims_vgpu_dirty_hash_bytes_avx2(p, len);
+    }
+    return reims_vgpu_dirty_hash_bytes_scalar(p, len);
 }
 
 uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
@@ -5706,23 +5787,55 @@ static void reims_vgpu_dirty_hash_range(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
     }
 }
 
-/* Lab DIRTY_HASH: take chunks of the running hash job until none is left. d->lock held. */
+/* Lab DIRTY_HASH: whether a running hash job has a chunk left to take. d->lock held. */
+static bool reims_vgpu_dirty_hash_pending(ReimsVgpuDirty *d)
+{
+    int j;
+
+    for (j = 0; j < REIMS_VGPU_DIRTY_HJOBS; j++) {
+        if (d->hjob[j].busy && d->hjob[j].next < d->hjob[j].total) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Lab DIRTY_HASH: take one chunk of a running hash job (preferring slot `first`), if any is left.
+ * d->lock held (dropped while hashing). The slot's fields stay put until its owner sees every chunk
+ * done, so they are read again after the lock is retaken.
+ */
+static bool reims_vgpu_dirty_hash_help_one(ReimsVgpuDirty *d, int first)
+{
+    int i;
+
+    for (i = 0; i < REIMS_VGPU_DIRTY_HJOBS; i++) {
+        int j = (first + i) % REIMS_VGPU_DIRTY_HJOBS;
+
+        if (d->hjob[j].busy && d->hjob[j].next < d->hjob[j].total) {
+            guint k = d->hjob[j].next++;
+            size_t p0 = (size_t)k * d->hjob[j].chunk;
+            size_t p1 = MIN(p0 + d->hjob[j].chunk, d->hjob[j].s->count);
+
+            qemu_mutex_unlock(&d->lock);
+            rcu_read_lock();
+            reims_vgpu_dirty_hash_range(d, d->hjob[j].s, d->hjob[j].slices, d->hjob[j].n, p0, p1,
+                                        d->hjob[j].base, d->hjob[j].moved);
+            rcu_read_unlock();
+            qemu_mutex_lock(&d->lock);
+            if (++d->hjob[j].done == d->hjob[j].total) {
+                qemu_cond_broadcast(&d->split_cond);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Lab DIRTY_HASH: take chunks of the running hash jobs until none is left. d->lock held. */
 static void reims_vgpu_dirty_hash_help(ReimsVgpuDirty *d)
 {
-    while (d->hjob.busy && d->hjob.next < d->hjob.total) {
-        guint k = d->hjob.next++;
-        size_t p0 = (size_t)k * d->hjob.chunk;
-        size_t p1 = MIN(p0 + d->hjob.chunk, d->hjob.s->count);
-
-        qemu_mutex_unlock(&d->lock);
-        rcu_read_lock();
-        reims_vgpu_dirty_hash_range(d, d->hjob.s, d->hjob.slices, d->hjob.n, p0, p1, d->hjob.base,
-                                    d->hjob.moved);
-        rcu_read_unlock();
-        qemu_mutex_lock(&d->lock);
-        if (++d->hjob.done == d->hjob.total) {
-            qemu_cond_broadcast(&d->split_cond);
-        }
+    while (reims_vgpu_dirty_hash_help_one(d, 0)) {
     }
 }
 
@@ -5782,28 +5895,34 @@ static void reims_vgpu_dirty_hash_sync(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
     rcu_read_lock();   /* the set (RCU-freed) and guest RAM stay put while hashing */
     split = false;
     if (s->count * (s->page_size >> shift) >= REIMS_VGPU_DIRTY_HASH_SPLIT_MIN && d->od_nworkers > 0) {
+        int j;
+
         qemu_mutex_lock(&d->lock);
-        if (!d->hjob.busy) {
+        for (j = 0; j < REIMS_VGPU_DIRTY_HJOBS && d->hjob[j].busy; j++) {
+        }
+        if (j < REIMS_VGPU_DIRTY_HJOBS) {
             /* The workers and any waiter take chunks while this thread takes its own share. */
-            d->hjob.s = s;
-            d->hjob.slices = slices;
-            d->hjob.n = n;
-            d->hjob.moved = flags;
-            d->hjob.base = base;
-            d->hjob.chunk = REIMS_VGPU_DIRTY_HASH_CHUNK;
-            d->hjob.next = d->hjob.done = 0;
-            d->hjob.total = (s->count + REIMS_VGPU_DIRTY_HASH_CHUNK - 1) / REIMS_VGPU_DIRTY_HASH_CHUNK;
-            d->hjob.busy = true;
+            d->hjob[j].s = s;
+            d->hjob[j].slices = slices;
+            d->hjob[j].n = n;
+            d->hjob[j].moved = flags;
+            d->hjob[j].base = base;
+            d->hjob[j].chunk = REIMS_VGPU_DIRTY_HASH_CHUNK;
+            d->hjob[j].next = d->hjob[j].done = 0;
+            d->hjob[j].total = (s->count + REIMS_VGPU_DIRTY_HASH_CHUNK - 1) / REIMS_VGPU_DIRTY_HASH_CHUNK;
+            d->hjob[j].busy = true;
             split = true;
             d->lab_hash_split++;
             qemu_cond_broadcast(&d->od_work_cond);
-            reims_vgpu_dirty_hash_help(d);
-            while (d->hjob.done < d->hjob.total) {
-                qemu_cond_wait(&d->split_cond, &d->lock);
+            /* Its own chunks first, then any other job's, then wait for the chunks others took. */
+            while (d->hjob[j].done < d->hjob[j].total) {
+                if (!reims_vgpu_dirty_hash_help_one(d, j)) {
+                    qemu_cond_wait(&d->split_cond, &d->lock);
+                }
             }
-            d->hjob.busy = false;
-            d->hjob.s = NULL;
-            d->hjob.total = d->hjob.done = d->hjob.next = 0;
+            d->hjob[j].busy = false;
+            d->hjob[j].s = NULL;
+            d->hjob[j].total = d->hjob[j].done = d->hjob[j].next = 0;
         }
         qemu_mutex_unlock(&d->lock);
     }
@@ -6660,7 +6779,7 @@ static void *reims_vgpu_dirty_od_worker(void *opaque)
     while (!d->od_stop) {
         uint64_t epoch = d->od_work_epoch;
 
-        if (d->hjob.busy && d->hjob.next < d->hjob.total) {
+        if (reims_vgpu_dirty_hash_pending(d)) {
             d->lab_hash_split_helped++;
             reims_vgpu_dirty_hash_help(d);   /* lab DIRTY_HASH */
             continue;
@@ -7676,6 +7795,11 @@ void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
             ReimsVgpuDirtySet *set = val;
 
             if (set->hash && d->hash_mode) {
+                uint64_t bgmax = qatomic_read(&reims_vgpu_dirty_hash_bg_max_live);
+
+                if (bgmax && set->count * (set->page_size >> qemu_target_page_bits()) > bgmax) {
+                    continue;   /* TEMP lab live DIRTY_HASH_BG_MAX: hashed when read */
+                }
                 /*
                  * Lab DIRTY_HASH: its own hashes, on a worker, never a batch's query — and only for
                  * a set read within about a frame (~3.5 doorbells). A query's bitmap costs ~26 ns a
