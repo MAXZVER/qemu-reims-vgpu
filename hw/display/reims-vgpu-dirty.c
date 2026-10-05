@@ -842,7 +842,8 @@ struct ReimsVgpuDirty {
     int wp_waiters;               /* store faults waiting for `wp_mutex` (atomic) */
     uint64_t lab_wp_young, lab_wp_dead, lab_wp_yields;
     /*
-     * TEMP lab REIMS_VGPU_LAB_DIRTY_WP_MERGE=on: read-only pages go back to writable in merged spans
+     * TEMP lab REIMS_VGPU_LAB_DIRTY_WP_MERGE (on by default, =off restores the one-run give-back and the
+     * one-page fault): read-only pages go back to writable in merged spans
      * (gaps of at most `wp_merge_gap` pages, DIRTY_WP_MERGE_GAP, 512), and a store fault on a dropped
      * set's or an orphan's page gives the whole of it back at once. A remap costs ~200 us whatever its
      * size and a 5K surface is ~2 000 runs: p005 fc0a had 2 500 remaps a second through the
@@ -2089,6 +2090,7 @@ static size_t reims_vgpu_dirty_wp_release_merged(ReimsVgpuDirty *d, const ReimsV
 
     while (i < nr && *budget > 0) {
         uint64_t start = runs[i].gpa, end = runs[i].gpa + runs[i].size, slice_end, a, pt;
+        size_t i0 = i, k;
         int si;
 
         while (start < end && !reims_vgpu_dirty_wp_ro(d, start)) {
@@ -2121,14 +2123,21 @@ static size_t reims_vgpu_dirty_wp_release_merged(ReimsVgpuDirty *d, const ReimsV
         d->wp_tickets_open++;   /* TEMP lab DIRTY_SETTLE_SKIP */
         qemu_mutex_unlock(&d->lock);
         reims_vgpu_dirty_wp_remap(d, start, end - start, true);
-        reims_vgpu_dirty_wp_mark(d->wp_merge_slices, n, start, end);
+        for (k = i0; k < i; k++) {
+            /* The runs only: a gap page stays RW->RW, which keeps its dirty bits (whpover.c). */
+            uint64_t ms = MAX(runs[k].gpa, start), me = MIN(runs[k].gpa + runs[k].size, end);
+
+            if (ms < me) {
+                reims_vgpu_dirty_wp_mark(d->wp_merge_slices, n, ms, me);
+                d->lab_wp_merge_pages += (me - ms) / pg;
+            }
+        }
         qemu_mutex_lock(&d->lock);
         reims_vgpu_dirty_query_end(d, pt);
         d->wp_tickets_open--;   /* TEMP lab DIRTY_SETTLE_SKIP */
         qemu_mutex_unlock(&d->lock);
         d->lab_wp_merge_spans++;
         d->lab_wp_merge_runs++;
-        d->lab_wp_merge_pages += (end - start) / pg;
         (*budget)--;
     }
     return i;
@@ -6674,8 +6683,9 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
             d->wp_list = g_array_new(FALSE, FALSE, sizeof(uint64_t));
             d->wp_orphans = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyRun));
             d->wp_dead = g_ptr_array_new();
-            d->wp_merge = getenv("REIMS_VGPU_LAB_DIRTY_WP_MERGE") &&
-                          strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_MERGE"), "on") == 0;
+            /* On by default since p006 (faults 12 556 -> 4, WindowServer kernel CPU -18 %); =off restores. */
+            d->wp_merge = !(getenv("REIMS_VGPU_LAB_DIRTY_WP_MERGE") &&
+                            strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_MERGE"), "off") == 0);
             d->wp_merge_gap = getenv("REIMS_VGPU_LAB_DIRTY_WP_MERGE_GAP") ?
                               (uint32_t)MAX(0, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_MERGE_GAP"))) : 512;
             d->wp_merge_runs = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyRun));
