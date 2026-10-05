@@ -1173,6 +1173,13 @@ static uint64_t reims_vgpu_dirty_hash_bg_max_live;
  * 89 -> 281 ms a second with the large sets hashed only when read).
  */
 static int reims_vgpu_dirty_hash_bg_once_live;
+/*
+ * TEMP lab live DIRTY_WP_HASHED=on: a hashed set gets the WP step too - its clean hash syncs count as the
+ * clean streak a queried set's syncs give it, under the same need and age. hq082: with the 5K sets hashed, the
+ * readers hashed the same 4-5 of them (10.8k pages, written 0-5 times a boot) 40-82 times a second each; a
+ * protected set reads as synced with no hash and no hypervisor call.
+ */
+static int reims_vgpu_dirty_wp_hashed_live;
 
 static uint64_t reims_vgpu_dirty_call_ns(void)
 {
@@ -1197,6 +1204,7 @@ static void reims_vgpu_dirty_gap_refresh(void)
     v = reims_vgpu_lab_live_num("DIRTY_HASH_BG_MAX");
     qatomic_set(&reims_vgpu_dirty_hash_bg_max_live, v > 0 ? (uint64_t)v : 0);
     qatomic_set(&reims_vgpu_dirty_hash_bg_once_live, reims_vgpu_lab_live("DIRTY_HASH_BG_ONCE") == 1);
+    qatomic_set(&reims_vgpu_dirty_wp_hashed_live, reims_vgpu_lab_live("DIRTY_WP_HASHED") == 1);
 }
 
 /* TEMP lab DIRTY_TIGHT: whether a sync bridges only gaps of tracked pages (one look a sync). */
@@ -5993,6 +6001,23 @@ static void reims_vgpu_dirty_hash_sync(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
         s->hash_base = true;
         s->hash_busy = false;
         qatomic_store_release(&s->synced_epoch, MAX(s->synced_epoch, epoch));
+        if (qatomic_read(&reims_vgpu_dirty_wp_hashed_live) && d->wp_mode && d->wp_active &&
+            s->wp_state == WP_NONE && s->count * (s->page_size >> shift) >= d->wp_min_pages) {
+            /* TEMP lab live DIRTY_WP_HASHED: the clean streak and the queueing of the query path. */
+            uint32_t need = (uint32_t)(qatomic_read(&reims_vgpu_dirty_wp_streak_live) ?: d->wp_streak_need)
+                            << MIN(s->wp_lost, 6);
+
+            s->wp_streak = moved->len ? 0 : s->wp_streak + 1;
+            if (s->wp_streak == need ||
+                ((d->wp_retry || d->wp_calm) && s->wp_streak > need && (s->wp_streak - need) % need == 0)) {
+                if (d->wp_calm && get_clock() - s->born_ns < reims_vgpu_dirty_wp_age_need(d, s)) {
+                    d->lab_wp_young++;
+                } else {
+                    g_array_append_val(d->wp_queue, s->token);
+                    REIMS_WP_BH_SCHEDULE(d->wp_bh);
+                }
+            }
+        }
         if (s->claim_epoch == epoch) {
             s->claim_epoch = 0;
         }
