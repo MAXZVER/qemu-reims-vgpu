@@ -903,6 +903,8 @@ struct ReimsVgpuDirty {
     bool tight;                   /* the switch's environment value */
     uint64_t tight_slack;         /* REIMS_VGPU_LAB_DIRTY_TIGHT_SLACK: untracked pages a bridge may still cross (0) */
     uint64_t lab_tight_kept, lab_tight_cut, lab_tight_cut_pages;
+    /* TEMP lab: foreground syncs of large sets (>= 4096 pages) and their time, by the drain's work channel (7 = All). */
+    uint64_t lab_fgbig_n[8], lab_fgbig_ns[8];
     /*
      * REIMS_VGPU_LAB_DIRTY_PERIOD=on: a set of at least `period_big` pages joins
      * a prefetch batch only when the batch's epoch is at least its shortest
@@ -3925,6 +3927,12 @@ uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token)
         d->lab_od_fg_ns += get_clock() - fg0;
     }
     s = g_hash_table_lookup(d->sets, &token);
+    if (stale && s && s->count * (s->page_size >> qemu_target_page_bits()) >= 4096) {   /* TEMP lab */
+        unsigned ch = MIN(qatomic_read(&d->work_chan), 7u);
+
+        d->lab_fgbig_n[ch]++;
+        d->lab_fgbig_ns[ch] += get_clock() - fg0;
+    }
     if (s) {
         gen = s->gen;
         if (d->gen_memo_mode &&
@@ -4120,6 +4128,12 @@ int64_t reims_vgpu_dirty_written_since(ReimsVgpuDirty *d, uint64_t token,
         d->lab_od_fg_n++;
         d->lab_od_fg_ns += get_clock() - fg0;
         s = g_hash_table_lookup(d->sets, &token);
+        if (s && s->count * (s->page_size >> qemu_target_page_bits()) >= 4096) {   /* TEMP lab */
+            unsigned ch = MIN(qatomic_read(&d->work_chan), 7u);
+
+            d->lab_fgbig_n[ch]++;
+            d->lab_fgbig_ns[ch] += get_clock() - fg0;
+        }
         if (s && l_synced) {   /* TEMP lab (FGTRACE) */
             ReimsVgpuLabRec r = { .t_ns = get_clock() - d->lab_t0, .token = token,
                                   .needed = l_needed, .epoch = l_epoch,
@@ -6576,6 +6590,17 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                     d->lab_settle_skips, d->lab_settle_skip_cand, d->ticket_batch,
                     d->lab_tb_syncs, d->lab_tb_batches);
             reims_vgpu_dirty_gap_refresh();   /* TEMP lab live DIRTY_GAP */
+            {   /* TEMP lab: who syncs the large sets in the foreground */
+                int c;
+
+                fprintf(stderr, "reims-dirty-fgbig");
+                for (c = 0; c < 8; c++) {
+                    fprintf(stderr, " ch%d=%" PRIu64 "/%" PRIu64 "us", c, d->lab_fgbig_n[c],
+                            d->lab_fgbig_ns[c] / 1000);
+                    d->lab_fgbig_n[c] = d->lab_fgbig_ns[c] = 0;
+                }
+                fputc('\n', stderr);
+            }
             if (d->trk_on) {   /* TEMP lab DIRTY_TIGHT */
                 fprintf(stderr, "reims-dirty-tight on=%d gap=%" PRIu64 " kept=%" PRIu64 " cut=%" PRIu64
                         " cut_pages=%" PRIu64 "\n", reims_vgpu_dirty_tight_on(d),
