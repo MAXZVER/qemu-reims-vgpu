@@ -842,6 +842,20 @@ struct ReimsVgpuDirty {
     int wp_waiters;               /* store faults waiting for `wp_mutex` (atomic) */
     uint64_t lab_wp_young, lab_wp_dead, lab_wp_yields;
     /*
+     * TEMP lab REIMS_VGPU_LAB_DIRTY_WP_MERGE=on: read-only pages go back to writable in merged spans
+     * (gaps of at most `wp_merge_gap` pages, DIRTY_WP_MERGE_GAP, 512), and a store fault on a dropped
+     * set's or an orphan's page gives the whole of it back at once. A remap costs ~200 us whatever its
+     * size and a 5K surface is ~2 000 runs: p005 fc0a had 2 500 remaps a second through the
+     * transitions, and one lost set took 7 387 faults (each an exit plus a one-page remap, ~1.5 s of
+     * vCPU time) before the step had given it back. See reims_vgpu_dirty_wp_release_merged().
+     */
+    bool wp_merge;
+    uint32_t wp_merge_gap;
+    ReimsVgpuDirtySlice *wp_merge_slices;   /* under `wp_mutex` */
+    int wp_merge_slices_cap;
+    GArray *wp_merge_runs;                  /* scratch, under `wp_mutex` */
+    uint64_t lab_wp_merge_spans, lab_wp_merge_runs, lab_wp_merge_pages, lab_wp_merge_fault;
+    /*
      * TEMP lab REIMS_VGPU_LAB_UNTRACK_POPULATE=on: the queried (not hashed) sets this tracker stops
      * tracking have their writable pages' second-level entries filled in for write on threads of
      * their own (`up_threads`, UNTRACK_POPULATE_THREADS, 2), before the guest reuses the pages. A
@@ -1704,14 +1718,24 @@ static void reims_vgpu_dirty_wp_yield(ReimsVgpuDirty *d)
     qemu_mutex_lock(&d->wp_mutex);
 }
 
+static size_t reims_vgpu_dirty_wp_release_merged(ReimsVgpuDirty *d, const ReimsVgpuDirtyRun *runs,
+                                                 size_t nr, int *budget);
+static void reims_vgpu_dirty_wp_set_runs(ReimsVgpuDirty *d, const ReimsVgpuDirtySet *s, size_t p);
+static void reims_vgpu_dirty_wp_release_orphans(ReimsVgpuDirty *d, int *budget);
+
+/* TEMP lab DIRTY_WP_MERGE: spans one store fault gives back before the step takes over. */
+#define REIMS_WP_MERGE_FAULT_SPANS 64
+
 /*
  * vCPU thread, a store exit at `gpa` (whpx_handle_mmio). The set holding the page stops being
  * protected (reads stop trusting it before anything is writable); only the page is made writable
- * here, the step function does the rest of the set without a pause.
+ * here, the step function does the rest of the set without a pause. Under DIRTY_WP_MERGE the fault
+ * gives the dropped set (or, for a page no set holds, the orphans) back itself, merged.
  */
 static bool reims_vgpu_dirty_wp_fault(uint64_t gpa)
 {
     ReimsVgpuDirty *d = reims_vgpu_dirty_wp_dev;
+    ReimsVgpuDirtySet *dropped = NULL;   /* TEMP lab DIRTY_WP_MERGE */
     guint i;
 
     if (!d || !qatomic_read(&d->wp_bits) || !reims_vgpu_dirty_wp_ro(d, gpa)) {
@@ -1769,6 +1793,7 @@ static bool reims_vgpu_dirty_wp_fault(uint64_t gpa)
                 if (d->wp_cur == token) {
                     d->wp_cur = 0;
                 }
+                dropped = s;   /* alive while `wp_mutex` is held: only the step frees listed sets */
             }
             qemu_mutex_unlock(&d->lock);
             if (hit && !d->wp_hole) {
@@ -1779,8 +1804,39 @@ static bool reims_vgpu_dirty_wp_fault(uint64_t gpa)
          * Only the page, also under DIRTY_WP_CALM: a whole run made writable here would open pages a
          * concurrent sync is leaving out of its query as read-only (RO_SKIP) while the guest is
          * storing into that very region — the stress gate's wp_hole rows lost writes that way.
+         * DIRTY_WP_MERGE gives more back only under a query ticket with marks, which closes that.
          */
-        reims_vgpu_dirty_wp_remap(d, gpa & ~(uint64_t)4095, 4096, true);
+        if (d->wp_merge && !d->wp_hole) {
+            int budget = REIMS_WP_MERGE_FAULT_SPANS;
+
+            d->lab_wp_merge_fault++;
+            for (i = 0; i < d->wp_list->len && !dropped; i++) {
+                /* A set an earlier fault began dropping, with runs still read-only. */
+                uint64_t token = g_array_index(d->wp_list, uint64_t, i);
+                ReimsVgpuDirtySet *s;
+
+                qemu_mutex_lock(&d->lock);
+                s = g_hash_table_lookup(d->sets, &token);
+                if (s && s->wp_state == WP_DROPPING && reims_vgpu_dirty_wp_has(s, gpa)) {
+                    dropped = s;
+                }
+                qemu_mutex_unlock(&d->lock);
+            }
+            if (dropped) {
+                reims_vgpu_dirty_wp_set_runs(d, dropped, 0);
+                reims_vgpu_dirty_wp_release_merged(d, &g_array_index(d->wp_merge_runs,
+                                                                     ReimsVgpuDirtyRun, 0),
+                                                   d->wp_merge_runs->len, &budget);
+            } else {
+                if (d->wp_calm) {
+                    reims_vgpu_dirty_wp_bury(d);   /* a set untracked since the last step */
+                }
+                reims_vgpu_dirty_wp_release_orphans(d, &budget);
+            }
+        }
+        if (reims_vgpu_dirty_wp_ro(d, gpa)) {
+            reims_vgpu_dirty_wp_remap(d, gpa & ~(uint64_t)4095, 4096, true);
+        }
     }
     d->lab_wp_faults++;
     qemu_mutex_unlock(&d->wp_mutex);
@@ -2004,6 +2060,116 @@ static void reims_vgpu_dirty_wp_mark(const ReimsVgpuDirtySlice *slices, int n, u
         pg = (slices[si].ram_addr + (gpa - slices[si].gpa)) >> shift;
         set_bit_atomic(pg % DIRTY_MEMORY_BLOCK_SIZE, blocks->blocks[pg / DIRTY_MEMORY_BLOCK_SIZE]);
     }
+}
+
+/*
+ * TEMP lab DIRTY_WP_MERGE: make the read-only target pages of `runs` (ascending gpa) writable in as
+ * few remaps as possible, at most `*budget` remaps (each counted against it). Returns how many runs
+ * were consumed.
+ *
+ * A span starts at a run's first read-only page and takes the next run in while the gap up to it is
+ * at most `wp_merge_gap` pages, holds no read-only page (another set's protection stays whole) and
+ * the span stays inside one RAM slice (one remap is one memory region). The gap pages and the run
+ * pages a fault already gave back are writable and tracked; the remap drops their dirty bits as the
+ * protect's RW->RO remap does, so each span is remapped under a query ticket and marked written in
+ * the VGA bitmap after the remap, exactly as protect_chunk does under DIRTY_WP_NOPAUSE: a sync that
+ * settles after the ticket began waits for the marks, and a mark covers every store before the
+ * remap. That is also why a fault may give a whole set back here, where the plain one-page remap of
+ * the fault hook could not (the stress gate lost writes to RO_SKIP that way).
+ *
+ * `wp_mutex` held, `lock` not.
+ */
+static size_t reims_vgpu_dirty_wp_release_merged(ReimsVgpuDirty *d, const ReimsVgpuDirtyRun *runs,
+                                                 size_t nr, int *budget)
+{
+    const uint64_t pg = 1ULL << qemu_target_page_bits();
+    const uint64_t gap_max = (uint64_t)d->wp_merge_gap << qemu_target_page_bits();
+    int n = reims_vgpu_dirty_ram_slices_into(&d->wp_merge_slices, &d->wp_merge_slices_cap);
+    size_t i = 0;
+
+    while (i < nr && *budget > 0) {
+        uint64_t start = runs[i].gpa, end = runs[i].gpa + runs[i].size, slice_end, a, pt;
+        int si;
+
+        while (start < end && !reims_vgpu_dirty_wp_ro(d, start)) {
+            start += pg;
+        }
+        si = start < end ? reims_vgpu_dirty_slice_of(d->wp_merge_slices, n, start) : -1;
+        i++;
+        if (si < 0) {
+            continue;   /* nothing read-only in the run (or not RAM: the plain release skips it too) */
+        }
+        slice_end = d->wp_merge_slices[si].gpa + d->wp_merge_slices[si].len;
+        end = MIN(end, slice_end);
+        while (i < nr) {
+            uint64_t g = runs[i].gpa, g_end = runs[i].gpa + runs[i].size;
+
+            if (g_end > slice_end || (g > end && g - end > gap_max)) {
+                break;
+            }
+            for (a = end; a < g && !reims_vgpu_dirty_wp_ro(d, a); a += pg) {
+            }
+            if (a < g) {
+                break;   /* a read-only page of another set lies in the gap */
+            }
+            end = MAX(end, g_end);
+            i++;
+            d->lab_wp_merge_runs++;
+        }
+        qemu_mutex_lock(&d->lock);
+        pt = reims_vgpu_dirty_query_begin(d);
+        d->wp_tickets_open++;   /* TEMP lab DIRTY_SETTLE_SKIP */
+        qemu_mutex_unlock(&d->lock);
+        reims_vgpu_dirty_wp_remap(d, start, end - start, true);
+        reims_vgpu_dirty_wp_mark(d->wp_merge_slices, n, start, end);
+        qemu_mutex_lock(&d->lock);
+        reims_vgpu_dirty_query_end(d, pt);
+        d->wp_tickets_open--;   /* TEMP lab DIRTY_SETTLE_SKIP */
+        qemu_mutex_unlock(&d->lock);
+        d->lab_wp_merge_spans++;
+        d->lab_wp_merge_runs++;
+        d->lab_wp_merge_pages += (end - start) / pg;
+        (*budget)--;
+    }
+    return i;
+}
+
+/* TEMP lab DIRTY_WP_MERGE: the runs of `s` from page index `p` on, into `wp_merge_runs`. */
+static void reims_vgpu_dirty_wp_set_runs(ReimsVgpuDirty *d, const ReimsVgpuDirtySet *s, size_t p)
+{
+    g_array_set_size(d->wp_merge_runs, 0);
+    while (p < s->count) {
+        uint64_t end;
+        size_t q = reims_vgpu_dirty_wp_run(s, p, &end);
+        ReimsVgpuDirtyRun r = { .gpa = s->pages[p], .size = end - s->pages[p] };
+
+        g_array_append_val(d->wp_merge_runs, r);
+        p = q;
+    }
+}
+
+static int reims_vgpu_dirty_cmp_run(gconstpointer a, gconstpointer b)
+{
+    const ReimsVgpuDirtyRun *x = a, *y = b;
+
+    return x->gpa < y->gpa ? -1 : x->gpa > y->gpa;
+}
+
+/*
+ * TEMP lab DIRTY_WP_MERGE: give the orphan runs back, merged, at most `*budget` remaps. The list is
+ * sorted first (it is appended set by set). `wp_mutex` held, `lock` not.
+ */
+static void reims_vgpu_dirty_wp_release_orphans(ReimsVgpuDirty *d, int *budget)
+{
+    size_t used;
+
+    if (!d->wp_orphans->len) {
+        return;
+    }
+    g_array_sort(d->wp_orphans, reims_vgpu_dirty_cmp_run);
+    used = reims_vgpu_dirty_wp_release_merged(d, &g_array_index(d->wp_orphans, ReimsVgpuDirtyRun, 0),
+                                              d->wp_orphans->len, budget);
+    g_array_remove_range(d->wp_orphans, 0, used);
 }
 
 /*
@@ -2253,6 +2419,9 @@ static bool reims_vgpu_dirty_wp_step(ReimsVgpuDirty *d)
     if (d->wp_calm) {
         reims_vgpu_dirty_wp_bury(d);   /* lab DIRTY_WP_CALM */
     }
+    if (d->wp_merge) {
+        reims_vgpu_dirty_wp_release_orphans(d, &budget);   /* TEMP lab DIRTY_WP_MERGE */
+    }
     while (budget > 0 && d->wp_orphans->len) {
         ReimsVgpuDirtyRun r = g_array_index(d->wp_orphans, ReimsVgpuDirtyRun, d->wp_orphans->len - 1);
 
@@ -2276,6 +2445,20 @@ static bool reims_vgpu_dirty_wp_step(ReimsVgpuDirty *d)
         if (s->wp_state != WP_DROPPING) {
             i++;
             continue;
+        }
+        if (d->wp_merge && s->wp_next < s->count) {
+            /* TEMP lab DIRTY_WP_MERGE: merged spans, no yield (a span or a few a set). */
+            size_t used;
+
+            reims_vgpu_dirty_wp_set_runs(d, s, s->wp_next);
+            used = reims_vgpu_dirty_wp_release_merged(d, &g_array_index(d->wp_merge_runs,
+                                                                        ReimsVgpuDirtyRun, 0),
+                                                      d->wp_merge_runs->len, &budget);
+            while (used-- && s->wp_next < s->count) {
+                uint64_t end;
+
+                s->wp_next = reims_vgpu_dirty_wp_run(s, s->wp_next, &end);
+            }
         }
         while (budget > 0 && s->wp_next < s->count) {
             uint64_t end;
@@ -5943,7 +6126,8 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                         " rej_ro=%" PRIu64 " requeued=%" PRIu64 " ro_skipped=%" PRIu64
                         " hole=%u holed=%" PRIu64 " heal_queued=%" PRIu64 " heals=%" PRIu64
                         " heal_skipped=%" PRIu64 " hole_drops=%" PRIu64 " calm=%u young=%" PRIu64
-                        " dead=%" PRIu64 " yields=%" PRIu64 "\n",
+                        " dead=%" PRIu64 " yields=%" PRIu64 " merge=%u mspans=%" PRIu64
+                        " mruns=%" PRIu64 " mpages=%" PRIu64 " mfault=%" PRIu64 "\n",
                         d->wp_active, d->wp_list ? d->wp_list->len : 0, d->wp_cur != 0,
                         d->lab_wp_protects, d->lab_wp_chunks, d->lab_wp_faults, d->lab_wp_lost,
                         d->lab_wp_dropped, d->wp_orphans ? d->wp_orphans->len : 0, d->lab_wp_remaps,
@@ -5953,8 +6137,11 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                         d->lab_wp_requeued, qatomic_xchg(&d->lab_ro_skipped, 0), d->wp_hole,
                         d->lab_wp_holed, d->lab_wp_heal_queued, d->lab_wp_heals,
                         d->lab_wp_heal_skipped, d->lab_wp_hole_drops, d->wp_calm, d->lab_wp_young,
-                        d->lab_wp_dead, d->lab_wp_yields);
+                        d->lab_wp_dead, d->lab_wp_yields, d->wp_merge, d->lab_wp_merge_spans,
+                        d->lab_wp_merge_runs, d->lab_wp_merge_pages, d->lab_wp_merge_fault);
                 d->lab_wp_young = d->lab_wp_dead = d->lab_wp_yields = 0;
+                d->lab_wp_merge_spans = d->lab_wp_merge_runs = 0;   /* TEMP lab DIRTY_WP_MERGE */
+                d->lab_wp_merge_pages = d->lab_wp_merge_fault = 0;
                 d->lab_wp_holed = d->lab_wp_heal_queued = d->lab_wp_heals = 0;
                 d->lab_wp_heal_skipped = d->lab_wp_hole_drops = 0;
                 d->lab_wp_rej_state = d->lab_wp_rej_gen = d->lab_wp_rej_bits = 0;
@@ -6487,6 +6674,11 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
             d->wp_list = g_array_new(FALSE, FALSE, sizeof(uint64_t));
             d->wp_orphans = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyRun));
             d->wp_dead = g_ptr_array_new();
+            d->wp_merge = getenv("REIMS_VGPU_LAB_DIRTY_WP_MERGE") &&
+                          strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_MERGE"), "on") == 0;
+            d->wp_merge_gap = getenv("REIMS_VGPU_LAB_DIRTY_WP_MERGE_GAP") ?
+                              (uint32_t)MAX(0, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_MERGE_GAP"))) : 512;
+            d->wp_merge_runs = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyRun));
             d->wp_calm = !(getenv("REIMS_VGPU_LAB_DIRTY_WP_CALM") &&
                            strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_CALM"), "off") == 0);
             /* 1 s plus 2 ms a run (its protect and give-back cost ~0.7 ms); the stress rows use 0. */
