@@ -1141,11 +1141,31 @@ static long reims_vgpu_lab_live_num(const char *name)
  */
 static uint64_t reims_vgpu_dirty_gap_live;
 
+/*
+ * TEMP lab live DIRTY_CALL_NS=<ns>: what the hash/query choice of a new set (reims_vgpu_dirty_hash_pick) prices
+ * a hypervisor call at, 0 = not set (5000, the host's own time for one). hq078 says the guest pays far more a
+ * call than the host does, and a hashed set makes no call at all.
+ */
+static uint64_t reims_vgpu_dirty_call_ns_live;
+/* TEMP lab live DIRTY_HASH_MAX=<pages>: REIMS_VGPU_LAB_DIRTY_HASH_MAX from the live file, 0 = not set. */
+static uint64_t reims_vgpu_dirty_hash_max_live;
+
+static uint64_t reims_vgpu_dirty_call_ns(void)
+{
+    uint64_t v = qatomic_read(&reims_vgpu_dirty_call_ns_live);
+
+    return v ? v : 5000;
+}
+
 static void reims_vgpu_dirty_gap_refresh(void)
 {
     long v = reims_vgpu_lab_live_num("DIRTY_GAP");
 
     qatomic_set(&reims_vgpu_dirty_gap_live, v > 0 ? (uint64_t)v : 0);
+    v = reims_vgpu_lab_live_num("DIRTY_CALL_NS");
+    qatomic_set(&reims_vgpu_dirty_call_ns_live, v > 0 ? (uint64_t)v : 0);
+    v = reims_vgpu_lab_live_num("DIRTY_HASH_MAX");
+    qatomic_set(&reims_vgpu_dirty_hash_max_live, v > 0 ? (uint64_t)v : 0);
 }
 
 /* TEMP lab DIRTY_TIGHT: whether a sync bridges only gaps of tracked pages (one look a sync). */
@@ -1516,7 +1536,7 @@ static bool reims_vgpu_dirty_hash_pick(ReimsVgpuDirty *d, const uint64_t *pages,
     uint64_t own = n * (page_size >> shift), walked = 0, calls = 0, start = 0, end = 0;
     size_t i;
 
-    if (own > d->hash_max) {
+    if (own > (qatomic_read(&reims_vgpu_dirty_hash_max_live) ?: d->hash_max)) {   /* TEMP lab live DIRTY_HASH_MAX */
         return false;
     }
     if (d->hash_all) {
@@ -1535,7 +1555,7 @@ static bool reims_vgpu_dirty_hash_pick(ReimsVgpuDirty *d, const uint64_t *pages,
         end = pages[i] + page_size;
     }
     walked += (end - start) >> shift;
-    return own * d->hash_ns < calls * 5000 + walked * 26;
+    return own * d->hash_ns < calls * reims_vgpu_dirty_call_ns() + walked * 26;
 }
 
 /* A 64-bit hash of `len` bytes (a multiple of 32): four independent multiply-rotate lanes. */
