@@ -898,6 +898,7 @@ struct ReimsVgpuDirty {
     struct ReimsVgpuDirtyTrk *trk;
     bool trk_on;                  /* `trk` is kept (the switch set, or a live file that may set it) */
     bool tight;                   /* the switch's environment value */
+    uint64_t tight_slack;         /* REIMS_VGPU_LAB_DIRTY_TIGHT_SLACK: untracked pages a bridge may still cross (0) */
     uint64_t lab_tight_kept, lab_tight_cut, lab_tight_cut_pages;
     /*
      * REIMS_VGPU_LAB_DIRTY_PERIOD=on: a set of at least `period_big` pages joins
@@ -1178,7 +1179,8 @@ static void reims_vgpu_dirty_trk_add(ReimsVgpuDirty *d, const ReimsVgpuDirtySet 
 
 /*
  * TEMP lab DIRTY_TIGHT: whether a sync may bridge target page frames [from, to) between two runs it
- * queries - always without the switch; with it, only when a tracked set holds every one of them. Any
+ * queries - always without the switch; with it, only when a tracked set holds every one of them but
+ * at most `tight_slack` (a scattered set's runs, each its own call, can cost more than the walk). Any
  * thread; a count read while a set is being tracked or untracked only moves where a range ends.
  */
 static bool reims_vgpu_dirty_bridge_ok(ReimsVgpuDirty *d, bool tight, uint64_t from, uint64_t to)
@@ -1193,10 +1195,12 @@ static bool reims_vgpu_dirty_bridge_ok(ReimsVgpuDirty *d, bool tight, uint64_t f
     WITH_RCU_READ_LOCK_GUARD() {
         t = qatomic_rcu_read(&d->trk);
         if (!t || to > t->n) {
-            ok = false;
+            ok = to - from <= d->tight_slack;
         } else {
+            uint64_t foreign = 0;
+
             for (p = from; p < to; p++) {
-                if (!qatomic_read(&t->c[p])) {
+                if (!qatomic_read(&t->c[p]) && ++foreign > d->tight_slack) {
                     ok = false;
                     break;
                 }
@@ -6762,6 +6766,8 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
         d->tight = getenv("REIMS_VGPU_LAB_DIRTY_TIGHT") &&
                    strcmp(getenv("REIMS_VGPU_LAB_DIRTY_TIGHT"), "on") == 0;
         d->trk_on = d->tight || getenv("REIMS_VGPU_LAB_LIVE_FILE");
+        d->tight_slack = getenv("REIMS_VGPU_LAB_DIRTY_TIGHT_SLACK") ?
+                         (uint64_t)MAX(0, atoi(getenv("REIMS_VGPU_LAB_DIRTY_TIGHT_SLACK"))) : 0;
 #ifndef REIMS_DIRTY_STRESS
         /* TEMP lab UNTRACK_POPULATE (opt-in for its A/B). */
         d->up_on = getenv("REIMS_VGPU_LAB_UNTRACK_POPULATE") &&
