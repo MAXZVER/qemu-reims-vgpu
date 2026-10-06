@@ -472,6 +472,8 @@ struct ReimsVgpuDirty {
     uint64_t hash_max;
     uint64_t lab_hash_sets, lab_hash_syncs, lab_hash_pages, lab_hash_ns, lab_hash_dirty;
     uint64_t lab_hash_waits, lab_hash_noram, lab_hash_fg, lab_hash_fg_ns, lab_hash_pf;
+    /* reims_vgpu_dirty_rebase: calls, pages re-baselined, calls that found no hashed baseline */
+    uint64_t lab_rebase_calls, lab_rebase_pages, lab_rebase_unhashed;
     int64_t lab_hash_last;
     uint32_t work_chan;             /* channel of the drain's work scope; 63 = All */
     uint64_t db_chans;              /* channels rung since the last batch took them; bit 63 = unnamed */
@@ -6967,6 +6969,87 @@ void reims_vgpu_dirty_sync_ahead(ReimsVgpuDirty *d, const uint64_t *tokens, size
     qemu_mutex_unlock(&d->lock);
 }
 
+/*
+ * The device itself just stored into these pages of `token`'s set (a writeback landing the frame
+ * the GPU rendered there). A hashed set cannot tell those stores from the guest's: its next sync
+ * sees the pages' content move and reports the device's own frame as the guest writing the
+ * surface, and the reader then refuses the resident that frame came from. Take the pages' hashes
+ * again now, as the set's baseline, so the generation moves only for stores made after this one.
+ * A set the hypervisor answers for needs nothing: the device's stores reach neither the VGA bitmap
+ * (reims_vgpu_shim_write_gpa) nor a protected page (they go through the host's mapping). Pages
+ * outside the set, or outside guest RAM, are left alone. Waits for a running sync of the set.
+ * Safe from any thread.
+ */
+void reims_vgpu_dirty_rebase(ReimsVgpuDirty *d, uint64_t token, const uint64_t *gpas, size_t count)
+{
+    ReimsVgpuDirtySlice *slices = NULL;
+    ReimsVgpuDirtySet *s;
+    uint64_t done = 0;
+    int cap = 0, n;
+    size_t k;
+
+    token &= ~REIMS_VGPU_DIRTY_TOKEN_LAGGED;
+    if (!d || !token || !gpas || count == 0) {
+        return;
+    }
+    qemu_mutex_lock(&d->lock);
+    d->lab_rebase_calls++;
+    s = g_hash_table_lookup(d->sets, &token);
+    while (s && s->hash_busy) {
+        d->lab_hash_waits++;
+        qemu_cond_wait(&d->synced_cond, &d->lock);
+        s = g_hash_table_lookup(d->sets, &token);
+    }
+    if (!s || !s->hash || !s->hash_base) {
+        /* Not hashed, or no baseline yet: the first sync takes one, over these stores too. */
+        d->lab_rebase_unhashed++;
+        qemu_mutex_unlock(&d->lock);
+        return;
+    }
+    s->hash_busy = true;
+    qemu_mutex_unlock(&d->lock);
+
+    n = reims_vgpu_dirty_ram_slices_into(&slices, &cap);
+    rcu_read_lock();   /* the set (RCU-freed) and guest RAM stay put while hashing */
+    for (k = 0; k < count; k++) {
+        uint64_t gpa = gpas[k] & ~(s->page_size - 1);
+        size_t lo = 0, hi = s->count;
+        int si;
+
+        while (lo < hi) {   /* `pages` is sorted */
+            size_t mid = lo + (hi - lo) / 2;
+
+            if (s->pages[mid] < gpa) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo >= s->count || s->pages[lo] != gpa) {
+            continue;
+        }
+        si = reims_vgpu_dirty_slice_of(slices, n, gpa);
+        if (si < 0 || gpa + s->page_size > slices[si].gpa + slices[si].len) {
+            continue;   /* outside guest RAM, or straddling two ranges: its sync keeps reading it as written */
+        }
+        s->hash[lo] = reims_vgpu_dirty_hash_bytes((const uint8_t *)memory_region_get_ram_ptr(slices[si].mr) +
+                                                  slices[si].offset + (gpa - slices[si].gpa),
+                                                  s->page_size);
+        done++;
+    }
+    rcu_read_unlock();
+    g_free(slices);
+
+    qemu_mutex_lock(&d->lock);
+    s = g_hash_table_lookup(d->sets, &token);
+    if (s) {
+        s->hash_busy = false;
+    }
+    d->lab_rebase_pages += done;
+    qemu_cond_broadcast(&d->synced_cond);
+    qemu_mutex_unlock(&d->lock);
+}
+
 void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
 {
     if (d) {
@@ -7867,13 +7950,16 @@ static void reims_vgpu_dirty_hash_report(ReimsVgpuDirty *d)
             " us=%" PRIu64 " dirty=%" PRIu64 " fg=%" PRIu64 " fg_us=%" PRIu64
             " waits=%" PRIu64 " noram=%" PRIu64 " pf=%" PRIu64 " split=%" PRIu64 " helped=%" PRIu64
             " due_skipped=%" PRIu64 " ahead_req=%" PRIu64 " ahead_q=%" PRIu64 " ahead_done=%" PRIu64
-            " ahead_hit=%" PRIu64 " ahead_busy=%" PRIu64 " ahead_full=%" PRIu64 "\n",
+            " ahead_hit=%" PRIu64 " ahead_busy=%" PRIu64 " ahead_full=%" PRIu64
+            " rebase=%" PRIu64 " rebase_pages=%" PRIu64 " rebase_unhashed=%" PRIu64 "\n",
             d->lab_hash_sets, d->lab_hash_syncs, d->lab_hash_pages,
             d->lab_hash_ns / 1000, d->lab_hash_dirty, d->lab_hash_fg,
             d->lab_hash_fg_ns / 1000, d->lab_hash_waits, qatomic_read(&d->lab_hash_noram),
             d->lab_hash_pf, d->lab_hash_split, d->lab_hash_split_helped, d->lab_hash_due_skipped,
             d->lab_ahead_req, d->lab_ahead_q, d->lab_ahead_done, d->lab_ahead_hit,
-            d->lab_ahead_busy, d->lab_ahead_full);
+            d->lab_ahead_busy, d->lab_ahead_full,
+            d->lab_rebase_calls, d->lab_rebase_pages, d->lab_rebase_unhashed);
+    d->lab_rebase_calls = d->lab_rebase_pages = d->lab_rebase_unhashed = 0;
     d->lab_ahead_req = d->lab_ahead_q = d->lab_ahead_done = d->lab_ahead_hit = 0;
     d->lab_ahead_busy = d->lab_ahead_full = 0;
     d->lab_hash_split = d->lab_hash_split_helped = d->lab_hash_due_skipped = 0;

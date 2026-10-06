@@ -955,6 +955,17 @@ static void reims_vgpu_pci_guest_write_sync_ahead(void *ctx, const uint64_t *tok
     }
 }
 
+/* HostOps.guest_write_rebase: the device's own stores into a set's pages (a hashed set re-takes them). */
+static void reims_vgpu_pci_guest_write_rebase(void *ctx, uint64_t token, const uint64_t *gpas,
+                                              size_t count)
+{
+    ReimsVGPUPCIState *s = ctx;
+
+    if (s->dirty) {
+        reims_vgpu_dirty_rebase(s->dirty, token, gpas, count);
+    }
+}
+
 /* HostOps.note_work_scope: which doorbells bind the reads that follow. */
 static void reims_vgpu_pci_note_work_scope(void *ctx, uint32_t scope)
 {
@@ -1689,6 +1700,7 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         .note_ring_tail = reims_vgpu_pci_note_ring_tail,
         .guest_write_sync_many = reims_vgpu_pci_guest_write_sync_many,
         .guest_write_sync_ahead = reims_vgpu_pci_guest_write_sync_ahead,
+        .guest_write_rebase = reims_vgpu_pci_guest_write_rebase,
         .track_guest_writes = reims_vgpu_pci_track_guest_writes,
         .untrack_guest_writes = reims_vgpu_pci_untrack_guest_writes,
         .guest_write_gen = reims_vgpu_pci_guest_write_gen,

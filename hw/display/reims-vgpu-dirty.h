@@ -63,6 +63,12 @@ uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token);
 void reims_vgpu_dirty_sync_tokens(ReimsVgpuDirty *d, const uint64_t *tokens, size_t count);
 /* TEMP lab SYNC_AHEAD: queue the named sets for the prefetch workers to sync now; never waits. */
 void reims_vgpu_dirty_sync_ahead(ReimsVgpuDirty *d, const uint64_t *tokens, size_t count);
+/*
+ * The device itself stored into these page-aligned GPAs of `token`'s set: a hashed set takes their
+ * content as its baseline now, so its generation does not move for the device's own stores (a set
+ * the hypervisor answers for never sees them). Safe from any thread.
+ */
+void reims_vgpu_dirty_rebase(ReimsVgpuDirty *d, uint64_t token, const uint64_t *gpas, size_t count);
 
 /*
  * Which pages of the set were written, not just whether any were.
