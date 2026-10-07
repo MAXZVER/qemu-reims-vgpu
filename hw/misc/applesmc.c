@@ -215,6 +215,50 @@ static void applesmc_io_cmd_write(void *opaque, hwaddr addr, uint64_t val,
     s->data_pos = 0;
 }
 
+/*
+ * TEMP lab (Opus, 2026-10-07): with QEMU_LAB_SMC=1, every key the guest asked
+ * for (read or type) that this SMC does not have, with how many times, since
+ * boot - one "lab-smc missing" line every 5 s while the set grows or is asked.
+ * What macOS looks for and gets "no such key" (PerfPowerServices enumerating
+ * forever was one such gap).
+ */
+static void applesmc_lab_missing(uint8_t cmd, const char *key)
+{
+    static GHashTable *seen;
+    static int64_t last;
+    static uint64_t asked;
+    char k[8];
+    gpointer n;
+    int64_t now;
+
+    if (!getenv("QEMU_LAB_SMC")) {
+        return;
+    }
+    if (!seen) {
+        seen = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    }
+    snprintf(k, sizeof(k), "%c%.4s", cmd == APPLESMC_READ_CMD ? 'r' : 't', key);
+    n = g_hash_table_lookup(seen, k);
+    g_hash_table_insert(seen, g_strdup(k), GUINT_TO_POINTER(GPOINTER_TO_UINT(n) + 1));
+    asked++;
+    now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    if (now - last >= 5000) {
+        GString *g = g_string_new("lab-smc missing");
+        GHashTableIter it;
+        gpointer kk, vv;
+
+        g_string_append_printf(g, " asked=%" PRIu64 " distinct=%u", asked,
+                               g_hash_table_size(seen));
+        g_hash_table_iter_init(&it, seen);
+        while (g_hash_table_iter_next(&it, &kk, &vv)) {
+            g_string_append_printf(g, " %s:%u", (char *)kk, GPOINTER_TO_UINT(vv));
+        }
+        fprintf(stderr, "%s\n", g->str);
+        g_string_free(g, true);
+        last = now;
+    }
+}
+
 static const struct AppleSMCData *applesmc_find_key(AppleSMCState *s)
 {
     struct AppleSMCData *d;
@@ -280,6 +324,9 @@ static void applesmc_io_data_write(void *opaque, hwaddr addr, uint64_t val,
                 s->status = APPLESMC_ST_CMD_DONE;
                 s->status_1e = s->cmd == APPLESMC_GET_KEY_BY_INDEX_CMD ?
                     APPLESMC_ST_1E_BAD_INDEX : APPLESMC_ST_1E_NOEXIST;
+                if (s->cmd != APPLESMC_GET_KEY_BY_INDEX_CMD) {
+                    applesmc_lab_missing(s->cmd, (const char *)s->key);
+                }
             }
         }
         s->read_pos++;
@@ -305,6 +352,7 @@ static void applesmc_io_data_write(void *opaque, hwaddr addr, uint64_t val,
                           s->key[0], s->key[1], s->key[2], s->key[3]);
                 s->status = APPLESMC_ST_CMD_DONE;
                 s->status_1e = APPLESMC_ST_1E_NOEXIST;
+                applesmc_lab_missing(s->cmd, (const char *)s->key);
             }
         }
         s->read_pos++;
