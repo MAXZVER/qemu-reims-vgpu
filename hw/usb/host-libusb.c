@@ -83,6 +83,30 @@ enum USBHostDeviceOptions {
     USB_HOST_OPT_PIPELINE,
 };
 
+/*
+ * Where a keyboard's input report keeps its keys, learned from the HID
+ * report descriptor of the interface (or the boot layout when there is
+ * none): bitmaps of 1-bit variable fields (the modifiers, an NKRO key map)
+ * and arrays of usage codes, each under its report ID.
+ */
+typedef struct USBHostKbdField {
+    uint8_t                          report_id;   /* 0: no report IDs */
+    bool                             bitmap;
+    uint16_t                         bit;         /* after the ID byte */
+    uint16_t                         count;
+    uint8_t                          size;        /* bits per array entry */
+    uint16_t                         first;       /* usage of bit 0 / value lmin */
+    int32_t                          lmin;
+} USBHostKbdField;
+
+#define USB_HOST_KBD_FIELDS 12
+
+typedef struct USBHostKbdLayout {
+    uint8_t                          nfields;
+    bool                             ids;         /* reports carry an ID */
+    USBHostKbdField                  f[USB_HOST_KBD_FIELDS];
+} USBHostKbdLayout;
+
 struct USBHostDevice {
     USBDevice parent_obj;
 
@@ -106,7 +130,8 @@ struct USBHostDevice {
     int                              bus_num;
     int                              addr;
     char                             port[16];
-    uint16_t                         kbd_in_eps;  /* boot keyboard int IN */
+    uint16_t                         kbd_in_eps;  /* keyboard int IN eps */
+    USBHostKbdLayout                 kbd[16];     /* by endpoint number */
     bool                             win32_refused;
 
     int                              hostfd;
@@ -496,41 +521,248 @@ static void usb_host_release_bh(void *opaque)
     usb_host_release_all();
 }
 
-static void usb_host_check_release_combo(USBHostDevice *s, const uint8_t *rep,
-                                         int len)
+/* The boot keyboard report: modifier bitmap, reserved byte, six key codes. */
+static void usb_host_kbd_boot_layout(USBHostKbdLayout *l)
 {
-    uint8_t m;
-    int i;
+    memset(l, 0, sizeof(*l));
+    l->nfields = 2;
+    l->f[0] = (USBHostKbdField) { .bitmap = true, .bit = 0, .count = 8,
+                                  .first = 0xe0 };
+    l->f[1] = (USBHostKbdField) { .bit = 16, .count = 6, .size = 8 };
+}
 
-    /*
-     * Exactly a boot report (8 bytes, reserved byte 0) with Ctrl, Alt and
-     * Shift down, no GUI key, and Escape as the only key: the first field
-     * test (2026-10-07) released everything a minute after boot on some
-     * other report, so nothing looser counts.
-     */
-    if (len != 8 || rep[1] != 0) {
-        return;
-    }
-    m = rep[0];
-    if (!(m & 0x11) || !(m & 0x44) || !(m & 0x22) || (m & 0x88)) {
-        return;
-    }
-    if (rep[2] != USB_HOST_COMBO_KEY) {
-        return;
-    }
-    for (i = 3; i < 8; i++) {
-        if (rep[i]) {
-            return;
+/*
+ * The keyboard fields of a HID report descriptor's input reports (usage
+ * page 7). Push/pop and long items are not followed; a descriptor that
+ * needs them simply yields fewer fields. Returns whether any were found.
+ */
+static bool usb_host_kbd_parse(const uint8_t *d, int len, USBHostKbdLayout *l)
+{
+    uint32_t page = 0, size = 0, count = 0, id = 0, umin = 0, umax = 0;
+    int32_t lmin = 0;
+    uint32_t usage0 = 0;
+    bool have_usage = false, have_range = false;
+    uint16_t off[256] = { 0 };
+    int i = 0;
+
+    memset(l, 0, sizeof(*l));
+    while (i < len) {
+        uint8_t b = d[i], tag = b >> 4, type = (b >> 2) & 3;
+        int n = (b & 3) == 3 ? 4 : (b & 3);
+        uint32_t v = 0;
+        int k;
+
+        if (b == 0xfe) {                       /* long item */
+            if (i + 1 >= len) {
+                break;
+            }
+            i += 3 + d[i + 1];
+            continue;
+        }
+        if (i + 1 + n > len) {
+            break;
+        }
+        for (k = 0; k < n; k++) {
+            v |= (uint32_t)d[i + 1 + k] << (8 * k);
+        }
+        i += 1 + n;
+        if (type == 1) {                       /* global */
+            switch (tag) {
+            case 0: page = v; break;
+            case 1: lmin = n == 1 ? (int8_t)v : n == 2 ? (int16_t)v : (int32_t)v;
+                    break;
+            case 7: size = v; break;
+            case 8: id = v & 0xff; l->ids = true; break;
+            case 9: count = v; break;
+            }
+        } else if (type == 2) {                /* local */
+            uint32_t u = n == 4 ? (v & 0xffff) : v;
+            switch (tag) {
+            case 0: if (!have_usage) { usage0 = u; have_usage = true; } break;
+            case 1: umin = u; have_range = true; break;
+            case 2: umax = u; break;
+            }
+        } else if (type == 0) {                /* main */
+            if (tag == 8) {                    /* input */
+                bool constant = v & 1, variable = v & 2;
+                if (!constant && page == 7 && l->nfields < USB_HOST_KBD_FIELDS) {
+                    USBHostKbdField *f = &l->f[l->nfields];
+                    f->report_id = id;
+                    f->bit = off[id];
+                    f->count = count;
+                    f->size = size;
+                    f->lmin = lmin;
+                    if (variable && size == 1) {
+                        f->bitmap = true;
+                        f->first = have_range ? umin : usage0;
+                        l->nfields++;
+                    } else if (!variable) {
+                        f->first = have_range ? umin : 0;
+                        l->nfields++;
+                    }
+                }
+                off[id] += size * count;
+            }
+            have_usage = have_range = false;
+            umin = umax = 0;
         }
     }
-    info_report("usb-host %04x:%04x: release combo (report %02x %02x %02x "
-                "%02x %02x %02x %02x %02x)", s->ddesc.idVendor,
-                s->ddesc.idProduct, rep[0], rep[1], rep[2], rep[3], rep[4],
-                rep[5], rep[6], rep[7]);
+    (void)umax;
+    return l->nfields > 0;
+}
+
+/*
+ * The release combo: Ctrl+Alt+Shift+Esc on a passed-through keyboard hands
+ * every grabbed device back to the host. Decoded through the interface's
+ * own report layout - modifiers held (no GUI key) and Escape the only key -
+ * in whatever form the keyboard reports: a boot report, an NKRO bitmap, or
+ * a report with an ID. Raw bytes are not enough: the first field test
+ * (2026-10-07) released everything on part of a 64-byte NKRO report, and
+ * missed the real combo on the same keyboard.
+ */
+static void usb_host_check_release_combo(USBHostDevice *s, int ep,
+                                         const uint8_t *rep, int len)
+{
+    const USBHostKbdLayout *l = &s->kbd[ep];
+    uint8_t mods = 0, rid = 0;
+    int keys = 0, esc = 0, i, j;
+    const uint8_t *p = rep;
+
+    if (l->ids) {
+        if (len < 1) {
+            return;
+        }
+        rid = rep[0];
+        p++;
+        len--;
+    }
+    for (i = 0; i < l->nfields; i++) {
+        const USBHostKbdField *f = &l->f[i];
+        if (f->report_id != rid) {
+            continue;
+        }
+        for (j = 0; j < f->count; j++) {
+            uint32_t bit = f->bit + (f->bitmap ? j : j * f->size);
+            uint32_t width = f->bitmap ? 1 : f->size, val = 0, k, usage;
+            if (bit + width > (uint32_t)len * 8 || width > 16) {
+                break;
+            }
+            for (k = 0; k < width; k++) {
+                if (p[(bit + k) / 8] & (1 << ((bit + k) % 8))) {
+                    val |= 1u << k;
+                }
+            }
+            if (f->bitmap) {
+                if (!val) {
+                    continue;
+                }
+                usage = f->first + j;
+            } else {
+                if (val == 0 || (int32_t)val < f->lmin) {
+                    continue;
+                }
+                usage = f->first + (val - f->lmin);
+            }
+            if (usage >= 0xe0 && usage <= 0xe7) {
+                mods |= 1 << (usage - 0xe0);
+            } else if (usage == USB_HOST_COMBO_KEY) {
+                esc++;
+            } else if (usage > 3) {              /* 1-3: rollover/errors */
+                keys++;
+            }
+        }
+    }
+    if (!(mods & 0x11) || !(mods & 0x44) || !(mods & 0x22) || (mods & 0x88) ||
+        esc != 1 || keys) {
+        return;
+    }
+    info_report("usb-host %04x:%04x: release combo (ep %d, report id %u, "
+                "%d bytes, modifiers %02x)", s->ddesc.idVendor,
+                s->ddesc.idProduct, ep, rid, len, mods);
     if (!release_bh) {
         release_bh = qemu_bh_new(usb_host_release_bh, NULL);
     }
     qemu_bh_schedule(release_bh);
+}
+
+/*
+ * Learn the keyboard layout of every HID interface's interrupt IN endpoint
+ * from its report descriptor (a standard GET_DESCRIPTOR to the interface);
+ * a boot keyboard interface whose descriptor cannot be read keeps the boot
+ * layout. Runs at open, before the guest owns the device.
+ */
+static void usb_host_kbd_learn(USBHostDevice *s)
+{
+    struct libusb_config_descriptor *conf;
+    int i, e;
+
+    s->kbd_in_eps = 0;
+    memset(s->kbd, 0, sizeof(s->kbd));
+    if (libusb_get_active_config_descriptor(s->dev, &conf) != 0) {
+        return;
+    }
+    for (i = 0; i < conf->bNumInterfaces; i++) {
+        const struct libusb_interface_descriptor *intf =
+            &conf->interface[i].altsetting[0];
+        int dlen = 0, x, rc;
+        uint8_t *buf;
+        USBHostKbdLayout l;
+        bool boot = intf->bInterfaceSubClass == 1 &&
+                    intf->bInterfaceProtocol == 1;
+        bool found;
+
+        if (intf->bInterfaceClass != LIBUSB_CLASS_HID) {
+            continue;
+        }
+        /* HID descriptor: bLength 0x21 bcdHID country n {type len16}... */
+        for (x = 0; x + 1 < intf->extra_length; x += intf->extra[x]) {
+            const uint8_t *h = intf->extra + x;
+            int k;
+            if (h[0] < 2) {
+                break;
+            }
+            if (h[1] != 0x21 || h[0] < 9) {
+                continue;
+            }
+            for (k = 0; k < h[5] && 6 + 3 * k + 2 < h[0]; k++) {
+                if (h[6 + 3 * k] == 0x22) {
+                    dlen = h[7 + 3 * k] | (h[8 + 3 * k] << 8);
+                }
+            }
+        }
+        found = false;
+        if (dlen > 0) {
+            buf = g_malloc(dlen);
+            rc = libusb_control_transfer(s->dh, 0x81, 6, 0x2200,
+                                         intf->bInterfaceNumber, buf, dlen,
+                                         1000);
+            if (rc > 0) {
+                found = usb_host_kbd_parse(buf, rc, &l);
+            }
+            g_free(buf);
+        }
+        if (!found && boot) {
+            usb_host_kbd_boot_layout(&l);
+            found = true;
+        }
+        if (!found) {
+            continue;
+        }
+        for (e = 0; e < intf->bNumEndpoints; e++) {
+            const struct libusb_endpoint_descriptor *endp = &intf->endpoint[e];
+            int ep = endp->bEndpointAddress & 0xf;
+            if ((endp->bEndpointAddress & USB_DIR_IN) &&
+                (endp->bmAttributes & 3) == USB_ENDPOINT_XFER_INT) {
+                s->kbd[ep] = l;
+                s->kbd_in_eps |= 1 << ep;
+                info_report("usb-host %04x:%04x: keyboard on interface %d "
+                            "ep %d (%u fields%s)", s->ddesc.idVendor,
+                            s->ddesc.idProduct, intf->bInterfaceNumber, ep,
+                            l.nfields, l.ids ? ", report IDs" : "");
+            }
+        }
+    }
+    libusb_free_config_descriptor(conf);
 }
 
 /*
@@ -614,7 +846,8 @@ static void LIBUSB_CALL usb_host_req_complete_data(struct libusb_transfer *xfer)
     if (r->in && xfer->actual_length) {
         usb_packet_copy(r->p, r->buffer, xfer->actual_length);
         if (s->kbd_in_eps & (1 << r->p->ep->nr)) {
-            usb_host_check_release_combo(s, r->buffer, xfer->actual_length);
+            usb_host_check_release_combo(s, r->p->ep->nr, r->buffer,
+                                         xfer->actual_length);
         }
     }
     trace_usb_host_req_complete(s->bus_num, s->addr, r->p,
@@ -1015,7 +1248,6 @@ static void usb_host_ep_update(USBHostDevice *s)
     int rc, i, e;
 
     usb_ep_reset(udev);
-    s->kbd_in_eps = 0;
     rc = libusb_get_active_config_descriptor(s->dev, &conf);
     if (rc != 0) {
         return;
@@ -1063,11 +1295,6 @@ static void usb_host_ep_update(USBHostDevice *s)
             trace_usb_host_parse_endpoint(s->bus_num, s->addr, ep,
                                           (devep & USB_DIR_IN) ? "in" : "out",
                                           tname[type], true);
-            if (intf->bInterfaceClass == LIBUSB_CLASS_HID &&
-                intf->bInterfaceSubClass == 1 && intf->bInterfaceProtocol == 1 &&
-                pid == USB_TOKEN_IN && type == USB_ENDPOINT_XFER_INT) {
-                s->kbd_in_eps |= 1 << ep;
-            }
             usb_ep_set_max_packet_size(udev, pid, ep,
                                        endp->wMaxPacketSize);
             usb_ep_set_type(udev, pid, ep, type);
@@ -1272,6 +1499,7 @@ static int usb_host_open(USBHostDevice *s, libusb_device *dev, int hostfd)
 
     usb_ep_init(udev);
     usb_host_ep_update(s);
+    usb_host_kbd_learn(s);
 
     libusb_speed = libusb_get_device_speed(dev);
 #if LIBUSB_API_VERSION >= 0x01000107 && defined(CONFIG_LINUX) && \
