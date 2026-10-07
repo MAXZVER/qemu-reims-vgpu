@@ -1740,7 +1740,13 @@ static void *file_ram_alloc(RAMBlock *block,
         return NULL;
     }
     block->mr->align = MAX(block->page_size, block->mr->align);
-#if defined(__s390x__)
+    /*
+     * TEMP lab: on Linux too, so a memfd's shmem huge pages can be PMD-mapped
+     * (THPeligible needs the mapping 2 MiB-aligned like its file offset) and
+     * KVM maps the guest with 2 MiB EPT entries; 4 KiB-aligned, every page of
+     * the reims Tahoe guest's RAM stayed a 4 KiB mapping.
+     */
+#if defined(__s390x__) || defined(__linux__)
     if (kvm_enabled()) {
         block->mr->align = MAX(block->mr->align, QEMU_VMALLOC_ALIGN);
     }
