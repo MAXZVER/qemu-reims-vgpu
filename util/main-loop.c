@@ -23,6 +23,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/timer.h"
+#include "qemu/lab-slow.h"
 #include "qapi/error.h"
 #include "qemu/cutils.h"
 #include "qemu/timer.h"
@@ -532,7 +534,11 @@ static int os_host_main_loop_wait(int64_t timeout)
         }
         for (i = 0; i < w->num; i++) {
             if (w->revents[i] && w->func[i]) {
-                w->func[i](w->opaque[i]);
+                int64_t lab_t = qemu_lab_slow_begin();
+                WaitObjectFunc *lab_fn = w->func[i];
+
+                lab_fn(w->opaque[i]);
+                qemu_lab_slow_end("waitobj", NULL, (const void *)lab_fn, lab_t);
             }
         }
     }

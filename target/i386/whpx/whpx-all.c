@@ -9,6 +9,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/timer.h"
+#include "qemu/lab-slow.h"
 #include "system/whpx-wp.h"
 #include "cpu.h"
 #include "qemu/typedefs.h"
@@ -1565,7 +1567,18 @@ static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
     } else {
         bql_lock();
     }
-    ret = emulate_instruction(cpu, ctx->InstructionBytes, ctx->InstructionByteCount);
+    {
+        int64_t lab_t = qemu_lab_slow_begin();
+
+        ret = emulate_instruction(cpu, ctx->InstructionBytes, ctx->InstructionByteCount);
+        if (lab_t) {
+            char what[48];
+
+            snprintf(what, sizeof(what), "gpa=0x%" PRIx64 "%s", (uint64_t)ctx->Gpa,
+                     ctx->AccessInfo.AccessType == WHvMemoryAccessWrite ? ":w" : ":r");
+            qemu_lab_slow_end("mmio", what, NULL, lab_t);
+        }
+    }
     bql_unlock();
     if (ret < 0) {
         error_report("failed to emulate mmio");
@@ -1657,6 +1670,11 @@ static int whpx_handle_portio(CPUState *cpu,
     CPUX86State *env = &x86_cpu->env;
     int ret;
 
+    if (whpx_stats_on()) {
+        /* TEMP lab: ports show in mmio_addrs as 0x10000000000<port><w|r> */
+        whpx_stats_mmio_page(0x1000000000000000ULL | ((uint64_t)ctx->PortNumber << 4) |
+                             (ctx->AccessInfo.IsWrite ? 1 : 0));
+    }
     if (!ctx->AccessInfo.StringOp && !ctx->AccessInfo.IsWrite) {
         uint64_t val = 0;
         WHV_REGISTER_VALUE reg;

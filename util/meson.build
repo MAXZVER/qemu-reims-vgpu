@@ -1,4 +1,4 @@
-util_ss.add(files('osdep.c', 'cutils.c', 'unicode.c', 'qemu-timer-common.c'))
+util_ss.add(files('osdep.c', 'cutils.c', 'unicode.c', 'qemu-timer-common.c', 'lab-slow.c'))
 util_ss.add(files('thread-context.c'), numa)
 if host_os != 'windows'
   util_ss.add(files('aio-posix.c'))
