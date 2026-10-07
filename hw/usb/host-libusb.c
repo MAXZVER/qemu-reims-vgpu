@@ -132,6 +132,7 @@ struct USBHostDevice {
     char                             port[16];
     uint16_t                         kbd_in_eps;  /* keyboard int IN eps */
     USBHostKbdLayout                 kbd[16];     /* by endpoint number */
+    int64_t                          int_done[16]; /* lab stats */
     bool                             win32_refused;
 
     int                              hostfd;
@@ -164,6 +165,7 @@ struct USBHostRequest {
     unsigned char                    *cbuf;
     unsigned int                     clen;
     bool                             usb3ep0quirk;
+    int64_t                          t_submit;    /* lab stats */
     QTAILQ_ENTRY(USBHostRequest)     next;
 };
 
@@ -300,9 +302,13 @@ static void usb_host_del_fd(int fd, void *user_data)
  * libusb's event handling would deadlock against libusb_close() and the
  * synchronous transfers the main loop issues under the BQL.
  */
+/* When libusb called back the completion now running (lab stats). */
+static int64_t usb_host_done_t;
+
 typedef struct USBHostDone {
     struct libusb_transfer           *xfer;
     libusb_transfer_cb_fn            fn;
+    int64_t                          t;
     QSIMPLEQ_ENTRY(USBHostDone)      next;
 } USBHostDone;
 
@@ -327,6 +333,7 @@ static void usb_host_done_run(void)
         if (!d) {
             return;
         }
+        usb_host_done_t = d->t;
         d->fn(d->xfer);
         g_free(d);
     }
@@ -345,6 +352,7 @@ static void usb_host_defer(struct libusb_transfer *xfer,
 
     d->xfer = xfer;
     d->fn = fn;
+    d->t = get_clock();
     qemu_mutex_lock(&done_lock);
     QSIMPLEQ_INSERT_TAIL(&done_queue, d, next);
     qemu_mutex_unlock(&done_lock);
@@ -766,6 +774,62 @@ static void usb_host_kbd_learn(USBHostDevice *s)
 }
 
 /*
+ * TEMP lab: QEMU_USB_HOST_STATS=1 prints, once a second while interrupt IN
+ * transfers complete, where a report's time goes: submit -> libusb callback
+ * (the device; at most its polling interval when it has data), callback ->
+ * completion in the main loop (the event thread's hand-off: BH and BQL),
+ * and completion -> the guest's next submit on that endpoint (the guest's
+ * round trip, during which a device's next report waits).
+ */
+static int usb_host_stats = -1;
+static struct {
+    int64_t t0;
+    uint64_t n, wait_sum, wait_max, bh_sum, bh_max, rt_n, rt_sum, rt_max;
+} ist;
+
+static bool usb_host_stats_on(void)
+{
+    if (usb_host_stats < 0) {
+        const char *e = getenv("QEMU_USB_HOST_STATS");
+        usb_host_stats = e && *e && *e != '0';
+    }
+    return usb_host_stats;
+}
+
+static void usb_host_stats_add(uint64_t *sum, uint64_t *max, int64_t v)
+{
+    if (v < 0) {
+        return;
+    }
+    *sum += v;
+    if ((uint64_t)v > *max) {
+        *max = v;
+    }
+}
+
+static void usb_host_stats_flush(int64_t now)
+{
+    if (!ist.t0) {
+        ist.t0 = now;
+        return;
+    }
+    if (now - ist.t0 < NANOSECONDS_PER_SECOND) {
+        return;
+    }
+    if (ist.n) {
+        info_report("usb-host-stats int_in n=%" PRIu64 " dev_wait_us avg=%" PRIu64
+                    " max=%" PRIu64 " handoff_us avg=%" PRIu64 " max=%" PRIu64
+                    " guest_rt_us avg=%" PRIu64 " max=%" PRIu64,
+                    ist.n, ist.wait_sum / ist.n / 1000, ist.wait_max / 1000,
+                    ist.bh_sum / ist.n / 1000, ist.bh_max / 1000,
+                    ist.rt_n ? ist.rt_sum / ist.rt_n / 1000 : 0,
+                    ist.rt_max / 1000);
+    }
+    memset(&ist, 0, sizeof(ist));
+    ist.t0 = now;
+}
+
+/*
  * USB_HOST_CB(fn) is what a transfer gets as its callback: fn itself where
  * libusb completes in the main loop, a queueing trampoline on Windows.
  */
@@ -845,6 +909,19 @@ static void LIBUSB_CALL usb_host_req_complete_data(struct libusb_transfer *xfer)
     r->p->status = status_map[xfer->status];
     if (r->in && xfer->actual_length) {
         usb_packet_copy(r->p, r->buffer, xfer->actual_length);
+        if (usb_host_stats_on() && xfer->type == LIBUSB_TRANSFER_TYPE_INTERRUPT) {
+            int64_t now = get_clock();
+#ifdef CONFIG_WIN32
+            int64_t cb = usb_host_done_t;
+#else
+            int64_t cb = now;
+#endif
+            ist.n++;
+            usb_host_stats_add(&ist.wait_sum, &ist.wait_max, cb - r->t_submit);
+            usb_host_stats_add(&ist.bh_sum, &ist.bh_max, now - cb);
+            s->int_done[r->p->ep->nr & 15] = now;
+            usb_host_stats_flush(now);
+        }
         if (s->kbd_in_eps & (1 << r->p->ep->nr)) {
             usb_host_check_release_combo(s, r->p->ep->nr, r->buffer,
                                          xfer->actual_length);
@@ -2149,6 +2226,16 @@ static void usb_host_handle_data(USBDevice *udev, USBPacket *p)
         r = usb_host_req_alloc(s, p, p->pid == USB_TOKEN_IN, p->iov.size);
         if (!r->in) {
             usb_packet_copy(p, r->buffer, p->iov.size);
+        }
+        if (r->in && usb_host_stats_on()) {
+            int64_t now = get_clock();
+            int64_t last = s->int_done[p->ep->nr & 15];
+            r->t_submit = now;
+            if (last) {
+                ist.rt_n++;
+                usb_host_stats_add(&ist.rt_sum, &ist.rt_max, now - last);
+                s->int_done[p->ep->nr & 15] = 0;
+            }
         }
         ep = p->ep->nr | (r->in ? USB_DIR_IN : 0);
         libusb_fill_interrupt_transfer(r->xfer, s->dh, ep,
