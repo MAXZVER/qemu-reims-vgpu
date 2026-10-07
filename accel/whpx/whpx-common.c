@@ -1065,6 +1065,97 @@ static void whpx_type_init(void)
     type_register_static(&whpx_cpu_accel_type);
 }
 
+/*
+ * TEMP lab (devices agent, 2026-10-07): QEMU_LAB_WHV_MS=<n> logs every
+ * partition-wide memory call (map, unmap, dirty query, advise) longer than n
+ * ms with its get_clock() stamp. The whole guest freezes 20-150 ms about once
+ * a second (every guest process late by the same amount, d026); these calls
+ * are the host operations that can stop every vCPU at once.
+ */
+static WHvMapGpaRange_t lab_whv_map;
+static WHvUnmapGpaRange_t lab_whv_unmap;
+static WHvQueryGpaRangeDirtyBitmap_t lab_whv_query;
+static WHvAdviseGpaRange_t lab_whv_advise;
+static int64_t lab_whv_ns;
+
+static void lab_whv_log(const char *what, int64_t t0, uint64_t gpa, uint64_t size)
+{
+    int64_t t1 = get_clock();
+
+    if (t1 - t0 > lab_whv_ns) {
+        fprintf(stderr, "lab-whv %s %.2f ms at %" PRId64 " gpa=0x%" PRIx64
+                " size_mb=%" PRIu64 "\n", what, (t1 - t0) / 1e6, t0, gpa,
+                size >> 20);
+    }
+}
+
+static HRESULT WINAPI lab_whv_map_w(WHV_PARTITION_HANDLE p, VOID *src,
+                                    WHV_GUEST_PHYSICAL_ADDRESS gpa, UINT64 size,
+                                    WHV_MAP_GPA_RANGE_FLAGS flags)
+{
+    int64_t t0 = get_clock();
+    HRESULT hr = lab_whv_map(p, src, gpa, size, flags);
+
+    lab_whv_log("map", t0, gpa, size);
+    return hr;
+}
+
+static HRESULT WINAPI lab_whv_unmap_w(WHV_PARTITION_HANDLE p,
+                                      WHV_GUEST_PHYSICAL_ADDRESS gpa, UINT64 size)
+{
+    int64_t t0 = get_clock();
+    HRESULT hr = lab_whv_unmap(p, gpa, size);
+
+    lab_whv_log("unmap", t0, gpa, size);
+    return hr;
+}
+
+static HRESULT WINAPI lab_whv_query_w(WHV_PARTITION_HANDLE p,
+                                      WHV_GUEST_PHYSICAL_ADDRESS gpa, UINT64 size,
+                                      UINT64 *bitmap, UINT32 bytes)
+{
+    int64_t t0 = get_clock();
+    HRESULT hr = lab_whv_query(p, gpa, size, bitmap, bytes);
+
+    lab_whv_log("dirty-query", t0, gpa, size);
+    return hr;
+}
+
+static HRESULT WINAPI lab_whv_advise_w(WHV_PARTITION_HANDLE p,
+                                       const WHV_MEMORY_RANGE_ENTRY *r, UINT32 n,
+                                       WHV_ADVISE_GPA_RANGE_CODE code,
+                                       const VOID *buf, UINT32 bytes)
+{
+    int64_t t0 = get_clock();
+    HRESULT hr = lab_whv_advise(p, r, n, code, buf, bytes);
+
+    lab_whv_log("advise", t0, n ? r[0].GuestAddress : 0, n ? r[0].SizeInBytes : 0);
+    return hr;
+}
+
+static void lab_whv_wrap(void)
+{
+    const char *e = getenv("QEMU_LAB_WHV_MS");
+
+    if (!e || !*e) {
+        return;
+    }
+    lab_whv_ns = (int64_t)(atof(e) * 1e6);
+    lab_whv_map = whp_dispatch.WHvMapGpaRange;
+    whp_dispatch.WHvMapGpaRange = lab_whv_map_w;
+    lab_whv_unmap = whp_dispatch.WHvUnmapGpaRange;
+    whp_dispatch.WHvUnmapGpaRange = lab_whv_unmap_w;
+    if (whp_dispatch.WHvQueryGpaRangeDirtyBitmap) {
+        lab_whv_query = whp_dispatch.WHvQueryGpaRangeDirtyBitmap;
+        whp_dispatch.WHvQueryGpaRangeDirtyBitmap = lab_whv_query_w;
+    }
+    if (whp_dispatch.WHvAdviseGpaRange) {
+        lab_whv_advise = whp_dispatch.WHvAdviseGpaRange;
+        whp_dispatch.WHvAdviseGpaRange = lab_whv_advise_w;
+    }
+    fprintf(stderr, "lab-whv on threshold_ms=%s\n", e);
+}
+
 bool init_whp_dispatch(void)
 {
     if (whp_dispatch_initialized) {
@@ -1076,6 +1167,7 @@ bool init_whp_dispatch(void)
     }
     assert(load_whp_dispatch_fns(&hWinHvPlatform,
         WINHV_PLATFORM_FNS_SUPPLEMENTAL));
+    lab_whv_wrap();
     whp_dispatch_initialized = true;
 
     return true;
