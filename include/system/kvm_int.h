@@ -30,6 +30,11 @@ typedef struct KVMSlot
     /* Dirty bitmap cache for the slot */
     unsigned long *dirty_bmap;
     unsigned long dirty_bmap_size;
+    /*
+     * TEMP lab: KVM_GET_DIRTY_LOG lands here for a ranged sync, which then
+     * copies only its range into dirty_bmap (kvm_slot_sync_dirty_range)
+     */
+    unsigned long *dirty_scratch;
     /* Cache of the address space ID */
     int as_id;
     /* Cache of the offset in ram address space */

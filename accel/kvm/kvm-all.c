@@ -1160,6 +1160,73 @@ static void kvm_dirty_ring_flush(void)
  * @kml: the KVM memory listener object
  * @section: the memory section to sync the dirty bitmap with
  */
+/*
+ * TEMP lab: the slot holding all of [start_addr, start_addr + size), for a
+ * ranged sync's sub-section (kvm_lookup_matching_slot wants the whole slot).
+ */
+static KVMSlot *kvm_lookup_containing_slot(KVMMemoryListener *kml,
+                                           hwaddr start_addr, hwaddr size)
+{
+    int i;
+
+    for (i = 0; i < kml->nr_slots_allocated; i++) {
+        KVMSlot *mem = &kml->slots[i];
+
+        if (mem->memory_size && start_addr >= mem->start_addr &&
+            start_addr + size <= mem->start_addr + mem->memory_size) {
+            return mem;
+        }
+    }
+    return NULL;
+}
+
+/*
+ * TEMP lab: a ranged sync (the reims dirty tracker asks for a surface's pages,
+ * thousands of times a second). KVM_GET_DIRTY_LOG only fetches whole slots,
+ * and with manual protect the kernel's bitmap keeps every page the guest
+ * dirtied anywhere until someone clears it, so merging the whole slot each
+ * time cost milliseconds (~22 GiB of mostly-set bits on a 24 GiB guest). The
+ * slot's bitmap goes to dirty_scratch, and only the range - widened to 64-page
+ * words - is copied into dirty_bmap and merged into QEMU's bitmaps. Bits
+ * outside it stay set in the kernel (manual protect clears nothing on GET) and
+ * dirty_bmap keeps exactly the bits QEMU was given, so kvm_log_clear_one_slot
+ * still clears only merged pages.
+ */
+static void kvm_slot_sync_dirty_range(KVMState *s, KVMSlot *mem,
+                                      hwaddr offset, hwaddr size)
+{
+    uint64_t psize = qemu_real_host_page_size();
+    uint64_t npages = mem->memory_size / psize;
+    uint64_t p0 = (offset / psize) & ~(uint64_t)63;
+    uint64_t p1 = MIN(ROUND_UP(DIV_ROUND_UP(offset + size, psize), 64), npages);
+    struct kvm_dirty_log d = {};
+    int ret;
+
+    if (!mem->dirty_bmap || p1 <= p0) {
+        return;
+    }
+    if (!mem->dirty_scratch) {
+        mem->dirty_scratch = g_malloc0(mem->dirty_bmap_size);
+    }
+    d.dirty_bitmap = mem->dirty_scratch;
+    d.slot = mem->slot | (mem->as_id << 16);
+    ret = kvm_vm_ioctl(s, KVM_GET_DIRTY_LOG, &d);
+    if (ret == -ENOENT) {
+        return;
+    }
+    if (ret) {
+        error_report_once("%s: KVM_GET_DIRTY_LOG failed with %d",
+                          __func__, ret);
+        return;
+    }
+    memcpy((uint64_t *)mem->dirty_bmap + p0 / 64,
+           (uint64_t *)mem->dirty_scratch + p0 / 64,
+           DIV_ROUND_UP(p1 - p0, 64) * sizeof(uint64_t));
+    physical_memory_set_dirty_lebitmap(
+        (unsigned long *)((uint64_t *)mem->dirty_bmap + p0 / 64),
+        mem->ram_start_offset + p0 * psize, p1 - p0);
+}
+
 static void kvm_physical_sync_dirty_bitmap(KVMMemoryListener *kml,
                                            MemoryRegionSection *section)
 {
@@ -1169,6 +1236,22 @@ static void kvm_physical_sync_dirty_bitmap(KVMMemoryListener *kml,
     hwaddr slot_size;
 
     size = kvm_align_section(section, &start_addr);
+    /* TEMP lab: a sub-section of a slot (log_sync_ranged) */
+    if (size && !kvm_lookup_matching_slot(kml, start_addr,
+                                          MIN(kvm_max_slot_size, size))) {
+        mem = kvm_lookup_containing_slot(kml, start_addr, size);
+        if (!mem) {
+            return;
+        }
+        if (s->manual_dirty_log_protect) {
+            kvm_slot_sync_dirty_range(s, mem, start_addr - mem->start_addr,
+                                      size);
+        } else if (kvm_slot_get_dirty_log(s, mem)) {
+            /* the GET cleared the kernel's bitmap: QEMU must take it all */
+            kvm_slot_sync_dirty_pages(mem);
+        }
+        return;
+    }
     while (size) {
         slot_size = MIN(kvm_max_slot_size, size);
         mem = kvm_lookup_matching_slot(kml, start_addr, slot_size);
@@ -1700,6 +1783,8 @@ static void kvm_set_phys_mem(KVMMemoryListener *kml,
             /* unregister the slot */
             g_free(mem->dirty_bmap);
             mem->dirty_bmap = NULL;
+            g_free(mem->dirty_scratch);
+            mem->dirty_scratch = NULL;
             mem->memory_size = 0;
             mem->flags = 0;
             err = kvm_set_user_memory_region(kml, mem, false);
@@ -2112,6 +2197,8 @@ void kvm_memory_listener_register(KVMState *s, KVMMemoryListener *kml,
     } else {
         kml->listener.log_sync = kvm_log_sync;
         kml->listener.log_clear = kvm_log_clear;
+        /* TEMP lab: sub-sections, see kvm_slot_sync_dirty_range */
+        kml->listener.log_sync_ranged = true;
     }
 
     memory_listener_register(&kml->listener, as);
