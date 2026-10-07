@@ -101,6 +101,30 @@ typedef struct USBHostKbdField {
 
 #define USB_HOST_KBD_FIELDS 12
 
+/*
+ * Read-ahead for the interrupt IN endpoints of HID interfaces (mice,
+ * keyboards): a few transfers stay in flight on the device all the time and
+ * their reports queue here, so the device is polled at its own rate instead
+ * of once per guest round trip (event thread -> main loop -> xHCI -> guest ->
+ * next TD -> submit), which a fast-moving mouse felt as stutter (2026-10-07).
+ * A guest packet takes the oldest queued report at once or waits for the
+ * next one. QEMU_USB_HOST_READAHEAD=0 turns it off (A/B).
+ */
+#define USB_HOST_AHEAD_XFERS 4
+#define USB_HOST_AHEAD_QUEUE 128
+#define USB_HOST_AHEAD_MAXPKT 64
+
+typedef struct USBHostAhead {
+    bool                             active;
+    int                              inflight;
+    int                              status;      /* sticky stall/nodev */
+    USBPacket                        *parked;
+    uint16_t                         head, count;
+    uint64_t                         dropped;
+    uint8_t                          len[USB_HOST_AHEAD_QUEUE];
+    uint8_t                          data[USB_HOST_AHEAD_QUEUE][USB_HOST_AHEAD_MAXPKT];
+} USBHostAhead;
+
 typedef struct USBHostKbdLayout {
     uint8_t                          nfields;
     bool                             ids;         /* reports carry an ID */
@@ -133,6 +157,8 @@ struct USBHostDevice {
     uint16_t                         kbd_in_eps;  /* keyboard int IN eps */
     USBHostKbdLayout                 kbd[16];     /* by endpoint number */
     int64_t                          int_done[16]; /* lab stats */
+    uint16_t                         hid_in_eps;   /* HID int IN eps */
+    USBHostAhead                     *ahead[16];
     bool                             win32_refused;
 
     int                              hostfd;
@@ -166,6 +192,7 @@ struct USBHostRequest {
     unsigned int                     clen;
     bool                             usb3ep0quirk;
     int64_t                          t_submit;    /* lab stats */
+    int8_t                           ahead_ep;    /* read-ahead ring, or -1 */
     QTAILQ_ENTRY(USBHostRequest)     next;
 };
 
@@ -484,6 +511,7 @@ static USBHostRequest *usb_host_req_alloc(USBHostDevice *s, USBPacket *p,
     r->host = s;
     r->p = p;
     r->in = in;
+    r->ahead_ep = -1;
     r->xfer = libusb_alloc_transfer(0);
     if (bufsize) {
         r->buffer = g_malloc(bufsize);
@@ -705,6 +733,7 @@ static void usb_host_kbd_learn(USBHostDevice *s)
     int i, e;
 
     s->kbd_in_eps = 0;
+    s->hid_in_eps = 0;
     memset(s->kbd, 0, sizeof(s->kbd));
     if (libusb_get_active_config_descriptor(s->dev, &conf) != 0) {
         return;
@@ -752,6 +781,14 @@ static void usb_host_kbd_learn(USBHostDevice *s)
         if (!found && boot) {
             usb_host_kbd_boot_layout(&l);
             found = true;
+        }
+        for (e = 0; e < intf->bNumEndpoints; e++) {
+            const struct libusb_endpoint_descriptor *endp = &intf->endpoint[e];
+            if ((endp->bEndpointAddress & USB_DIR_IN) &&
+                (endp->bmAttributes & 3) == USB_ENDPOINT_XFER_INT &&
+                endp->wMaxPacketSize <= USB_HOST_AHEAD_MAXPKT) {
+                s->hid_in_eps |= 1 << (endp->bEndpointAddress & 0xf);
+            }
         }
         if (!found) {
             continue;
@@ -943,10 +980,204 @@ out:
 }
 USB_HOST_DEFERRED(usb_host_req_complete_data)
 
+/* ---- read-ahead for HID interrupt IN endpoints (see USBHostAhead) ---- */
+
+static bool usb_host_readahead_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("QEMU_USB_HOST_READAHEAD");
+        on = !(e && *e == '0');
+    }
+    return on;
+}
+
+/* The oldest queued report into the guest's packet. */
+static void usb_host_ahead_pop(USBHostAhead *a, USBPacket *p)
+{
+    size_t len = MIN((size_t)a->len[a->head], p->iov.size);
+
+    usb_packet_copy(p, a->data[a->head], len);
+    a->head = (a->head + 1) % USB_HOST_AHEAD_QUEUE;
+    a->count--;
+    p->status = USB_RET_SUCCESS;
+}
+
+static void LIBUSB_CALL usb_host_ahead_complete(struct libusb_transfer *xfer);
+USB_HOST_DEFERRED(usb_host_ahead_complete)
+
+static int usb_host_ahead_submit(USBHostDevice *s, int ep)
+{
+    USBEndpoint *uep = usb_ep_get(USB_DEVICE(s), USB_TOKEN_IN, ep);
+    int mps = MIN(uep->max_packet_size, USB_HOST_AHEAD_MAXPKT);
+    USBHostRequest *r = usb_host_req_alloc(s, NULL, true, mps);
+    int rc;
+
+    r->ahead_ep = ep;
+    libusb_fill_interrupt_transfer(r->xfer, s->dh, ep | USB_DIR_IN, r->buffer,
+                                   mps, USB_HOST_CB(usb_host_ahead_complete),
+                                   r, INTR_TIMEOUT);
+    rc = libusb_submit_transfer(r->xfer);
+    if (rc != 0) {
+        usb_host_req_free(r);
+        return rc;
+    }
+    s->ahead[ep]->inflight++;
+    return 0;
+}
+
+static void LIBUSB_CALL usb_host_ahead_complete(struct libusb_transfer *xfer)
+{
+    USBHostRequest *r = xfer->user_data;
+    USBHostDevice *s = r->host;
+    int ep = r->ahead_ep;
+    USBHostAhead *a = s->ahead[ep];
+    bool disconnect = (xfer->status == LIBUSB_TRANSFER_NO_DEVICE);
+
+    a->inflight--;
+    if (!a->active || xfer->status == LIBUSB_TRANSFER_CANCELLED) {
+        usb_host_req_free(r);
+        goto out;
+    }
+    if (xfer->status == LIBUSB_TRANSFER_COMPLETED) {
+        int len = MIN(xfer->actual_length, USB_HOST_AHEAD_MAXPKT);
+        if (usb_host_stats_on()) {
+            int64_t now = get_clock();
+#ifdef CONFIG_WIN32
+            int64_t cb = usb_host_done_t;
+#else
+            int64_t cb = now;
+#endif
+            ist.n++;
+            usb_host_stats_add(&ist.bh_sum, &ist.bh_max, now - cb);
+            usb_host_stats_flush(now);
+        }
+        if (len > 0) {
+            int slot;
+            if (s->kbd_in_eps & (1 << ep)) {
+                usb_host_check_release_combo(s, ep, r->buffer, len);
+            }
+            if (a->count == USB_HOST_AHEAD_QUEUE) {
+                a->head = (a->head + 1) % USB_HOST_AHEAD_QUEUE;
+                a->count--;
+                a->dropped++;
+            }
+            slot = (a->head + a->count) % USB_HOST_AHEAD_QUEUE;
+            a->len[slot] = len;
+            memcpy(a->data[slot], r->buffer, len);
+            a->count++;
+        }
+        if (libusb_submit_transfer(r->xfer) == 0) {
+            a->inflight++;
+        } else {
+            usb_host_req_free(r);
+        }
+    } else {
+        a->status = disconnect ? USB_RET_NODEV :
+            xfer->status == LIBUSB_TRANSFER_STALL ? USB_RET_STALL : USB_RET_IOERROR;
+        a->active = false;
+        usb_host_req_free(r);
+    }
+    if (a->parked) {
+        USBPacket *p = a->parked;
+        if (a->count) {
+            a->parked = NULL;
+            usb_host_ahead_pop(a, p);
+            usb_packet_complete(USB_DEVICE(s), p);
+        } else if (!a->active && a->status) {
+            a->parked = NULL;
+            p->status = a->status;
+            a->status = 0;
+            usb_packet_complete(USB_DEVICE(s), p);
+        }
+    }
+out:
+    if (disconnect) {
+        usb_host_nodev(s);
+    }
+}
+
+/*
+ * The ring of ep, running (started on the guest's first poll), or NULL: the
+ * endpoint then goes the plain way - one transfer per guest packet - e.g.
+ * while the transfers of a stopped ring are still draining.
+ */
+static USBHostAhead *usb_host_ahead_start(USBHostDevice *s, int ep)
+{
+    USBHostAhead *a = s->ahead[ep];
+    int i;
+
+    if (!a) {
+        a = s->ahead[ep] = g_new0(USBHostAhead, 1);
+    }
+    if (!a->active && a->inflight == 0) {
+        a->active = true;
+        a->status = 0;
+        a->head = a->count = 0;
+        for (i = 0; i < USB_HOST_AHEAD_XFERS; i++) {
+            if (usb_host_ahead_submit(s, ep) != 0) {
+                break;
+            }
+        }
+        if (a->inflight == 0) {
+            a->active = false;
+        }
+    }
+    return a->active ? a : NULL;
+}
+
+/*
+ * Stop every ring: in-flight transfers are cancelled and free themselves as
+ * they come back; a parked guest packet completes with status.
+ */
+static void usb_host_ahead_stop_all(USBHostDevice *s, int status)
+{
+    USBHostRequest *r;
+    int ep;
+
+    for (ep = 0; ep < 16; ep++) {
+        USBHostAhead *a = s->ahead[ep];
+        if (!a) {
+            continue;
+        }
+        a->active = false;
+        a->head = a->count = 0;
+        a->status = 0;
+        if (a->parked) {
+            USBPacket *p = a->parked;
+            a->parked = NULL;
+            p->status = status;
+            usb_packet_complete(USB_DEVICE(s), p);
+        }
+    }
+    QTAILQ_FOREACH(r, &s->requests, next) {
+        if (r->ahead_ep >= 0) {
+            libusb_cancel_transfer(r->xfer);
+        }
+    }
+}
+
+/* After usb_host_abort_xfers drained every transfer. */
+static void usb_host_ahead_free_all(USBHostDevice *s)
+{
+    int ep;
+
+    for (ep = 0; ep < 16; ep++) {
+        g_free(s->ahead[ep]);
+        s->ahead[ep] = NULL;
+    }
+}
+
 static void usb_host_req_abort(USBHostRequest *r)
 {
     USBHostDevice  *s = r->host;
     bool inflight = (r->p && r->p->state == USB_PACKET_ASYNC);
+
+    if (r->ahead_ep >= 0) {
+        libusb_cancel_transfer(r->xfer);
+        return;
+    }
 
     if (inflight) {
         r->p->status = USB_RET_NODEV;
@@ -1691,7 +1922,9 @@ static int usb_host_close(USBHostDevice *s)
 
     trace_usb_host_close(s->bus_num, s->addr);
 
+    usb_host_ahead_stop_all(s, USB_RET_NODEV);
     usb_host_abort_xfers(s);
+    usb_host_ahead_free_all(s);
     usb_host_iso_free_all(s);
 
     if (udev->attached) {
@@ -1734,6 +1967,7 @@ static void usb_host_exit_notifier(struct Notifier *n, void *data)
     USBHostDevice *s = container_of(n, USBHostDevice, exit);
 
     if (s->dh) {
+        usb_host_ahead_stop_all(s, USB_RET_NODEV);
         usb_host_abort_xfers(s);
         usb_host_release_interfaces(s);
         libusb_reset_device(s->dh);
@@ -1910,6 +2144,10 @@ static void usb_host_cancel_packet(USBDevice *udev, USBPacket *p)
 
     trace_usb_host_req_canceled(s->bus_num, s->addr, p);
 
+    if (s->ahead[p->ep->nr & 15] && s->ahead[p->ep->nr & 15]->parked == p) {
+        s->ahead[p->ep->nr & 15]->parked = NULL;
+        return;
+    }
     r = usb_host_req_find(s, p);
     if (r && r->p) {
         r->p = NULL; /* mark as dead */
@@ -2046,6 +2284,7 @@ static void usb_host_set_config(USBHostDevice *s, int config, USBPacket *p)
 
     trace_usb_host_set_config(s->bus_num, s->addr, config);
 
+    usb_host_ahead_stop_all(s, USB_RET_IOERROR);
     usb_host_release_interfaces(s);
     if (s->ddesc.bNumConfigurations != 1) {
         rc = libusb_set_configuration(s->dh, config);
@@ -2074,6 +2313,7 @@ static void usb_host_set_interface(USBHostDevice *s, int iface, int alt,
     trace_usb_host_set_interface(s->bus_num, s->addr, iface, alt);
 
     usb_host_iso_free_all(s);
+    usb_host_ahead_stop_all(s, USB_RET_IOERROR);
 
     if (iface >= USB_MAX_INTERFACES) {
         p->status = USB_RET_STALL;
@@ -2223,6 +2463,25 @@ static void usb_host_handle_data(USBDevice *udev, USBPacket *p)
         }
         break;
     case USB_ENDPOINT_XFER_INT:
+        if (p->pid == USB_TOKEN_IN && (s->hid_in_eps & (1 << p->ep->nr)) &&
+            usb_host_readahead_on()) {
+            USBHostAhead *a = s->ahead[p->ep->nr];
+            if (a && !a->active && a->status) {
+                p->status = a->status;           /* a stall the ring saw */
+                a->status = 0;
+                return;
+            }
+            a = usb_host_ahead_start(s, p->ep->nr);
+            if (a) {
+                if (a->count) {
+                    usb_host_ahead_pop(a, p);
+                } else {
+                    a->parked = p;
+                    p->status = USB_RET_ASYNC;
+                }
+                return;
+            }
+        }
         r = usb_host_req_alloc(s, p, p->pid == USB_TOKEN_IN, p->iov.size);
         if (!r->in) {
             usb_packet_copy(p, r->buffer, p->iov.size);
@@ -2294,6 +2553,7 @@ static void usb_host_handle_reset(USBDevice *udev)
 
     trace_usb_host_reset(s->bus_num, s->addr);
 
+    usb_host_ahead_stop_all(s, USB_RET_NODEV);
     rc = libusb_reset_device(s->dh);
     if (rc != 0) {
         usb_host_nodev(s);
