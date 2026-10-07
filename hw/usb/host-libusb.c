@@ -822,6 +822,7 @@ static int usb_host_stats = -1;
 static struct {
     int64_t t0;
     uint64_t n, wait_sum, wait_max, bh_sum, bh_max, rt_n, rt_sum, rt_max;
+    uint64_t taken, parked, q_max, dropped;   /* read-ahead */
 } ist;
 
 static bool usb_host_stats_on(void)
@@ -856,11 +857,14 @@ static void usb_host_stats_flush(int64_t now)
     if (ist.n) {
         info_report("usb-host-stats int_in n=%" PRIu64 " dev_wait_us avg=%" PRIu64
                     " max=%" PRIu64 " handoff_us avg=%" PRIu64 " max=%" PRIu64
-                    " guest_rt_us avg=%" PRIu64 " max=%" PRIu64,
+                    " guest_rt_us avg=%" PRIu64 " max=%" PRIu64
+                    " ahead taken=%" PRIu64 " parked=%" PRIu64 " q_max=%" PRIu64
+                    " dropped=%" PRIu64,
                     ist.n, ist.wait_sum / ist.n / 1000, ist.wait_max / 1000,
                     ist.bh_sum / ist.n / 1000, ist.bh_max / 1000,
                     ist.rt_n ? ist.rt_sum / ist.rt_n / 1000 : 0,
-                    ist.rt_max / 1000);
+                    ist.rt_max / 1000, ist.taken, ist.parked, ist.q_max,
+                    ist.dropped);
     }
     memset(&ist, 0, sizeof(ist));
     ist.t0 = now;
@@ -1062,11 +1066,15 @@ static void LIBUSB_CALL usb_host_ahead_complete(struct libusb_transfer *xfer)
                 a->head = (a->head + 1) % USB_HOST_AHEAD_QUEUE;
                 a->count--;
                 a->dropped++;
+                ist.dropped++;
             }
             slot = (a->head + a->count) % USB_HOST_AHEAD_QUEUE;
             a->len[slot] = len;
             memcpy(a->data[slot], r->buffer, len);
             a->count++;
+            if (a->count > ist.q_max) {
+                ist.q_max = a->count;
+            }
         }
         if (libusb_submit_transfer(r->xfer) == 0) {
             a->inflight++;
@@ -2475,9 +2483,11 @@ static void usb_host_handle_data(USBDevice *udev, USBPacket *p)
             if (a) {
                 if (a->count) {
                     usb_host_ahead_pop(a, p);
+                    ist.taken++;
                 } else {
                     a->parked = p;
                     p->status = USB_RET_ASYNC;
+                    ist.parked++;
                 }
                 return;
             }
