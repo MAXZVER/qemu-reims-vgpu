@@ -740,6 +740,11 @@ static void usb_hid_handle_data(USBDevice *dev, USBPacket *p)
                 len = hid_keyboard_poll(hs, buf, p->iov.size);
             }
             usb_packet_copy(p, buf, len);
+            if (usb_lab_trace_on()) {
+                usb_lab_trace("U kind%d len%d %02x %02x %02x %02x", hs->kind, len,
+                              len > 0 ? buf[0] : 0, len > 1 ? buf[1] : 0,
+                              len > 2 ? buf[2] : 0, len > 3 ? buf[3] : 0);
+            }
         } else {
             goto fail;
         }

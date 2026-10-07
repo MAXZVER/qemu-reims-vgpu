@@ -27,6 +27,47 @@
 #include "hw/usb/usb.h"
 #include "qemu/iov.h"
 #include "trace.h"
+#include "qemu/timer.h"
+
+static FILE *usb_lab_trace_file(void)
+{
+    static int state;               /* 0 unknown, 1 on, -1 off */
+    static FILE *f;
+
+    if (!state) {
+        const char *path = getenv("QEMU_USB_HOST_TRACE");
+        f = path && *path ? fopen(path, "a") : NULL;
+        state = f ? 1 : -1;
+    }
+    return f;
+}
+
+bool usb_lab_trace_on(void)
+{
+    return usb_lab_trace_file() != NULL;
+}
+
+void usb_lab_trace(const char *fmt, ...)
+{
+    static int64_t flushed;
+    FILE *f = usb_lab_trace_file();
+    int64_t now;
+    va_list ap;
+
+    if (!f) {
+        return;
+    }
+    now = get_clock();
+    fprintf(f, "%" PRId64 " ", now);
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    if (now - flushed > 1000000000LL) {
+        fflush(f);
+        flushed = now;
+    }
+}
 
 void usb_pick_speed(USBPort *port)
 {

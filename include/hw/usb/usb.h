@@ -436,6 +436,12 @@ USBDevice *usb_find_device(USBPort *port, uint8_t addr);
 
 void usb_handle_packet(USBDevice *dev, USBPacket *p);
 void usb_packet_complete(USBDevice *dev, USBPacket *p);
+/*
+ * TEMP lab: QEMU_USB_HOST_TRACE=<file> appends "<get_clock() ns> <event>" lines
+ * (pointer stutter timeline, 2026-10-07). Main loop / BQL only.
+ */
+bool usb_lab_trace_on(void);
+void G_GNUC_PRINTF(1, 2) usb_lab_trace(const char *fmt, ...);
 void usb_packet_complete_one(USBDevice *dev, USBPacket *p);
 void usb_cancel_packet(USBPacket * p);
 

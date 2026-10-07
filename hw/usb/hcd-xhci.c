@@ -20,6 +20,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/core/cpu.h"
 #include "qemu/timer.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -3151,6 +3152,12 @@ static void xhci_doorbell_write(void *ptr, hwaddr reg,
     unsigned int epid, streamid;
 
     trace_usb_xhci_doorbell_write(reg, val);
+    if (usb_lab_trace_on() && reg) {
+        usb_lab_trace("D %s s%d e%d cpu%d",
+                      object_get_canonical_path_component(OBJECT(xhci->hostOpaque)),
+                      (int)(reg >> 2), (int)(val & 0xff),
+                      current_cpu ? current_cpu->cpu_index : -1);
+    }
 
     if (!xhci_running(xhci)) {
         DPRINTF("xhci: wrote doorbell while xHC stopped or paused\n");

@@ -1003,6 +1003,11 @@ static void usb_host_ahead_pop(USBHostAhead *a, USBPacket *p)
     size_t len = MIN((size_t)a->len[a->head], p->iov.size);
 
     usb_packet_copy(p, a->data[a->head], len);
+    if (usb_lab_trace_on()) {
+        usb_lab_trace("T %04x ep%d q%d",
+                      USB_HOST_DEVICE(p->ep->dev)->match.product_id,
+                      p->ep->nr, a->count);
+    }
     a->head = (a->head + 1) % USB_HOST_AHEAD_QUEUE;
     a->count--;
     p->status = USB_RET_SUCCESS;
@@ -1067,6 +1072,14 @@ static void LIBUSB_CALL usb_host_ahead_complete(struct libusb_transfer *xfer)
                 a->count--;
                 a->dropped++;
                 ist.dropped++;
+            }
+            if (usb_lab_trace_on()) {
+                const uint8_t *b = r->buffer;
+                usb_lab_trace("R %04x ep%d len%d %02x %02x %02x %02x %02x %02x %02x %02x",
+                              s->match.product_id, ep, len, b[0], len > 1 ? b[1] : 0,
+                              len > 2 ? b[2] : 0, len > 3 ? b[3] : 0,
+                              len > 4 ? b[4] : 0, len > 5 ? b[5] : 0,
+                              len > 6 ? b[6] : 0, len > 7 ? b[7] : 0);
             }
             slot = (a->head + a->count) % USB_HOST_AHEAD_QUEUE;
             a->len[slot] = len;
@@ -2488,6 +2501,9 @@ static void usb_host_handle_data(USBDevice *udev, USBPacket *p)
                     a->parked = p;
                     p->status = USB_RET_ASYNC;
                     ist.parked++;
+                    if (usb_lab_trace_on()) {
+                        usb_lab_trace("Q %04x ep%d", s->match.product_id, p->ep->nr);
+                    }
                 }
                 return;
             }

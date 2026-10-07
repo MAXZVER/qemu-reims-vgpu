@@ -69,6 +69,12 @@ static bool xhci_pci_intr_raise(XHCIState *xhci, int n, bool level)
     }
 
     if (msix_enabled(pci_dev) && level) {
+        if (usb_lab_trace_on()) {
+            MSIMessage m = msix_get_message(pci_dev, n);
+            usb_lab_trace("I %s n%d apic%d vec%d",
+                          object_get_canonical_path_component(OBJECT(pci_dev)), n,
+                          (int)((m.address >> 12) & 0xff), (int)(m.data & 0xff));
+        }
         msix_notify(pci_dev, n);
         return true;
     }
