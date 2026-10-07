@@ -1192,9 +1192,60 @@ static KVMSlot *kvm_lookup_containing_slot(KVMMemoryListener *kml,
  * dirty_bmap keeps exactly the bits QEMU was given, so kvm_log_clear_one_slot
  * still clears only merged pages.
  */
+/*
+ * TEMP lab: where a tracker sync's time goes under KVM - the slots_lock wait,
+ * KVM_GET_DIRTY_LOG, the merge into QEMU's bitmaps, KVM_CLEAR_DIRTY_LOG. All
+ * updated under kvm_slots_lock except the lock waits (atomics); one stderr
+ * line a second.
+ */
+static struct {
+    uint64_t get_n, get_us, merge_us, merge_pages, clear_n, clear_us,
+             clear_pages, last_us;
+    uint64_t lock_n, lock_us, lock_max_us;
+} kvm_lab_dirty;
+
+static void kvm_lab_dirty_lock_wait(int64_t t0)
+{
+    uint64_t us = g_get_monotonic_time() - t0;
+
+    qatomic_inc(&kvm_lab_dirty.lock_n);
+    qatomic_add(&kvm_lab_dirty.lock_us, us);
+    if (us > qatomic_read(&kvm_lab_dirty.lock_max_us)) {
+        qatomic_set(&kvm_lab_dirty.lock_max_us, us);
+    }
+}
+
+static void kvm_lab_dirty_report(void)
+{
+    uint64_t now = g_get_monotonic_time();
+
+    if (!kvm_lab_dirty.last_us) {
+        kvm_lab_dirty.last_us = now;
+        return;
+    }
+    if (now - kvm_lab_dirty.last_us < 1000000) {
+        return;
+    }
+    fprintf(stderr, "kvm-dirty get=%" PRIu64 " get_us=%" PRIu64
+            " merge_us=%" PRIu64 " merge_pages=%" PRIu64
+            " clear=%" PRIu64 " clear_us=%" PRIu64 " clear_pages=%" PRIu64
+            " lock=%" PRIu64 " lock_us=%" PRIu64 " lock_max_us=%" PRIu64 "\n",
+            kvm_lab_dirty.get_n, kvm_lab_dirty.get_us, kvm_lab_dirty.merge_us,
+            kvm_lab_dirty.merge_pages, kvm_lab_dirty.clear_n,
+            kvm_lab_dirty.clear_us, kvm_lab_dirty.clear_pages,
+            qatomic_xchg(&kvm_lab_dirty.lock_n, 0),
+            qatomic_xchg(&kvm_lab_dirty.lock_us, 0),
+            qatomic_xchg(&kvm_lab_dirty.lock_max_us, 0));
+    kvm_lab_dirty.get_n = kvm_lab_dirty.get_us = kvm_lab_dirty.merge_us = 0;
+    kvm_lab_dirty.merge_pages = kvm_lab_dirty.clear_n = 0;
+    kvm_lab_dirty.clear_us = kvm_lab_dirty.clear_pages = 0;
+    kvm_lab_dirty.last_us = now;
+}
+
 static void kvm_slot_sync_dirty_range(KVMState *s, KVMSlot *mem,
                                       hwaddr offset, hwaddr size)
 {
+    int64_t t0, t1;
     uint64_t psize = qemu_real_host_page_size();
     uint64_t npages = mem->memory_size / psize;
     uint64_t p0 = (offset / psize) & ~(uint64_t)63;
@@ -1210,7 +1261,11 @@ static void kvm_slot_sync_dirty_range(KVMState *s, KVMSlot *mem,
     }
     d.dirty_bitmap = mem->dirty_scratch;
     d.slot = mem->slot | (mem->as_id << 16);
+    t0 = g_get_monotonic_time();
     ret = kvm_vm_ioctl(s, KVM_GET_DIRTY_LOG, &d);
+    t1 = g_get_monotonic_time();
+    kvm_lab_dirty.get_n++;
+    kvm_lab_dirty.get_us += t1 - t0;
     if (ret == -ENOENT) {
         return;
     }
@@ -1225,6 +1280,9 @@ static void kvm_slot_sync_dirty_range(KVMState *s, KVMSlot *mem,
     physical_memory_set_dirty_lebitmap(
         (unsigned long *)((uint64_t *)mem->dirty_bmap + p0 / 64),
         mem->ram_start_offset + p0 * psize, p1 - p0);
+    kvm_lab_dirty.merge_us += g_get_monotonic_time() - t1;
+    kvm_lab_dirty.merge_pages += p1 - p0;
+    kvm_lab_dirty_report();
 }
 
 static void kvm_physical_sync_dirty_bitmap(KVMMemoryListener *kml,
@@ -1355,7 +1413,14 @@ static int kvm_log_clear_one_slot(KVMSlot *mem, int as_id, uint64_t start,
     d.num_pages = bmap_npages;
     d.slot = mem->slot | (as_id << 16);
 
-    ret = kvm_vm_ioctl(s, KVM_CLEAR_DIRTY_LOG, &d);
+    {
+        int64_t t0 = g_get_monotonic_time();
+
+        ret = kvm_vm_ioctl(s, KVM_CLEAR_DIRTY_LOG, &d);
+        kvm_lab_dirty.clear_n++;
+        kvm_lab_dirty.clear_us += g_get_monotonic_time() - t0;
+        kvm_lab_dirty.clear_pages += bmap_npages;
+    }
     if (ret < 0 && ret != -ENOENT) {
         error_report("%s: KVM_CLEAR_DIRTY_LOG failed, slot=%d, "
                      "start=0x%"PRIx64", size=0x%"PRIx32", errno=%d",
@@ -2045,8 +2110,10 @@ static void kvm_log_sync(MemoryListener *listener,
                          MemoryRegionSection *section)
 {
     KVMMemoryListener *kml = container_of(listener, KVMMemoryListener, listener);
+    int64_t t0 = g_get_monotonic_time();
 
     kvm_slots_lock();
+    kvm_lab_dirty_lock_wait(t0);
     kvm_physical_sync_dirty_bitmap(kml, section);
     kvm_slots_unlock();
 }
