@@ -104,6 +104,7 @@ struct USBHostDevice {
     int                              addr;
     char                             port[16];
     uint16_t                         kbd_in_eps;  /* boot keyboard int IN */
+    bool                             win32_refused;
 
     int                              hostfd;
     libusb_device                    *dev;
@@ -1070,6 +1071,54 @@ static void usb_host_ep_update(USBHostDevice *s)
     libusb_free_config_descriptor(conf);
 }
 
+#ifdef CONFIG_WIN32
+/*
+ * libusb opens more than it can drive on Windows: a device still on its
+ * Windows driver (HidUsb, usbccgp, BTHUSB) opens through libusb's HID or
+ * composite shims, yet its interfaces cannot be claimed, and the guest got
+ * a device whose every configuration failed. Only a device whose every
+ * interface can be claimed - bound to WinUSB - is given to the guest; the
+ * others are refused once in the log and retried by the auto scan.
+ */
+static bool usb_host_win32_owned(USBHostDevice *s)
+{
+    struct libusb_config_descriptor *conf;
+    int rc, i, n, bad = -1;
+
+    rc = libusb_get_active_config_descriptor(s->dev, &conf);
+    if (rc != 0) {
+        return true; /* address state: nothing to claim yet */
+    }
+    n = conf->bNumInterfaces;
+    for (i = 0; i < n && bad < 0; i++) {
+        int nr = conf->interface[i].altsetting[0].bInterfaceNumber;
+        rc = libusb_claim_interface(s->dh, nr);
+        if (rc != 0) {
+            bad = nr;
+            break;
+        }
+    }
+    while (--i >= 0) {
+        libusb_release_interface(s->dh,
+                                 conf->interface[i].altsetting[0].bInterfaceNumber);
+    }
+    libusb_free_config_descriptor(conf);
+    if (bad >= 0 && !s->win32_refused) {
+        warn_report("usb-host %04x:%04x: interface %d cannot be claimed (%s) - "
+                    "not bound to WinUSB, not given to the guest",
+                    s->ddesc.idVendor, s->ddesc.idProduct, bad,
+                    libusb_error_name(rc));
+        s->win32_refused = true;
+    }
+    if (bad < 0 && s->win32_refused) {
+        info_report("usb-host %04x:%04x: on WinUSB now", s->ddesc.idVendor,
+                    s->ddesc.idProduct);
+        s->win32_refused = false;
+    }
+    return bad < 0;
+}
+#endif
+
 static int usb_host_open(USBHostDevice *s, libusb_device *dev, int hostfd)
 {
     USBDevice *udev = USB_DEVICE(s);
@@ -1116,6 +1165,15 @@ static int usb_host_open(USBHostDevice *s, libusb_device *dev, int hostfd)
     s->bus_num = bus_num;
     s->addr    = addr;
 
+#ifdef CONFIG_WIN32
+    libusb_get_device_descriptor(dev, &s->ddesc);
+    if (!usb_host_win32_owned(s)) {
+        libusb_close(s->dh);
+        s->dh = NULL;
+        s->dev = NULL;
+        return -1;
+    }
+#endif
     usb_host_detach_kernel(s);
 
     libusb_get_device_descriptor(dev, &s->ddesc);
@@ -1468,6 +1526,11 @@ static void usb_host_detach_kernel(USBHostDevice *s)
     struct libusb_config_descriptor *conf;
     int rc, i;
 
+#ifdef CONFIG_WIN32
+    /* Windows has no driver detach: the device's driver binding decides. */
+    return;
+#endif
+
     rc = libusb_get_active_config_descriptor(s->dev, &conf);
     if (rc != 0) {
         return;
@@ -1493,6 +1556,10 @@ static void usb_host_attach_kernel(USBHostDevice *s)
 {
     struct libusb_config_descriptor *conf;
     int rc, i;
+
+#ifdef CONFIG_WIN32
+    return;
+#endif
 
     rc = libusb_get_active_config_descriptor(s->dev, &conf);
     if (rc != 0) {
@@ -2053,7 +2120,15 @@ static void usb_host_auto_match(libusb_device **devs, ssize_t n)
                     continue;
                 }
                 if (s->errcount >= 3) {
+#ifdef CONFIG_WIN32
+                    /* a rebind to WinUSB changes nothing libusb can see */
+                    if (++s->errcount < 3 + 5) {
+                        continue;
+                    }
+                    s->errcount = 2;
+#else
                     continue;
+#endif
                 }
                 if (s->dh != NULL) {
                     continue;
