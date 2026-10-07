@@ -5,5 +5,6 @@ stub_ss.add(files(
   'mshv-stub.c',
   'nvmm-stub.c',
   'whpx-stub.c',
+  'whpx-wp-stub.c',
   'xen-stub.c',
 ))
