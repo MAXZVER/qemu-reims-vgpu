@@ -35,6 +35,8 @@ typedef struct KVMSlot
      * copies only its range into dirty_bmap (kvm_slot_sync_dirty_range)
      */
     unsigned long *dirty_scratch;
+    /* TEMP lab: when the GET that filled dirty_scratch began (monotonic us) */
+    int64_t scratch_us;
     /* Cache of the address space ID */
     int as_id;
     /* Cache of the offset in ram address space */
