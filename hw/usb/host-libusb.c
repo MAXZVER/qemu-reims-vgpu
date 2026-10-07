@@ -51,6 +51,7 @@
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
+#include "qemu/thread.h"
 #include "system/runstate.h"
 #include "system/system.h"
 #include "trace.h"
@@ -94,6 +95,7 @@ struct USBHostDevice {
     bool                             allow_one_guest_reset;
     bool                             allow_all_guest_resets;
     bool                             suppress_remote_wake;
+    bool                             grab;
 
     /* state */
     QTAILQ_ENTRY(USBHostDevice)      next;
@@ -101,6 +103,7 @@ struct USBHostDevice {
     int                              bus_num;
     int                              addr;
     char                             port[16];
+    uint16_t                         kbd_in_eps;  /* boot keyboard int IN */
 
     int                              hostfd;
     libusb_device                    *dev;
@@ -156,6 +159,8 @@ static QTAILQ_HEAD(, USBHostDevice) hostdevs =
     QTAILQ_HEAD_INITIALIZER(hostdevs);
 
 static void usb_host_auto_check(void *unused);
+static void usb_host_release_all(void);
+static int usb_host_close(USBHostDevice *s);
 static void usb_host_release_interfaces(USBHostDevice *s);
 static void usb_host_nodev(USBHostDevice *s);
 static void usb_host_detach_kernel(USBHostDevice *s);
@@ -256,25 +261,73 @@ static void usb_host_del_fd(int fd, void *user_data)
 
 #else
 
-static QEMUTimer *poll_timer;
-static uint32_t request_count;
+/*
+ * Windows has no pollable libusb fds. A thread sits in libusb's own event
+ * loop and hands every completion to the main loop through a bottom half,
+ * so completions run under the BQL exactly like the fd handlers above, at
+ * the moment the host controller finishes them (a poll timer quantised
+ * them to 10 ms: a passed-through mouse was capped at 100 Hz and iso
+ * streams starved). The libusb callbacks only queue: taking the BQL inside
+ * libusb's event handling would deadlock against libusb_close() and the
+ * synchronous transfers the main loop issues under the BQL.
+ */
+typedef struct USBHostDone {
+    struct libusb_transfer           *xfer;
+    libusb_transfer_cb_fn            fn;
+    QSIMPLEQ_ENTRY(USBHostDone)      next;
+} USBHostDone;
 
-static void usb_host_timer_kick(void)
+static QemuThread event_thread;
+static QemuMutex done_lock;
+static QSIMPLEQ_HEAD(, USBHostDone) done_queue =
+    QSIMPLEQ_HEAD_INITIALIZER(done_queue);
+static QEMUBH *done_bh;
+
+/* Main loop, BQL held: run the queued completions in completion order. */
+static void usb_host_done_run(void)
 {
-    int64_t delay_ns;
+    USBHostDone *d;
 
-    delay_ns = request_count
-        ? (NANOSECONDS_PER_SECOND / 100)  /* 10 ms interval with active req */
-        : (NANOSECONDS_PER_SECOND);       /* 1 sec interval otherwise */
-    timer_mod(poll_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay_ns);
+    for (;;) {
+        qemu_mutex_lock(&done_lock);
+        d = QSIMPLEQ_FIRST(&done_queue);
+        if (d) {
+            QSIMPLEQ_REMOVE_HEAD(&done_queue, next);
+        }
+        qemu_mutex_unlock(&done_lock);
+        if (!d) {
+            return;
+        }
+        d->fn(d->xfer);
+        g_free(d);
+    }
 }
 
-static void usb_host_timer(void *opaque)
+static void usb_host_done_bh(void *opaque)
 {
-    struct timeval tv = { 0, 0 };
+    usb_host_done_run();
+}
 
-    libusb_handle_events_timeout(ctx, &tv);
-    usb_host_timer_kick();
+/* Event thread: queue one completion for the main loop. */
+static void usb_host_defer(struct libusb_transfer *xfer,
+                           libusb_transfer_cb_fn fn)
+{
+    USBHostDone *d = g_new(USBHostDone, 1);
+
+    d->xfer = xfer;
+    d->fn = fn;
+    qemu_mutex_lock(&done_lock);
+    QSIMPLEQ_INSERT_TAIL(&done_queue, d, next);
+    qemu_mutex_unlock(&done_lock);
+    qemu_bh_schedule(done_bh);
+}
+
+static void *usb_host_event_thread(void *opaque)
+{
+    for (;;) {
+        libusb_handle_events(ctx);
+    }
+    return NULL;
 }
 
 #endif /* !CONFIG_WIN32 */
@@ -299,8 +352,19 @@ static int usb_host_init(void)
     libusb_set_debug(ctx, loglevel);
 #endif
 #ifdef CONFIG_WIN32
-    poll_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, usb_host_timer, NULL);
-    usb_host_timer_kick();
+    /*
+     * UsbDk, when installed, detaches any device from its Windows driver
+     * for as long as QEMU holds it; without it only devices bound to
+     * WinUSB (Zadig) can be opened. libusb wants the backend chosen
+     * before the context is used.
+     */
+    rc = libusb_set_option(ctx, LIBUSB_OPTION_USE_USBDK);
+    info_report("usb-host: libusb %s backend",
+                rc == LIBUSB_SUCCESS ? "UsbDk" : "WinUSB");
+    qemu_mutex_init(&done_lock);
+    done_bh = qemu_bh_new(usb_host_done_bh, NULL);
+    qemu_thread_create(&event_thread, "usb-host-events",
+                       usb_host_event_thread, NULL, QEMU_THREAD_DETACHED);
 #else
     libusb_set_pollfd_notifiers(ctx, usb_host_add_fd,
                                 usb_host_del_fd,
@@ -388,18 +452,11 @@ static USBHostRequest *usb_host_req_alloc(USBHostDevice *s, USBPacket *p,
         r->buffer = g_malloc(bufsize);
     }
     QTAILQ_INSERT_TAIL(&s->requests, r, next);
-#ifdef CONFIG_WIN32
-    request_count++;
-    usb_host_timer_kick();
-#endif
     return r;
 }
 
 static void usb_host_req_free(USBHostRequest *r)
 {
-#ifdef CONFIG_WIN32
-    request_count--;
-#endif
     QTAILQ_REMOVE(&r->host->requests, r, next);
     libusb_free_transfer(r->xfer);
     g_free(r->buffer);
@@ -417,6 +474,62 @@ static USBHostRequest *usb_host_req_find(USBHostDevice *s, USBPacket *p)
     }
     return NULL;
 }
+
+/*
+ * The release combo: Ctrl+Alt+Shift+Esc on a passed-through keyboard hands
+ * every grabbed device back to the host. The keyboard and mouse may be the
+ * host's only ones, and a guest that hangs must not keep them. Seen in boot
+ * protocol input reports (modifier byte, reserved, six key codes), which is
+ * the layout a boot keyboard interface sends without report IDs; the key
+ * still reaches the guest. QMP qom-set ... grab=true takes them back.
+ */
+#define USB_HOST_COMBO_KEY  0x29                 /* Escape */
+
+static QEMUBH *release_bh;
+
+static void usb_host_release_bh(void *opaque)
+{
+    usb_host_release_all();
+}
+
+static void usb_host_check_release_combo(const uint8_t *rep, int len)
+{
+    uint8_t m;
+    int i;
+
+    if (len < 8) {
+        return;
+    }
+    m = rep[0];
+    if (!(m & 0x11) || !(m & 0x44) || !(m & 0x22)) {
+        return;
+    }
+    for (i = 2; i < 8; i++) {
+        if (rep[i] == USB_HOST_COMBO_KEY) {
+            if (!release_bh) {
+                release_bh = qemu_bh_new(usb_host_release_bh, NULL);
+            }
+            qemu_bh_schedule(release_bh);
+            return;
+        }
+    }
+}
+
+/*
+ * USB_HOST_CB(fn) is what a transfer gets as its callback: fn itself where
+ * libusb completes in the main loop, a queueing trampoline on Windows.
+ */
+#ifdef CONFIG_WIN32
+#define USB_HOST_CB(fn) fn##_deferred
+#define USB_HOST_DEFERRED(fn)                                           \
+    static void LIBUSB_CALL fn##_deferred(struct libusb_transfer *xfer) \
+    {                                                                   \
+        usb_host_defer(xfer, fn);                                       \
+    }
+#else
+#define USB_HOST_CB(fn) fn
+#define USB_HOST_DEFERRED(fn)
+#endif
 
 static void LIBUSB_CALL usb_host_req_complete_ctrl(struct libusb_transfer *xfer)
 {
@@ -467,6 +580,7 @@ out:
         usb_host_nodev(s);
     }
 }
+USB_HOST_DEFERRED(usb_host_req_complete_ctrl)
 
 static void LIBUSB_CALL usb_host_req_complete_data(struct libusb_transfer *xfer)
 {
@@ -481,6 +595,9 @@ static void LIBUSB_CALL usb_host_req_complete_data(struct libusb_transfer *xfer)
     r->p->status = status_map[xfer->status];
     if (r->in && xfer->actual_length) {
         usb_packet_copy(r->p, r->buffer, xfer->actual_length);
+        if (s->kbd_in_eps & (1 << r->p->ep->nr)) {
+            usb_host_check_release_combo(r->buffer, xfer->actual_length);
+        }
     }
     trace_usb_host_req_complete(s->bus_num, s->addr, r->p,
                                 r->p->status, r->p->actual_length);
@@ -496,6 +613,7 @@ out:
         usb_host_nodev(s);
     }
 }
+USB_HOST_DEFERRED(usb_host_req_complete_data)
 
 static void usb_host_req_abort(USBHostRequest *r)
 {
@@ -543,6 +661,7 @@ usb_host_req_complete_iso(struct libusb_transfer *transfer)
         QTAILQ_INSERT_TAIL(&xfer->ring->unused, xfer, next);
     }
 }
+USB_HOST_DEFERRED(usb_host_req_complete_iso)
 
 static USBHostIsoRing *usb_host_iso_alloc(USBHostDevice *s, USBEndpoint *ep)
 {
@@ -570,7 +689,7 @@ static USBHostIsoRing *usb_host_iso_alloc(USBHostDevice *s, USBEndpoint *ep)
         if (ring->ep->pid == USB_TOKEN_IN) {
             xfer->xfer->endpoint |= USB_DIR_IN;
         }
-        xfer->xfer->callback = usb_host_req_complete_iso;
+        xfer->xfer->callback = USB_HOST_CB(usb_host_req_complete_iso);
         xfer->xfer->user_data = xfer;
 
         xfer->xfer->num_iso_packets = packets;
@@ -878,6 +997,7 @@ static void usb_host_ep_update(USBHostDevice *s)
     int rc, i, e;
 
     usb_ep_reset(udev);
+    s->kbd_in_eps = 0;
     rc = libusb_get_active_config_descriptor(s->dev, &conf);
     if (rc != 0) {
         return;
@@ -925,6 +1045,11 @@ static void usb_host_ep_update(USBHostDevice *s)
             trace_usb_host_parse_endpoint(s->bus_num, s->addr, ep,
                                           (devep & USB_DIR_IN) ? "in" : "out",
                                           tname[type], true);
+            if (intf->bInterfaceClass == LIBUSB_CLASS_HID &&
+                intf->bInterfaceSubClass == 1 && intf->bInterfaceProtocol == 1 &&
+                pid == USB_TOKEN_IN && type == USB_ENDPOINT_XFER_INT) {
+                s->kbd_in_eps |= 1 << ep;
+            }
             usb_ep_set_max_packet_size(udev, pid, ep,
                                        endp->wMaxPacketSize);
             usb_ep_set_type(udev, pid, ep, type);
@@ -1083,6 +1208,9 @@ static void usb_host_abort_xfers(USBHostDevice *s)
         memset(&tv, 0, sizeof(tv));
         tv.tv_usec = 2500;
         libusb_handle_events_timeout(ctx, &tv);
+#ifdef CONFIG_WIN32
+        usb_host_done_run();
+#endif
         if (--limit == 0) {
             /*
              * Don't wait forever for libusb calling the complete
@@ -1252,6 +1380,46 @@ static void usb_host_realize(USBDevice *udev, Error **errp)
     qemu_add_exit_notifier(&s->exit);
 }
 
+/*
+ * grab: whether this device belongs to the guest. False closes it and
+ * keeps the auto scan off it, so the host driver gets it back; true lets
+ * the next scan open it again. Settable at run time (QMP qom-set).
+ */
+static bool usb_host_get_grab(Object *obj, Error **errp)
+{
+    return USB_HOST_DEVICE(obj)->grab;
+}
+
+static void usb_host_set_grab(Object *obj, bool value, Error **errp)
+{
+    USBHostDevice *s = USB_HOST_DEVICE(obj);
+
+    if (s->grab == value) {
+        return;
+    }
+    s->grab = value;
+    if (!DEVICE(obj)->realized) {
+        return;
+    }
+    if (value) {
+        s->errcount = 0;
+        usb_host_auto_check(NULL);
+    } else {
+        usb_host_close(s);
+    }
+    info_report("usb-host %04x:%04x: %s", s->match.vendor_id,
+                s->match.product_id, value ? "grabbed" : "released to host");
+}
+
+static void usb_host_release_all(void)
+{
+    USBHostDevice *s;
+
+    QTAILQ_FOREACH(s, &hostdevs, next) {
+        object_property_set_bool(OBJECT(s), "grab", false, NULL);
+    }
+}
+
 static void usb_host_instance_init(Object *obj)
 {
     USBDevice *udev = USB_DEVICE(obj);
@@ -1260,6 +1428,9 @@ static void usb_host_instance_init(Object *obj)
     device_add_bootindex_property(obj, &s->bootindex,
                                   "bootindex", NULL,
                                   &udev->qdev);
+    s->grab = true;
+    object_property_add_bool(obj, "grab", usb_host_get_grab,
+                             usb_host_set_grab);
 }
 
 static void usb_host_unrealize(USBDevice *udev)
@@ -1519,7 +1690,7 @@ static void usb_host_handle_control(USBDevice *udev, USBPacket *p,
     }
 
     libusb_fill_control_transfer(r->xfer, s->dh, r->buffer,
-                                 usb_host_req_complete_ctrl, r,
+                                 USB_HOST_CB(usb_host_req_complete_ctrl), r,
                                  CONTROL_TIMEOUT);
     rc = libusb_submit_transfer(r->xfer);
     if (rc != 0) {
@@ -1574,7 +1745,7 @@ static void usb_host_handle_data(USBDevice *udev, USBPacket *p)
 #ifdef HAVE_STREAMS
             libusb_fill_bulk_stream_transfer(r->xfer, s->dh, ep, p->stream,
                                              r->buffer, size,
-                                             usb_host_req_complete_data, r,
+                                             USB_HOST_CB(usb_host_req_complete_data), r,
                                              BULK_TIMEOUT);
 #else
             usb_host_req_free(r);
@@ -1584,7 +1755,7 @@ static void usb_host_handle_data(USBDevice *udev, USBPacket *p)
         } else {
             libusb_fill_bulk_transfer(r->xfer, s->dh, ep,
                                       r->buffer, size,
-                                      usb_host_req_complete_data, r,
+                                      USB_HOST_CB(usb_host_req_complete_data), r,
                                       BULK_TIMEOUT);
         }
         break;
@@ -1596,7 +1767,7 @@ static void usb_host_handle_data(USBDevice *udev, USBPacket *p)
         ep = p->ep->nr | (r->in ? USB_DIR_IN : 0);
         libusb_fill_interrupt_transfer(r->xfer, s->dh, ep,
                                        r->buffer, p->iov.size,
-                                       usb_host_req_complete_data, r,
+                                       USB_HOST_CB(usb_host_req_complete_data), r,
                                        INTR_TIMEOUT);
         break;
     case USB_ENDPOINT_XFER_ISOC:
@@ -1831,20 +2002,18 @@ static void usb_host_vm_state(void *unused, bool running, RunState state)
     }
 }
 
-static void usb_host_auto_check(void *unused)
+/* Main loop: match a device list against the auto-scanned devices; frees it. */
+static void usb_host_auto_match(libusb_device **devs, ssize_t n)
 {
     struct USBHostDevice *s;
     struct USBAutoFilter *f;
-    libusb_device **devs = NULL;
     struct libusb_device_descriptor ddesc;
-    int i, n;
+    ssize_t i;
 
-    if (usb_host_init() != 0) {
+    if (devs == NULL || n < 0) {
         return;
     }
-
     if (runstate_is_running()) {
-        n = libusb_get_device_list(ctx, &devs);
         for (i = 0; i < n; i++) {
             if (libusb_get_device_descriptor(devs[i], &ddesc) != 0) {
                 continue;
@@ -1880,6 +2049,9 @@ static void usb_host_auto_check(void *unused)
 
                 /* We got a match */
                 s->seen++;
+                if (!s->grab) {
+                    continue;
+                }
                 if (s->errcount >= 3) {
                     continue;
                 }
@@ -1893,7 +2065,6 @@ static void usb_host_auto_check(void *unused)
                 break;
             }
         }
-        libusb_free_device_list(devs, 1);
 
         QTAILQ_FOREACH(s, &hostdevs, next) {
             if (s->seen == 0) {
@@ -1905,18 +2076,98 @@ static void usb_host_auto_check(void *unused)
             s->seen = 0;
         }
     }
+    libusb_free_device_list(devs, 1);
+}
 
+static void usb_host_auto_timer(void *unused);
+
+static void usb_host_auto_rearm(void)
+{
     if (!usb_vmstate) {
         usb_vmstate = qemu_add_vm_change_state_handler(usb_host_vm_state, NULL);
     }
     if (!usb_auto_timer) {
-        usb_auto_timer = timer_new_ms(QEMU_CLOCK_REALTIME, usb_host_auto_check, NULL);
+        usb_auto_timer = timer_new_ms(QEMU_CLOCK_REALTIME, usb_host_auto_timer, NULL);
         if (!usb_auto_timer) {
             return;
         }
         trace_usb_host_auto_scan_enabled();
     }
     timer_mod(usb_auto_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 2000);
+}
+
+/* A scan now, in the main loop: realize, close, a grab, the VM resuming. */
+static void usb_host_auto_check(void *unused)
+{
+    libusb_device **devs = NULL;
+    ssize_t n;
+
+    if (usb_host_init() != 0) {
+        return;
+    }
+    if (runstate_is_running()) {
+        n = libusb_get_device_list(ctx, &devs);
+        usb_host_auto_match(devs, n);
+    }
+    usb_host_auto_rearm();
+}
+
+#ifdef CONFIG_WIN32
+/*
+ * Listing the host's USB devices costs 5-9 ms on Windows (SetupAPI walks
+ * every node). The periodic scan therefore lists on its own thread and
+ * only the match runs in the main loop: a 2 s beat of BQL-held stalls is a
+ * dropped frame for the vCPUs every 2 s while anything is passed through.
+ */
+static QemuThread scan_thread;
+static QemuSemaphore scan_sem;
+static QEMUBH *scan_bh;
+static libusb_device **scan_devs;
+static ssize_t scan_n;
+static bool scan_busy;
+
+static void *usb_host_scan_thread(void *opaque)
+{
+    for (;;) {
+        qemu_sem_wait(&scan_sem);
+        scan_n = libusb_get_device_list(ctx, &scan_devs);
+        qemu_bh_schedule(scan_bh);
+    }
+    return NULL;
+}
+
+static void usb_host_scan_bh(void *opaque)
+{
+    libusb_device **devs = scan_devs;
+
+    scan_devs = NULL;
+    scan_busy = false;
+    usb_host_auto_match(devs, scan_n);
+    usb_host_auto_rearm();
+}
+#endif
+
+static void usb_host_auto_timer(void *unused)
+{
+#ifdef CONFIG_WIN32
+    if (!runstate_is_running()) {
+        usb_host_auto_rearm();
+        return;
+    }
+    if (!scan_bh) {
+        qemu_sem_init(&scan_sem, 0);
+        scan_bh = qemu_bh_new(usb_host_scan_bh, NULL);
+        qemu_thread_create(&scan_thread, "usb-host-scan",
+                           usb_host_scan_thread, NULL, QEMU_THREAD_DETACHED);
+    }
+    if (!scan_busy) {
+        scan_busy = true;
+        qemu_sem_post(&scan_sem);
+    }
+    /* the scan's bottom half re-arms the timer */
+#else
+    usb_host_auto_check(NULL);
+#endif
 }
 
 void hmp_info_usbhost(Monitor *mon, const QDict *qdict)
