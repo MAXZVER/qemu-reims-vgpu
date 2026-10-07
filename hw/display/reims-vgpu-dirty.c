@@ -165,6 +165,18 @@ typedef struct ReimsVgpuDirtySet {
     uint64_t *hash;
     bool hash_base;
     bool hash_busy;
+    /*
+     * TEMP lab DIRTY_VERIFY (live, default on): a set the hypervisor answers for keeps its pages'
+     * content hashes too, so a page the bitmap calls written whose bytes did not move is not a
+     * write - the contract `hash` already gives the sets it is kept for. p080: a 5K framebuffer the
+     * device renders only in its resident (its guest pages never painted) read "all 10800 pages
+     * written" when the guest stored back the bytes those pages already held, and the reader laid
+     * the unpainted pages over the resident - the boot wallpaper stripes of p79c/p80a. Baseline at
+     * track, refreshed for the pages an unarmed evaluation names, re-taken by rebase for the
+     * device's own stores. Read and written under `lock` once the set is published.
+     */
+    uint64_t *vhash;
+    bool vhash_base;
 } ReimsVgpuDirtySet;
 
 /*
@@ -474,6 +486,8 @@ struct ReimsVgpuDirty {
     uint64_t lab_hash_waits, lab_hash_noram, lab_hash_fg, lab_hash_fg_ns, lab_hash_pf;
     /* reims_vgpu_dirty_rebase: calls, pages re-baselined, calls that found no hashed baseline */
     uint64_t lab_rebase_calls, lab_rebase_pages, lab_rebase_unhashed;
+    /* TEMP lab DIRTY_VERIFY: sets given a baseline, its cost, and the pages it judged. */
+    uint64_t lab_vhash_sets, lab_vhash_base_ns, lab_vhash_same, lab_vhash_moved, lab_vhash_rebase;
     int64_t lab_hash_last;
     uint32_t work_chan;             /* channel of the drain's work scope; 63 = All */
     uint64_t db_chans;              /* channels rung since the last batch took them; bit 63 = unnamed */
@@ -1199,6 +1213,27 @@ static int reims_vgpu_dirty_wp_hashed_live;
  * need.
  */
 static uint64_t reims_vgpu_dirty_wp_hashed_streak_live;
+/*
+ * TEMP lab live DIRTY_VERIFY=on|off (see `ReimsVgpuDirtySet::vhash`): -1 while the live file does not name it, and
+ * then REIMS_VGPU_LAB_DIRTY_VERIFY=off at boot is the only way to turn it off.
+ */
+static int reims_vgpu_dirty_verify_live = -1;
+
+static bool reims_vgpu_dirty_verify_on(void)
+{
+    static int env = -1;
+    int v = qatomic_read(&reims_vgpu_dirty_verify_live);
+
+    if (v >= 0) {
+        return v == 1;
+    }
+    if (qatomic_read(&env) < 0) {
+        const char *e = getenv("REIMS_VGPU_LAB_DIRTY_VERIFY");
+
+        qatomic_set(&env, !(e && strcmp(e, "off") == 0));
+    }
+    return qatomic_read(&env) == 1;
+}
 
 static uint64_t reims_vgpu_dirty_call_ns(void)
 {
@@ -1226,6 +1261,7 @@ static void reims_vgpu_dirty_gap_refresh(void)
     qatomic_set(&reims_vgpu_dirty_wp_hashed_live, reims_vgpu_lab_live("DIRTY_WP_HASHED") == 1);
     v = reims_vgpu_lab_live_num("DIRTY_WP_HASHED_STREAK");
     qatomic_set(&reims_vgpu_dirty_wp_hashed_streak_live, v > 0 ? (uint64_t)v : 0);
+    qatomic_set(&reims_vgpu_dirty_verify_live, reims_vgpu_lab_live("DIRTY_VERIFY"));
 }
 
 /* TEMP lab DIRTY_TIGHT: whether a sync bridges only gaps of tracked pages (one look a sync). */
@@ -1337,6 +1373,7 @@ static void reims_vgpu_dirty_set_free(gpointer p)
     g_free(s->pages);
     g_free(s->page_gen);
     g_free(s->hash);
+    g_free(s->vhash);
     g_free(s);
 }
 
@@ -1712,6 +1749,98 @@ static uint64_t reims_vgpu_dirty_hash_bytes(const uint8_t *p, size_t len)
     return reims_vgpu_dirty_hash_bytes_scalar(p, len);
 }
 
+static int reims_vgpu_dirty_ram_slices_into(ReimsVgpuDirtySlice **buf, int *cap);
+static int reims_vgpu_dirty_slice_of(const ReimsVgpuDirtySlice *slices, int n, uint64_t gpa);
+
+/*
+ * TEMP lab DIRTY_VERIFY: the content hash of page `gpa`, or false when it is not inside one host mapping of guest RAM
+ * (such a page reads as written by every evaluation anyway). RCU read lock held.
+ */
+static bool reims_vgpu_dirty_page_hash(const ReimsVgpuDirtySlice *slices, int n, uint64_t gpa,
+                                       uint64_t page_size, uint64_t *h)
+{
+    int si = reims_vgpu_dirty_slice_of(slices, n, gpa);
+
+    if (si < 0 || gpa + page_size > slices[si].gpa + slices[si].len) {
+        return false;
+    }
+    *h = reims_vgpu_dirty_hash_bytes((const uint8_t *)memory_region_get_ram_ptr(slices[si].mr) +
+                                     slices[si].offset + (gpa - slices[si].gpa), page_size);
+    return true;
+}
+
+/*
+ * TEMP lab DIRTY_VERIFY: hash every page of a set not yet published (no lock needed for it) into its baseline. The
+ * evaluation that arms the set takes the hashes again for the pages it names, so a store between here and the
+ * arming is baseline too, as it is for a hashed set's first sync.
+ */
+static void reims_vgpu_dirty_verify_base(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s)
+{
+    ReimsVgpuDirtySlice *slices = NULL;
+    int64_t t0 = get_clock();
+    int cap = 0, n;
+    size_t p;
+
+    s->vhash = g_new0(uint64_t, MAX(s->count, 1));
+    n = reims_vgpu_dirty_ram_slices_into(&slices, &cap);
+    rcu_read_lock();
+    for (p = 0; p < s->count; p++) {
+        reims_vgpu_dirty_page_hash(slices, n, s->pages[p], s->page_size, &s->vhash[p]);
+    }
+    rcu_read_unlock();
+    g_free(slices);
+    s->vhash_base = true;
+    qatomic_inc(&d->lab_vhash_sets);
+    qatomic_add(&d->lab_vhash_base_ns, (uint64_t)(get_clock() - t0));
+}
+
+/*
+ * TEMP lab DIRTY_VERIFY: of the pages an armed evaluation found stamped, keep those whose bytes moved since the
+ * baseline (and take their new hashes) and those it cannot hash - outside guest RAM, or in a range not yet logged,
+ * which read as written whatever their bytes. Returns whether any is left. `lock` held.
+ */
+static bool reims_vgpu_dirty_verify_filter(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
+                                           const ReimsVgpuDirtySlice *slices, int n, GArray *hit)
+{
+    guint h, keep = 0;
+
+    rcu_read_lock();
+    for (h = 0; h < hit->len; h++) {
+        size_t p = g_array_index(hit, size_t, h);
+        int si = reims_vgpu_dirty_slice_of(slices, n, s->pages[p]);
+        uint64_t v;
+
+        if (si >= 0 && slices[si].logged &&
+            reims_vgpu_dirty_page_hash(slices, n, s->pages[p], s->page_size, &v)) {
+            if (v == s->vhash[p]) {
+                d->lab_vhash_same++;
+                continue;
+            }
+            s->vhash[p] = v;
+            d->lab_vhash_moved++;
+        }
+        g_array_index(hit, size_t, keep++) = p;
+    }
+    rcu_read_unlock();
+    g_array_set_size(hit, keep);
+    return keep > 0;
+}
+
+/* TEMP lab DIRTY_VERIFY: an unarmed set's baseline follows the pages its evaluations name. `lock` held. */
+static void reims_vgpu_dirty_verify_refresh(ReimsVgpuDirtySet *s, const ReimsVgpuDirtySlice *slices, int n,
+                                            const GArray *hit)
+{
+    guint h;
+
+    rcu_read_lock();
+    for (h = 0; h < hit->len; h++) {
+        size_t p = g_array_index(hit, size_t, h);
+
+        reims_vgpu_dirty_page_hash(slices, n, s->pages[p], s->page_size, &s->vhash[p]);
+    }
+    rcu_read_unlock();
+}
+
 uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
                                 size_t count, size_t page_size)
 {
@@ -1753,6 +1882,9 @@ uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
     s->page_size = page_size;
     if (qatomic_read(&d->hash_mode) && reims_vgpu_dirty_hash_pick(d, pages, n, page_size)) {
         s->hash = g_new0(uint64_t, n);   /* lab DIRTY_HASH */
+    }
+    if (!s->hash && reims_vgpu_dirty_verify_on()) {
+        reims_vgpu_dirty_verify_base(d, s);   /* TEMP lab DIRTY_VERIFY */
     }
 
     qemu_mutex_lock(&d->lock);
@@ -1841,8 +1973,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                                       uint64_t needed, int64_t *lab_wait,
                                       int64_t *lab_query);
 
-static int reims_vgpu_dirty_ram_slices_into(ReimsVgpuDirtySlice **buf, int *cap);
-static int reims_vgpu_dirty_slice_of(const ReimsVgpuDirtySlice *slices, int n, uint64_t gpa);
+/* reims_vgpu_dirty_ram_slices_into / reims_vgpu_dirty_slice_of: declared above reims_vgpu_dirty_track. */
 static uint64_t reims_vgpu_dirty_query_begin(ReimsVgpuDirty *d);
 static void reims_vgpu_dirty_query_footprint(ReimsVgpuDirty *d, uint64_t ticket,
                                              const ReimsVgpuDirtyChunk *chunks, guint n);
@@ -4521,6 +4652,7 @@ static bool reims_vgpu_dirty_eval_set(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
     const uint64_t target = 1ULL << shift;
     bool any = false;
     bool unlogged = false;
+    bool was_armed;   /* TEMP lab DIRTY_VERIFY */
     size_t p;
     uint64_t off;
 
@@ -4558,6 +4690,18 @@ static bool reims_vgpu_dirty_eval_set(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
             g_array_append_val(hit, p);
         } else {
             reims_diag_clean++;
+        }
+    }
+    /*
+     * TEMP lab DIRTY_VERIFY: an armed set's stamped pages count only if their bytes moved; an unarmed set's baseline
+     * takes them in. Before the generation is rewritten, so a set whose stamped pages all held their bytes keeps it.
+     */
+    was_armed = s->gen != 0;
+    if (s->vhash && s->vhash_base && hit->len) {
+        if (!was_armed) {
+            reims_vgpu_dirty_verify_refresh(s, slices, n, hit);
+        } else if (reims_vgpu_dirty_verify_on()) {
+            any = reims_vgpu_dirty_verify_filter(d, s, slices, n, hit);
         }
     }
     /* Stored atomically: the generation fast path reads it without `lock`. */
@@ -7000,6 +7144,43 @@ void reims_vgpu_dirty_rebase(ReimsVgpuDirty *d, uint64_t token, const uint64_t *
         qemu_cond_wait(&d->synced_cond, &d->lock);
         s = g_hash_table_lookup(d->sets, &token);
     }
+    if (s && !s->hash && s->vhash && s->vhash_base) {
+        /*
+         * TEMP lab DIRTY_VERIFY: a hypervisor-answered set never sees the device's stores, but its baseline must
+         * hold their bytes, or a guest store of those same bytes later reads as moved content. Under `lock`, which
+         * every evaluation reading `vhash` holds.
+         */
+        qemu_mutex_unlock(&d->lock);
+        n = reims_vgpu_dirty_ram_slices_into(&slices, &cap);
+        qemu_mutex_lock(&d->lock);
+        s = g_hash_table_lookup(d->sets, &token);
+        if (s && s->vhash && s->vhash_base) {
+            rcu_read_lock();
+            for (k = 0; k < count; k++) {
+                uint64_t gpa = gpas[k] & ~(s->page_size - 1);
+                size_t lo = 0, hi = s->count;
+
+                while (lo < hi) {   /* `pages` is sorted */
+                    size_t mid = lo + (hi - lo) / 2;
+
+                    if (s->pages[mid] < gpa) {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                if (lo < s->count && s->pages[lo] == gpa &&
+                    reims_vgpu_dirty_page_hash(slices, n, gpa, s->page_size, &s->vhash[lo])) {
+                    done++;
+                }
+            }
+            rcu_read_unlock();
+        }
+        d->lab_vhash_rebase += done;
+        qemu_mutex_unlock(&d->lock);
+        g_free(slices);
+        return;
+    }
     if (!s || !s->hash || !s->hash_base) {
         /* Not hashed, or no baseline yet: the first sync takes one, over these stores too. */
         d->lab_rebase_unhashed++;
@@ -7951,15 +8132,22 @@ static void reims_vgpu_dirty_hash_report(ReimsVgpuDirty *d)
             " waits=%" PRIu64 " noram=%" PRIu64 " pf=%" PRIu64 " split=%" PRIu64 " helped=%" PRIu64
             " due_skipped=%" PRIu64 " ahead_req=%" PRIu64 " ahead_q=%" PRIu64 " ahead_done=%" PRIu64
             " ahead_hit=%" PRIu64 " ahead_busy=%" PRIu64 " ahead_full=%" PRIu64
-            " rebase=%" PRIu64 " rebase_pages=%" PRIu64 " rebase_unhashed=%" PRIu64 "\n",
+            " rebase=%" PRIu64 " rebase_pages=%" PRIu64 " rebase_unhashed=%" PRIu64
+            " verify_sets=%" PRIu64 " verify_base_us=%" PRIu64 " verify_same=%" PRIu64
+            " verify_moved=%" PRIu64 " verify_rebase=%" PRIu64 "\n",
             d->lab_hash_sets, d->lab_hash_syncs, d->lab_hash_pages,
             d->lab_hash_ns / 1000, d->lab_hash_dirty, d->lab_hash_fg,
             d->lab_hash_fg_ns / 1000, d->lab_hash_waits, qatomic_read(&d->lab_hash_noram),
             d->lab_hash_pf, d->lab_hash_split, d->lab_hash_split_helped, d->lab_hash_due_skipped,
             d->lab_ahead_req, d->lab_ahead_q, d->lab_ahead_done, d->lab_ahead_hit,
             d->lab_ahead_busy, d->lab_ahead_full,
-            d->lab_rebase_calls, d->lab_rebase_pages, d->lab_rebase_unhashed);
+            d->lab_rebase_calls, d->lab_rebase_pages, d->lab_rebase_unhashed,
+            qatomic_read(&d->lab_vhash_sets), qatomic_read(&d->lab_vhash_base_ns) / 1000,
+            d->lab_vhash_same, d->lab_vhash_moved, d->lab_vhash_rebase);
     d->lab_rebase_calls = d->lab_rebase_pages = d->lab_rebase_unhashed = 0;
+    qatomic_set(&d->lab_vhash_sets, 0);
+    qatomic_set(&d->lab_vhash_base_ns, 0);
+    d->lab_vhash_same = d->lab_vhash_moved = d->lab_vhash_rebase = 0;
     d->lab_ahead_req = d->lab_ahead_q = d->lab_ahead_done = d->lab_ahead_hit = 0;
     d->lab_ahead_busy = d->lab_ahead_full = 0;
     d->lab_hash_split = d->lab_hash_split_helped = d->lab_hash_due_skipped = 0;
