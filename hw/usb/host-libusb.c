@@ -52,6 +52,9 @@
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "qemu/thread.h"
+#ifdef CONFIG_WIN32
+#include <setupapi.h>
+#endif
 #include "system/runstate.h"
 #include "system/system.h"
 #include "trace.h"
@@ -493,27 +496,41 @@ static void usb_host_release_bh(void *opaque)
     usb_host_release_all();
 }
 
-static void usb_host_check_release_combo(const uint8_t *rep, int len)
+static void usb_host_check_release_combo(USBHostDevice *s, const uint8_t *rep,
+                                         int len)
 {
     uint8_t m;
     int i;
 
-    if (len < 8) {
+    /*
+     * Exactly a boot report (8 bytes, reserved byte 0) with Ctrl, Alt and
+     * Shift down, no GUI key, and Escape as the only key: the first field
+     * test (2026-10-07) released everything a minute after boot on some
+     * other report, so nothing looser counts.
+     */
+    if (len != 8 || rep[1] != 0) {
         return;
     }
     m = rep[0];
-    if (!(m & 0x11) || !(m & 0x44) || !(m & 0x22)) {
+    if (!(m & 0x11) || !(m & 0x44) || !(m & 0x22) || (m & 0x88)) {
         return;
     }
-    for (i = 2; i < 8; i++) {
-        if (rep[i] == USB_HOST_COMBO_KEY) {
-            if (!release_bh) {
-                release_bh = qemu_bh_new(usb_host_release_bh, NULL);
-            }
-            qemu_bh_schedule(release_bh);
+    if (rep[2] != USB_HOST_COMBO_KEY) {
+        return;
+    }
+    for (i = 3; i < 8; i++) {
+        if (rep[i]) {
             return;
         }
     }
+    info_report("usb-host %04x:%04x: release combo (report %02x %02x %02x "
+                "%02x %02x %02x %02x %02x)", s->ddesc.idVendor,
+                s->ddesc.idProduct, rep[0], rep[1], rep[2], rep[3], rep[4],
+                rep[5], rep[6], rep[7]);
+    if (!release_bh) {
+        release_bh = qemu_bh_new(usb_host_release_bh, NULL);
+    }
+    qemu_bh_schedule(release_bh);
 }
 
 /*
@@ -597,7 +614,7 @@ static void LIBUSB_CALL usb_host_req_complete_data(struct libusb_transfer *xfer)
     if (r->in && xfer->actual_length) {
         usb_packet_copy(r->p, r->buffer, xfer->actual_length);
         if (s->kbd_in_eps & (1 << r->p->ep->nr)) {
-            usb_host_check_release_combo(r->buffer, xfer->actual_length);
+            usb_host_check_release_combo(s, r->buffer, xfer->actual_length);
         }
     }
     trace_usb_host_req_complete(s->bus_num, s->addr, r->p,
@@ -1080,11 +1097,85 @@ static void usb_host_ep_update(USBHostDevice *s)
  * interface can be claimed - bound to WinUSB - is given to the guest; the
  * others are refused once in the log and retried by the auto scan.
  */
+/*
+ * Whether Windows has the device (the whole device node, not an interface
+ * of it) on the WinUSB service. A claim is no proof: libusb claims the HID
+ * interfaces of a composite device that is still on usbccgp + HidUsb
+ * (2026-10-07: the main keyboard and mouse, already handed back to Windows,
+ * were reopened by a restarted QEMU and fed both Windows and the guest).
+ * SetupAPI is loaded at run time: the probe must not change what QEMU links.
+ */
+static bool usb_host_win32_on_winusb(uint16_t vid, uint16_t pid)
+{
+    typedef HDEVINFO (WINAPI *get_class_devs_fn)(const GUID *, PCSTR, HWND,
+                                                 DWORD);
+    typedef BOOL (WINAPI *enum_fn)(HDEVINFO, DWORD, PSP_DEVINFO_DATA);
+    typedef BOOL (WINAPI *instance_id_fn)(HDEVINFO, PSP_DEVINFO_DATA, PSTR,
+                                          DWORD, PDWORD);
+    typedef BOOL (WINAPI *property_fn)(HDEVINFO, PSP_DEVINFO_DATA, DWORD,
+                                       PDWORD, PBYTE, DWORD, PDWORD);
+    typedef BOOL (WINAPI *destroy_fn)(HDEVINFO);
+    static HMODULE lib;
+    get_class_devs_fn get_class_devs;
+    enum_fn enum_info;
+    instance_id_fn instance_id;
+    property_fn property;
+    destroy_fn destroy;
+    SP_DEVINFO_DATA data = { .cbSize = sizeof(data) };
+    char want[32], id[512], service[64];
+    HDEVINFO set;
+    DWORD i;
+    bool found = false;
+
+    if (!lib) {
+        lib = LoadLibraryA("setupapi.dll");
+    }
+    if (!lib) {
+        return false;
+    }
+    get_class_devs = (get_class_devs_fn)GetProcAddress(lib, "SetupDiGetClassDevsA");
+    enum_info = (enum_fn)GetProcAddress(lib, "SetupDiEnumDeviceInfo");
+    instance_id = (instance_id_fn)GetProcAddress(lib, "SetupDiGetDeviceInstanceIdA");
+    property = (property_fn)GetProcAddress(lib, "SetupDiGetDeviceRegistryPropertyA");
+    destroy = (destroy_fn)GetProcAddress(lib, "SetupDiDestroyDeviceInfoList");
+    if (!get_class_devs || !enum_info || !instance_id || !property || !destroy) {
+        return false;
+    }
+    /* "USB\VID_xxxx&PID_yyyy\": the device node; interfaces add "&MI_nn". */
+    snprintf(want, sizeof(want), "USB\\VID_%04X&PID_%04X\\", vid, pid);
+    set = get_class_devs(NULL, "USB", NULL, DIGCF_PRESENT | DIGCF_ALLCLASSES);
+    if (set == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    for (i = 0; !found && enum_info(set, i, &data); i++) {
+        if (!instance_id(set, &data, id, sizeof(id), NULL) ||
+            g_ascii_strncasecmp(id, want, strlen(want)) != 0) {
+            continue;
+        }
+        if (property(set, &data, SPDRP_SERVICE, NULL, (PBYTE)service,
+                     sizeof(service), NULL) &&
+            g_ascii_strcasecmp(service, "WinUSB") == 0) {
+            found = true;
+        }
+    }
+    destroy(set);
+    return found;
+}
+
 static bool usb_host_win32_owned(USBHostDevice *s)
 {
     struct libusb_config_descriptor *conf;
     int rc, i, n, bad = -1;
 
+    if (!usb_host_win32_on_winusb(s->ddesc.idVendor, s->ddesc.idProduct)) {
+        if (!s->win32_refused) {
+            warn_report("usb-host %04x:%04x: Windows has it on its own driver, "
+                        "not WinUSB - not given to the guest",
+                        s->ddesc.idVendor, s->ddesc.idProduct);
+            s->win32_refused = true;
+        }
+        return false;
+    }
     rc = libusb_get_active_config_descriptor(s->dev, &conf);
     if (rc != 0) {
         return true; /* address state: nothing to claim yet */
