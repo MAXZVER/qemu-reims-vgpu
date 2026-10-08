@@ -3866,6 +3866,142 @@ void whpx_arch_accel_class_init(ObjectClass *oc)
         "Separate security domain");
 }
 
+/*
+ * TEMP lab: QEMU_LAB_VPWATCH=1 - whether the hypervisor runs the guest's VPs.
+ * b050 (Intel, 24 vCPUs, large-page RAM): the whole guest stops 8-11 % of the
+ * time, up to ~200 ms at once - four guest threads spinning on
+ * mach_absolute_time all stop together, idle or not, with no dirty query, WP
+ * remap or other device work on the host. A thread here reads every VP's
+ * runtime counters each ~1 ms; a stretch of >= 20 ms in which no VP gained
+ * guest runtime (total - hypervisor), after VPs were running, is the guest not
+ * executing; hv_vps says whether the VPs sat in the hypervisor meanwhile (b052:
+ * total runtime never stopped through the guest's freezes). The
+ * thread's own lateness says whether host threads stalled with them.
+ * Lines: `vpwatch stall t_ms=<epoch> len_ms= prev_vps= watcher_gap_ms=` and a
+ * per-second `vpwatch sec vps= stalls= stall_ms= max_watcher_gap_ms=`.
+ */
+typedef HRESULT (WINAPI *WhvGetVpCountersFn)(WHV_PARTITION_HANDLE, UINT32,
+                                              WHV_PROCESSOR_COUNTER_SET, VOID *,
+                                              UINT32, UINT32 *);
+static WhvGetVpCountersFn lab_vpw_get;
+static unsigned lab_vpw_n;
+
+/* Sum of the VPs' guest runtime (total - hypervisor); the hypervisor part into *hv. */
+static uint64_t lab_vpw_total(uint64_t *per, uint64_t *perhv, uint64_t *hv)
+{
+    uint64_t sum = 0, sumhv = 0;
+    unsigned i;
+
+    for (i = 0; i < lab_vpw_n; i++) {
+        WHV_PROCESSOR_RUNTIME_COUNTERS c = {0};
+        UINT32 got = 0;
+
+        if (SUCCEEDED(lab_vpw_get(whpx_global.partition, i,
+                                  WHvProcessorCounterSetRuntime, &c,
+                                  sizeof(c), &got))) {
+            per[i] = c.TotalRuntime100ns;
+            perhv[i] = c.HypervisorRuntime100ns;
+        }
+        sum += per[i] - perhv[i];
+        sumhv += perhv[i];
+    }
+    *hv = sumhv;
+    return sum;
+}
+
+static void *lab_vpw_thread(void *arg)
+{
+    uint64_t per[256] = {0}, perhv[256] = {0}, hv = 0, hv_prev = 0, stall_hv = 0;
+    uint64_t prev = lab_vpw_total(per, perhv, &hv_prev), sec_stall_ns = 0, sec_hv = 0;
+    int64_t t_prev = get_clock(), sec_t0 = t_prev, stall_t0 = 0;
+    int64_t max_gap_ns = 0, stall_gap_ns = 0;
+    double rate = 0, prev_rate = 0, sec_run = 0;
+    unsigned sec_stalls = 0;
+    HANDLE tm = CreateWaitableTimerExW(NULL, NULL,
+                                       0x00000002 /* HIGH_RESOLUTION */,
+                                       TIMER_ALL_ACCESS);
+
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    for (;;) {
+        if (tm) {
+            LARGE_INTEGER due = { .QuadPart = -10000 };   /* 1 ms */
+            SetWaitableTimer(tm, &due, 0, NULL, NULL, FALSE);
+            WaitForSingleObject(tm, INFINITE);
+        } else {
+            Sleep(1);
+        }
+        int64_t now = get_clock(), dt = now - t_prev;
+        uint64_t cur = lab_vpw_total(per, perhv, &hv);
+        double vps = dt > 0 ? (double)(cur - prev) * 100.0 / dt : 0;
+
+        max_gap_ns = MAX(max_gap_ns, dt);
+        sec_run += (double)(cur - prev) * 100.0;
+        sec_hv += (hv - hv_prev) * 100;
+        if (cur == prev && rate >= 0.5) {
+            if (!stall_t0) {
+                stall_t0 = t_prev;
+                prev_rate = rate;
+                stall_gap_ns = 0;
+                stall_hv = 0;
+            }
+            stall_hv += (hv - hv_prev) * 100;
+            stall_gap_ns = MAX(stall_gap_ns, dt);
+        } else if (stall_t0) {
+            int64_t len = t_prev - stall_t0;
+
+            if (len >= 20 * SCALE_MS) {
+                fprintf(stderr, "vpwatch stall t_ms=%" PRId64 " len_ms=%.1f prev_vps=%.1f "
+                        "watcher_gap_ms=%.1f hv_vps=%.2f\n",
+                        g_get_real_time() / 1000 - (now - stall_t0) / SCALE_MS,
+                        len / 1e6, prev_rate, stall_gap_ns / 1e6,
+                        (double)stall_hv / len);
+                sec_stalls++;
+                sec_stall_ns += len;
+            }
+            stall_t0 = 0;
+        }
+        if (!stall_t0) {
+            /* ~20 ms moving average of the VPs running */
+            rate = rate * 0.95 + vps * 0.05;
+        }
+        if (now - sec_t0 >= NANOSECONDS_PER_SECOND) {
+            fprintf(stderr, "vpwatch sec t_ms=%" PRId64 " vps=%.2f hv_vps=%.2f stalls=%u stall_ms=%" PRIu64
+                    " max_watcher_gap_ms=%.1f\n", g_get_real_time() / 1000,
+                    sec_run / (now - sec_t0), (double)sec_hv / (now - sec_t0), sec_stalls,
+                    sec_stall_ns / 1000000, max_gap_ns / 1e6);
+            sec_hv = 0;
+            sec_t0 = now;
+            sec_run = 0;
+            sec_stalls = 0;
+            sec_stall_ns = 0;
+            max_gap_ns = 0;
+        }
+        prev = cur;
+        hv_prev = hv;
+        t_prev = now;
+    }
+    return NULL;
+}
+
+static void lab_vpw_start(unsigned vps)
+{
+    const char *e = getenv("QEMU_LAB_VPWATCH");
+    HMODULE m = GetModuleHandleA("WinHvPlatform.dll");
+    static QemuThread th;
+
+    if (!e || strcmp(e, "1") != 0) {
+        return;
+    }
+    lab_vpw_get = m ? (WhvGetVpCountersFn)(void *)GetProcAddress(
+                          m, "WHvGetVirtualProcessorCounters") : NULL;
+    lab_vpw_n = MIN(vps, 256u);
+    fprintf(stderr, "vpwatch on vps=%u api=%d\n", lab_vpw_n, lab_vpw_get != NULL);
+    if (lab_vpw_get) {
+        qemu_thread_create(&th, "lab-vpwatch", lab_vpw_thread, NULL,
+                           QEMU_THREAD_DETACHED);
+    }
+}
+
 int whpx_accel_init(AccelState *as, MachineState *ms)
 {
     struct whpx_state *whpx;
@@ -4195,6 +4331,7 @@ int whpx_accel_init(AccelState *as, MachineState *ms)
 
     whpx_memory_init();
     whpx_init_emu();
+    lab_vpw_start(ms->smp.cpus);   /* TEMP lab: QEMU_LAB_VPWATCH=1 */
 
     return 0;
 
