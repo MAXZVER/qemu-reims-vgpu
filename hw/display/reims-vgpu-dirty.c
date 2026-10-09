@@ -1214,6 +1214,22 @@ static int reims_vgpu_dirty_wp_hashed_live;
  */
 static uint64_t reims_vgpu_dirty_wp_hashed_streak_live;
 /*
+ * TEMP lab live DIRTY_WP_HASHED_MIN=<pages>: the smallest hashed set WP_HASHED protects, apart from DIRTY_WP_MIN (the
+ * queried sets', 2048). b099 (Intel, Weather): the hashed sets the drain re-hashes are mostly 150-2110 pages - under the
+ * queried sets' floor, so WP_HASHED protected none - and 6.2k hash syncs a window over 2.7M pages found 2 dirty.
+ * 0 = DIRTY_WP_MIN's floor.
+ */
+static uint64_t reims_vgpu_dirty_wp_hashed_min_live;
+/*
+ * DIRTY_WP_HASHED and its floor when the live file does not name them: on, 64 pages, on an Intel host (b099: the
+ * hashed sets there are the small and mid ones, hash_max 4096, and protecting them took the drain's foreground hashes
+ * from ~44 to ~3 ms a second - Weather 11.3 -> 9.2 us a draw, reveal-desktop 15.1 -> 11.9, Safari 27 -> 22, Finder
+ * 18.3 -> 16.5; no artifacts); off elsewhere (hq084/hq085, AMD: with the 5K sets hashed the remaps cost the guest
+ * more than the hashes). REIMS_VGPU_LAB_DIRTY_WP_HASHED=on|off and _WP_HASHED_MIN=<pages> override at boot.
+ */
+static int reims_vgpu_dirty_wp_hashed_default;
+static uint64_t reims_vgpu_dirty_wp_hashed_min_default;
+/*
  * TEMP lab live DIRTY_VERIFY=on|off (see `ReimsVgpuDirtySet::vhash`): -1 while the live file does not name it, and
  * then REIMS_VGPU_LAB_DIRTY_VERIFY=off at boot is the only way to turn it off.
  */
@@ -1258,9 +1274,15 @@ static void reims_vgpu_dirty_gap_refresh(void)
     v = reims_vgpu_lab_live_num("DIRTY_HASH_BG_MAX");
     qatomic_set(&reims_vgpu_dirty_hash_bg_max_live, v < 0 ? reims_vgpu_dirty_hash_bg_max_default : (uint64_t)v);
     qatomic_set(&reims_vgpu_dirty_hash_bg_once_live, reims_vgpu_lab_live("DIRTY_HASH_BG_ONCE") == 1);
-    qatomic_set(&reims_vgpu_dirty_wp_hashed_live, reims_vgpu_lab_live("DIRTY_WP_HASHED") == 1);
+    {
+        int on = reims_vgpu_lab_live("DIRTY_WP_HASHED");
+
+        qatomic_set(&reims_vgpu_dirty_wp_hashed_live, on < 0 ? reims_vgpu_dirty_wp_hashed_default : on == 1);
+    }
     v = reims_vgpu_lab_live_num("DIRTY_WP_HASHED_STREAK");
     qatomic_set(&reims_vgpu_dirty_wp_hashed_streak_live, v > 0 ? (uint64_t)v : 0);
+    v = reims_vgpu_lab_live_num("DIRTY_WP_HASHED_MIN");
+    qatomic_set(&reims_vgpu_dirty_wp_hashed_min_live, v > 0 ? (uint64_t)v : reims_vgpu_dirty_wp_hashed_min_default);
     qatomic_set(&reims_vgpu_dirty_verify_live, reims_vgpu_lab_live("DIRTY_VERIFY"));
 }
 
@@ -6179,7 +6201,8 @@ static void reims_vgpu_dirty_hash_sync(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
         s->hash_busy = false;
         qatomic_store_release(&s->synced_epoch, MAX(s->synced_epoch, epoch));
         if (qatomic_read(&reims_vgpu_dirty_wp_hashed_live) && d->wp_mode && d->wp_active &&
-            s->wp_state == WP_NONE && s->count * (s->page_size >> shift) >= d->wp_min_pages) {
+            s->wp_state == WP_NONE && s->count * (s->page_size >> shift) >=
+                (qatomic_read(&reims_vgpu_dirty_wp_hashed_min_live) ?: d->wp_min_pages)) {
             /* TEMP lab live DIRTY_WP_HASHED: the clean streak and the queueing of the query path. */
             uint32_t need = (uint32_t)(qatomic_read(&reims_vgpu_dirty_wp_hashed_streak_live) ?:
                                        qatomic_read(&reims_vgpu_dirty_wp_streak_live) ?: d->wp_streak_need)
@@ -7347,9 +7370,21 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
             reims_vgpu_dirty_hash_bg_max_default = (uint64_t)MAX(0, atoi(getenv("REIMS_VGPU_LAB_DIRTY_HASH_BG_MAX")));
         }
         qatomic_set(&reims_vgpu_dirty_hash_bg_max_live, reims_vgpu_dirty_hash_bg_max_default);
+        reims_vgpu_dirty_wp_hashed_default = d->host_intel;
+        reims_vgpu_dirty_wp_hashed_min_default = d->host_intel ? 64 : 0;
+        if (getenv("REIMS_VGPU_LAB_DIRTY_WP_HASHED")) {
+            reims_vgpu_dirty_wp_hashed_default = strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_HASHED"), "on") == 0;
+        }
+        if (getenv("REIMS_VGPU_LAB_DIRTY_WP_HASHED_MIN")) {
+            reims_vgpu_dirty_wp_hashed_min_default =
+                (uint64_t)MAX(0, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_HASHED_MIN")));
+        }
+        qatomic_set(&reims_vgpu_dirty_wp_hashed_live, reims_vgpu_dirty_wp_hashed_default);
+        qatomic_set(&reims_vgpu_dirty_wp_hashed_min_live, reims_vgpu_dirty_wp_hashed_min_default);
         fprintf(stderr, "reims-dirty-hash-config hash_max=%" PRIu64 " bg_max=%" PRIu64 " hash_ns=%" PRIu64
-                " host=%s\n", (uint64_t)d->hash_max, reims_vgpu_dirty_hash_bg_max_default, (uint64_t)d->hash_ns,
-                d->host_intel ? "intel" : "other");
+                " host=%s wp_hashed=%d wp_hashed_min=%" PRIu64 "\n", (uint64_t)d->hash_max,
+                reims_vgpu_dirty_hash_bg_max_default, (uint64_t)d->hash_ns, d->host_intel ? "intel" : "other",
+                reims_vgpu_dirty_wp_hashed_default, reims_vgpu_dirty_wp_hashed_min_default);
         /* TEMP lab DIRTY_TIGHT (opt-in for its A/B; the counts are kept when a live file may set it). */
         d->tight = getenv("REIMS_VGPU_LAB_DIRTY_TIGHT") &&
                    strcmp(getenv("REIMS_VGPU_LAB_DIRTY_TIGHT"), "on") == 0;
@@ -7568,6 +7603,19 @@ bool reims_vgpu_dirty_note_doorbell(ReimsVgpuDirty *d, int channel)
 
     if (!d) {
         return false;
+    }
+    {
+        /*
+         * TEMP lab: the live switches are otherwise re-read only beside the on-demand census, which prints
+         * only in seconds with foreground queries (every 30-60 s on a hashed Intel boot): a live A/B arm
+         * then ran on the previous arm's values (b099). A doorbell re-reads them at most every 250 ms.
+         */
+        static int64_t live_next_ns;
+        int64_t now = get_clock(), next = qatomic_read(&live_next_ns);
+
+        if (now >= next && qatomic_cmpxchg(&live_next_ns, next, now + 250 * SCALE_MS) == next) {
+            reims_vgpu_dirty_gap_refresh();
+        }
     }
     if (d->hole_mode) {   /* TEMP lab (DIRTY_HOLE) */
         if (channel >= 0 && channel < (int)ARRAY_SIZE(d->lab_db)) {
