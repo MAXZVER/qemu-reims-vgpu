@@ -148,6 +148,7 @@ typedef struct ReimsVgpuDirtySet {
     int64_t born_ns;
     uint32_t nruns;
     bool wp_listed;
+    bool wp_counted;        /* TEMP lab DIRTY_WP_OVERLAP: its pages are counted in `wp_refs`; `wp_mutex` */
     uint32_t lab_fg_n;      /* TEMP lab: foreground syncs since the last fgtop line */
     /*
      * Lab DIRTY_HASH: a set scattered over many runs of guest RAM is brought up to date by
@@ -810,6 +811,12 @@ struct ReimsVgpuDirty {
      */
     unsigned long *wp_hole_bits;
     uint64_t wp_bits_n;
+    /*
+     * TEMP lab DIRTY_WP_OVERLAP: per pfn, how many protected (or being-protected) sets hold the page;
+     * a release leaves a page with a non-zero count read-only. Allocated with `wp_bits` when on.
+     */
+    uint16_t *wp_refs;
+    bool wp_overlap;
     uint64_t lab_wp_protects, lab_wp_faults, lab_wp_refused, lab_wp_chunks, lab_wp_remaps;
     /*
      * TEMP lab (n148): why the protect step passed over a queued set — gone or no longer WP_NONE,
@@ -2028,6 +2035,61 @@ static inline bool reims_vgpu_dirty_wp_ro(ReimsVgpuDirty *d, uint64_t gpa)
     return pfn < d->wp_bits_n && test_bit(pfn, d->wp_bits);
 }
 
+/*
+ * TEMP lab DIRTY_WP_OVERLAP (REIMS_VGPU_LAB_DIRTY_WP_OVERLAP=on, not with DIRTY_WP_HOLE): sets may be
+ * protected over pages another protected set already holds read-only. b103/b104: the 5K surfaces and
+ * the long-lived queried sets were refused for read-only pages (`rej_ro`, 500-3000 a boot once the
+ * hashed windows over the same memory were protected). Each page counts the protected sets holding
+ * it; a store fault drops every set holding the page (the fault loop already walks them all), and a
+ * release - a dropped set's runs, an orphan, a merged span - leaves a page some other set still holds
+ * read-only. `wp_mutex` held.
+ */
+static inline bool reims_vgpu_dirty_wp_kept(ReimsVgpuDirty *d, uint64_t gpa)
+{
+    uint64_t pfn = gpa >> qemu_target_page_bits();
+
+    return d->wp_refs && pfn < d->wp_bits_n && d->wp_refs[pfn] != 0;
+}
+
+/* TEMP lab DIRTY_WP_OVERLAP: whether any page of [gpa, end) is held by a protected set. */
+static bool reims_vgpu_dirty_wp_run_kept(ReimsVgpuDirty *d, uint64_t gpa, uint64_t end)
+{
+    for (; gpa < end; gpa += 1ULL << qemu_target_page_bits()) {
+        if (reims_vgpu_dirty_wp_kept(d, gpa)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* TEMP lab DIRTY_WP_OVERLAP: count `s` in (`up`) or out of `wp_refs`, once each way. `wp_mutex` held. */
+static void reims_vgpu_dirty_wp_count(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s, bool up)
+{
+    const uint64_t pg = 1ULL << qemu_target_page_bits();
+    size_t p;
+
+    if (!d->wp_refs || s->wp_counted == up) {
+        return;
+    }
+    s->wp_counted = up;
+    for (p = 0; p < s->count; p++) {
+        uint64_t a;
+
+        for (a = s->pages[p]; a < s->pages[p] + s->page_size; a += pg) {
+            uint64_t pfn = a >> qemu_target_page_bits();
+
+            if (pfn >= d->wp_bits_n) {
+                continue;
+            }
+            if (up) {
+                d->wp_refs[pfn] += d->wp_refs[pfn] != UINT16_MAX;
+            } else {
+                d->wp_refs[pfn] -= d->wp_refs[pfn] != 0;
+            }
+        }
+    }
+}
+
 /* One remap of [gpa, gpa+size), with `wp_bits` kept equal to what is read-only. `wp_mutex` held. */
 static int reims_vgpu_dirty_wp_remap(ReimsVgpuDirty *d, uint64_t gpa, uint64_t size, bool writable)
 {
@@ -2065,11 +2127,12 @@ static void reims_vgpu_dirty_wp_release(ReimsVgpuDirty *d, uint64_t gpa, uint64_
     while (gpa < end) {
         uint64_t a;
 
-        if (!reims_vgpu_dirty_wp_ro(d, gpa)) {
+        if (!reims_vgpu_dirty_wp_ro(d, gpa) || reims_vgpu_dirty_wp_kept(d, gpa)) {
             gpa += pg;
             continue;
         }
-        for (a = gpa + pg; a < end && reims_vgpu_dirty_wp_ro(d, a); a += pg) {
+        for (a = gpa + pg; a < end && reims_vgpu_dirty_wp_ro(d, a) && !reims_vgpu_dirty_wp_kept(d, a);
+             a += pg) {
         }
         reims_vgpu_dirty_wp_remap(d, gpa, a - gpa, true);
         (*budget)--;
@@ -2230,6 +2293,7 @@ static void reims_vgpu_dirty_wp_bury(ReimsVgpuDirty *d)
         if (d->wp_cur == ds->token) {
             d->wp_cur = 0;
         }
+        reims_vgpu_dirty_wp_count(d, ds, false);   /* TEMP lab DIRTY_WP_OVERLAP: before its runs go back */
         reims_vgpu_dirty_wp_orphan(d, ds);
         reims_vgpu_dirty_wp_holes_clear(d, ds);   /* TEMP lab DIRTY_WP_HOLE */
         call_rcu(ds, reims_vgpu_dirty_set_free_rcu, rcu);
@@ -2332,6 +2396,7 @@ static bool reims_vgpu_dirty_wp_fault(uint64_t gpa)
                     qatomic_store_release(&s->synced_epoch, 0);
                 }
                 s->wp_state = WP_DROPPING;
+                reims_vgpu_dirty_wp_count(d, s, false);   /* TEMP lab DIRTY_WP_OVERLAP */
                 s->wp_next = 0;
                 s->wp_streak = 0;
                 s->wp_lost++;
@@ -2342,8 +2407,12 @@ static bool reims_vgpu_dirty_wp_fault(uint64_t gpa)
                 dropped = s;   /* alive while `wp_mutex` is held: only the step frees listed sets */
             }
             qemu_mutex_unlock(&d->lock);
-            if (hit && !d->wp_hole) {
-                break;   /* protected sets never share a page without holes */
+            if (hit && !d->wp_hole && !d->wp_refs) {
+                /*
+                 * Protected sets never share a page without holes - unless DIRTY_WP_OVERLAP lets them,
+                 * and then every set holding the page has to stop trusting it before it is writable.
+                 */
+                break;
             }
         }
         /*
@@ -2412,6 +2481,7 @@ static void reims_vgpu_dirty_wp_invalidate(void)
             }
             s->wp_state = WP_NONE;
             s->wp_streak = 0;
+            reims_vgpu_dirty_wp_count(d, s, false);   /* TEMP lab DIRTY_WP_OVERLAP */
         }
         qemu_mutex_unlock(&d->lock);
         if (s && d->wp_bits) {
@@ -2503,14 +2573,15 @@ static bool reims_vgpu_dirty_wp_pick_hot(ReimsVgpuDirty *d)
                 d->lab_wp_heals++;
                 continue;
             }
-            if (d->wp_hole ? reims_vgpu_dirty_wp_any_held(d, c)
-                           : reims_vgpu_dirty_wp_any_ro(d, c, 0, c->count)) {
+            if (!d->wp_refs && (d->wp_hole ? reims_vgpu_dirty_wp_any_held(d, c)
+                                            : reims_vgpu_dirty_wp_any_ro(d, c, 0, c->count))) {
                 d->lab_wp_rej_ro++;
                 continue;   /* WP_RETRY queues it again later */
             }
             c->wp_state = WP_PROTECTING;
             c->wp_next = 0;
             c->wp_listed = true;
+            reims_vgpu_dirty_wp_count(d, c, true);   /* TEMP lab DIRTY_WP_OVERLAP */
             d->wp_cur = token;
             g_array_append_val(d->wp_list, token);
         }
@@ -2542,13 +2613,14 @@ static bool reims_vgpu_dirty_wp_pick(ReimsVgpuDirty *d)
         } else if (((c->pages[c->count - 1] + c->page_size - 1) >> qemu_target_page_bits()) >=
                    d->wp_bits_n) {
             d->lab_wp_rej_bits++;
-        } else if (d->wp_hole ? reims_vgpu_dirty_wp_any_held(d, c)
-                              : reims_vgpu_dirty_wp_any_ro(d, c, 0, c->count)) {
+        } else if (!d->wp_refs && (d->wp_hole ? reims_vgpu_dirty_wp_any_held(d, c)
+                                               : reims_vgpu_dirty_wp_any_ro(d, c, 0, c->count))) {
             d->lab_wp_rej_ro++;
         } else {
             c->wp_state = WP_PROTECTING;
             c->wp_next = 0;
             c->wp_listed = true;
+            reims_vgpu_dirty_wp_count(d, c, true);   /* TEMP lab DIRTY_WP_OVERLAP */
             d->wp_cur = token;
             g_array_append_val(d->wp_list, token);
         }
@@ -2638,6 +2710,12 @@ static size_t reims_vgpu_dirty_wp_release_merged(ReimsVgpuDirty *d, const ReimsV
         size_t i0 = i, k;
         int si;
 
+        if (d->wp_refs && reims_vgpu_dirty_wp_run_kept(d, start, end)) {
+            /* TEMP lab DIRTY_WP_OVERLAP: another set holds part of it; page by page. */
+            reims_vgpu_dirty_wp_release(d, start, end, budget);
+            i++;
+            continue;
+        }
         while (start < end && !reims_vgpu_dirty_wp_ro(d, start)) {
             start += pg;
         }
@@ -2653,6 +2731,9 @@ static size_t reims_vgpu_dirty_wp_release_merged(ReimsVgpuDirty *d, const ReimsV
 
             if (g_end > slice_end || (g > end && g - end > gap_max)) {
                 break;
+            }
+            if (d->wp_refs && reims_vgpu_dirty_wp_run_kept(d, g, g_end)) {
+                break;   /* TEMP lab DIRTY_WP_OVERLAP: that run goes page by page */
             }
             for (a = end; a < g && !reims_vgpu_dirty_wp_ro(d, a); a += pg) {
             }
@@ -2893,6 +2974,7 @@ static int64_t reims_vgpu_dirty_wp_protect_chunk(ReimsVgpuDirty *d, uint64_t tok
     qemu_mutex_lock(&d->lock);
     if (rc) {
         s->wp_state = WP_DROPPING;
+        reims_vgpu_dirty_wp_count(d, s, false);   /* TEMP lab DIRTY_WP_OVERLAP */
         s->wp_next = 0;
         d->wp_cur = 0;
         d->wp_mode = 0;
@@ -2964,6 +3046,10 @@ static bool reims_vgpu_dirty_wp_step(ReimsVgpuDirty *d)
          * when it covered almost nothing and no set would ever have fitted.
          */
         d->wp_bits_n = 1ULL << (36 - qemu_target_page_bits());
+        if (d->wp_overlap && !d->wp_hole) {
+            /* Before the bitmap is published: a pick that sees `wp_bits` sees these too. */
+            d->wp_refs = g_new0(uint16_t, d->wp_bits_n);   /* TEMP lab DIRTY_WP_OVERLAP */
+        }
         qatomic_set(&d->wp_bits, bitmap_new(d->wp_bits_n));
         if (d->wp_hole) {
             d->wp_hole_bits = bitmap_new(d->wp_bits_n);   /* TEMP lab DIRTY_WP_HOLE */
@@ -3325,6 +3411,7 @@ void reims_vgpu_dirty_untrack(ReimsVgpuDirty *d, uint64_t token)
                 }
                 qemu_mutex_unlock(&d->lock);
                 if (ws) {
+                    reims_vgpu_dirty_wp_count(d, ws, false);   /* TEMP lab DIRTY_WP_OVERLAP */
                     reims_vgpu_dirty_wp_orphan(d, ws);
                     reims_vgpu_dirty_wp_holes_clear(d, ws);   /* TEMP lab DIRTY_WP_HOLE */
                 }
@@ -7547,6 +7634,9 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
             d->wp_merge_gap = getenv("REIMS_VGPU_LAB_DIRTY_WP_MERGE_GAP") ?
                               (uint32_t)MAX(0, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_MERGE_GAP"))) : 512;
             d->wp_merge_runs = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyRun));
+            /* TEMP lab DIRTY_WP_OVERLAP: opt-in until measured; see reims_vgpu_dirty_wp_kept. */
+            d->wp_overlap = getenv("REIMS_VGPU_LAB_DIRTY_WP_OVERLAP") &&
+                            strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_OVERLAP"), "on") == 0;
             d->wp_calm = !(getenv("REIMS_VGPU_LAB_DIRTY_WP_CALM") &&
                            strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_CALM"), "off") == 0);
             /* 1 s plus 2 ms a run (its protect and give-back cost ~0.7 ms); the stress rows use 0. */
