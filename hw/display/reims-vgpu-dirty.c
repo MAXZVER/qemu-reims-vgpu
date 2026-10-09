@@ -7634,9 +7634,14 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
             d->wp_merge_gap = getenv("REIMS_VGPU_LAB_DIRTY_WP_MERGE_GAP") ?
                               (uint32_t)MAX(0, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_MERGE_GAP"))) : 512;
             d->wp_merge_runs = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyRun));
-            /* TEMP lab DIRTY_WP_OVERLAP: opt-in until measured; see reims_vgpu_dirty_wp_kept. */
-            d->wp_overlap = getenv("REIMS_VGPU_LAB_DIRTY_WP_OVERLAP") &&
-                            strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_OVERLAP"), "on") == 0;
+            /*
+             * TEMP lab DIRTY_WP_OVERLAP (see reims_vgpu_dirty_wp_kept): on by default since b110 (Intel, a boot an
+             * arm, A O O A): rej_ro 600-750 -> 0, drain us a draw reveal-desktop 11.95 -> 11.15, Safari 21.55 -> 19.0,
+             * Weather and Finder -2 %, Safari window fps 140 -> 146, no artifacts; the stress gate's overlap rows 0.
+             * `=off` restores disjoint protection.
+             */
+            d->wp_overlap = !(getenv("REIMS_VGPU_LAB_DIRTY_WP_OVERLAP") &&
+                              strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_OVERLAP"), "off") == 0);
             d->wp_calm = !(getenv("REIMS_VGPU_LAB_DIRTY_WP_CALM") &&
                            strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_CALM"), "off") == 0);
             /* 1 s plus 2 ms a run (its protect and give-back cost ~0.7 ms); the stress rows use 0. */
