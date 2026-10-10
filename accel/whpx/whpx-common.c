@@ -451,7 +451,16 @@ void whpx_lab_excl_core_drain(void)
     if (core0 < 0 || !drain || !n) {
         return;
     }
-    SetProcessDefaultCpuSets(GetCurrentProcess(), rest, n);
+    {
+        typedef BOOL (WINAPI *SetDefaultFn)(HANDLE, const ULONG *, ULONG);
+        HMODULE k32 = GetModuleHandleA("kernel32.dll");
+        SetDefaultFn set_default = k32 ? (SetDefaultFn)(void *)GetProcAddress(
+                                             k32, "SetProcessDefaultCpuSets")
+                                       : NULL;
+        if (!set_default || !set_default(GetCurrentProcess(), rest, n)) {
+            return;
+        }
+    }
     SetThreadSelectedCpuSets(GetCurrentThread(), &drain, 1);
     fprintf(stderr, "reims-excl-core drain=core%d set=%lu recorder=core%d rest=%lu\n", core0,
             (unsigned long)drain, core1, (unsigned long)n);
