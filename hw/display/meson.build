@@ -108,6 +108,12 @@ if config_all_devices.has_key('CONFIG_REIMS_VGPU')
     reims_vgpu_rust_sys_libs = ['-luser32', '-lgdi32', '-ldwmapi', '-lole32',
                                 '-lshell32', '-limm32', '-loleaut32', '-lws2_32',
                                 '-luserenv', '-lntdll', '-luxtheme']
+    # TEMP lab (PGO): the profiling runtime a `-Cprofile-generate` Rust staticlib
+    # references and does not bundle. Present only on a host set up for a PGO
+    # run; an archive nothing references adds nothing to the link.
+    if import('fs').exists('E:/pgo-c/libprofiler_builtins.a')
+      reims_vgpu_rust_sys_libs += ['E:/pgo-c/libprofiler_builtins.a']
+    endif
   endif
   if reims_vgpu_backend_kind == 'metal'
     # host-window: the Metal rail presents through a Rust-owned winit window and
