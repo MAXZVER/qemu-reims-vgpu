@@ -1116,6 +1116,7 @@ static void *reims_vgpu_pci_drain_thread(void *opaque)
 #if defined(_WIN32)
     reims_vgpu_hiqos_apply(false);
     whpx_lab_pin_pcores("drain");
+    whpx_lab_excl_core_drain();
 #endif
 
     /*

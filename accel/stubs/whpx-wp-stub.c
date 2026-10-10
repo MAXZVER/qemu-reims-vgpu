@@ -35,3 +35,7 @@ void whpx_lab_pin_ccd(const char *who)
 void whpx_lab_pin_pcores(const char *who)
 {
 }
+
+void whpx_lab_excl_core_drain(void)
+{
+}

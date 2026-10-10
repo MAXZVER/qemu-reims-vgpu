@@ -384,6 +384,80 @@ void whpx_lab_pin_pcores(const char *who)
     }
 }
 /*
+ * TEMP lab REIMS_VGPU_LAB_EXCL_CORE=on: the drain thread alone on the first performance core and the recorder
+ * (crates/reims-vgpu/src/lab_cores.rs pin_recorder_excl_core) alone on the second; every other thread of the
+ * process (vCPUs, pool helpers, the recording lane, QEMU's own) defaults to the rest. The drain is the frame's
+ * critical path and is serial: a busy hyperthread sibling or a vCPU sharing its core slows every packet.
+ */
+void whpx_lab_excl_core_drain(void)
+{
+    ULONG need = 0, rest[256], drain = 0, n = 0;
+    uint8_t *buf;
+    size_t off;
+    uint8_t maxc = 0;
+    int core0 = -1, core1 = -1;
+    const char *e = getenv("REIMS_VGPU_LAB_EXCL_CORE");
+
+    if (!e || strcmp(e, "on") != 0) {
+        return;
+    }
+    GetSystemCpuSetInformation(NULL, 0, &need, NULL, 0);
+    buf = need ? g_malloc0(need) : NULL;
+    if (!buf || !GetSystemCpuSetInformation((PSYSTEM_CPU_SET_INFORMATION)buf, need, &need,
+                                            NULL, 0)) {
+        g_free(buf);
+        return;
+    }
+    for (off = 0; off + 19 <= need;) {
+        PSYSTEM_CPU_SET_INFORMATION r = (PSYSTEM_CPU_SET_INFORMATION)(buf + off);
+        if (!r->Size) {
+            break;
+        }
+        maxc = MAX(maxc, r->CpuSet.EfficiencyClass);
+        off += r->Size;
+    }
+    /* The two lowest-numbered performance cores. */
+    for (off = 0; off + 19 <= need;) {
+        PSYSTEM_CPU_SET_INFORMATION r = (PSYSTEM_CPU_SET_INFORMATION)(buf + off);
+        if (!r->Size) {
+            break;
+        }
+        if (r->CpuSet.Group == 0 && r->CpuSet.EfficiencyClass == maxc) {
+            int c = r->CpuSet.CoreIndex;
+            if (core0 < 0 || c < core0) {
+                core1 = core0;
+                core0 = c;
+            } else if (c != core0 && (core1 < 0 || c < core1)) {
+                core1 = c;
+            }
+        }
+        off += r->Size;
+    }
+    for (off = 0; off + 19 <= need && n < G_N_ELEMENTS(rest);) {
+        PSYSTEM_CPU_SET_INFORMATION r = (PSYSTEM_CPU_SET_INFORMATION)(buf + off);
+        if (!r->Size) {
+            break;
+        }
+        if (r->CpuSet.Group == 0 && r->CpuSet.CoreIndex == core0) {
+            if (!drain) {
+                drain = r->CpuSet.Id;
+            }
+        } else if (r->CpuSet.Group == 0 && r->CpuSet.CoreIndex != core1) {
+            rest[n++] = r->CpuSet.Id;
+        }
+        off += r->Size;
+    }
+    g_free(buf);
+    if (core0 < 0 || !drain || !n) {
+        return;
+    }
+    SetProcessDefaultCpuSets(GetCurrentProcess(), rest, n);
+    SetThreadSelectedCpuSets(GetCurrentThread(), &drain, 1);
+    fprintf(stderr, "reims-excl-core drain=core%d set=%lu recorder=core%d rest=%lu
+", core0,
+            (unsigned long)drain, core1, (unsigned long)n);
+}
+/*
  * TEMP lab REIMS_VGPU_LAB_DEVICE_CCD=N: the calling device thread prefers the logical processors sharing
  * last-level cache N - one CCD of the home rig's Ryzen 9 7950X (crates/reims-vgpu/src/lab_cores.rs
  * pin_device_ccd, the Rust half). The drain, its recorder and the pool hand work across for every draw.
