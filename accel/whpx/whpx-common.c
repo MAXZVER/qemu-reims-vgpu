@@ -453,8 +453,7 @@ void whpx_lab_excl_core_drain(void)
     }
     SetProcessDefaultCpuSets(GetCurrentProcess(), rest, n);
     SetThreadSelectedCpuSets(GetCurrentThread(), &drain, 1);
-    fprintf(stderr, "reims-excl-core drain=core%d set=%lu recorder=core%d rest=%lu
-", core0,
+    fprintf(stderr, "reims-excl-core drain=core%d set=%lu recorder=core%d rest=%lu\n", core0,
             (unsigned long)drain, core1, (unsigned long)n);
 }
 /*
