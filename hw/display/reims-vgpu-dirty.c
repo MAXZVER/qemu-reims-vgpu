@@ -546,8 +546,16 @@ struct ReimsVgpuDirty {
         size_t chunk;
         guint next, done, total;
         bool busy;
+        /*
+         * TEMP lab REBASE_SPLIT: non-NULL for a rebase job - the set's page indices `idx[0..nidx)` are hashed into
+         * `out` (the set's `hash` or `vhash`), with no comparison and no `moved`.
+         */
+        const size_t *idx;
+        size_t nidx;
+        uint64_t *out;
     } hjob[REIMS_VGPU_DIRTY_HJOBS];
     uint64_t lab_hash_split, lab_hash_split_helped;
+    uint64_t lab_rebase_split;   /* TEMP lab REBASE_SPLIT: rebases hashed on the workers */
     /*
      * TEMP lab DIRTY_FGSLOT (on unless =off): a large foreground sync gets a
      * split job of its own, which every helper serves before the batch's.
@@ -6112,6 +6120,22 @@ static void reims_vgpu_dirty_hash_range(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
     }
 }
 
+/*
+ * TEMP lab REBASE_SPLIT: hash pages `idx[i0..i1)` of `s` into `out` (no comparison). The caller holds the RCU read
+ * lock. A page outside guest RAM keeps its old hash, as the serial rebase leaves it.
+ */
+static void reims_vgpu_dirty_rehash_idx(ReimsVgpuDirtySet *s, const ReimsVgpuDirtySlice *slices, int n,
+                                        const size_t *idx, size_t i0, size_t i1, uint64_t *out)
+{
+    size_t i;
+
+    for (i = i0; i < i1; i++) {
+        size_t p = idx[i];
+
+        reims_vgpu_dirty_page_hash(slices, n, s->pages[p], s->page_size, &out[p]);
+    }
+}
+
 /* Lab DIRTY_HASH: whether a running hash job has a chunk left to take. d->lock held. */
 static bool reims_vgpu_dirty_hash_pending(ReimsVgpuDirty *d)
 {
@@ -6140,12 +6164,18 @@ static bool reims_vgpu_dirty_hash_help_one(ReimsVgpuDirty *d, int first)
         if (d->hjob[j].busy && d->hjob[j].next < d->hjob[j].total) {
             guint k = d->hjob[j].next++;
             size_t p0 = (size_t)k * d->hjob[j].chunk;
-            size_t p1 = MIN(p0 + d->hjob[j].chunk, d->hjob[j].s->count);
+            size_t lim = d->hjob[j].idx ? d->hjob[j].nidx : d->hjob[j].s->count;
+            size_t p1 = MIN(p0 + d->hjob[j].chunk, lim);
 
             qemu_mutex_unlock(&d->lock);
             rcu_read_lock();
-            reims_vgpu_dirty_hash_range(d, d->hjob[j].s, d->hjob[j].slices, d->hjob[j].n, p0, p1,
-                                        d->hjob[j].base, d->hjob[j].moved);
+            if (d->hjob[j].idx) {
+                reims_vgpu_dirty_rehash_idx(d->hjob[j].s, d->hjob[j].slices, d->hjob[j].n, d->hjob[j].idx,
+                                            p0, p1, d->hjob[j].out);
+            } else {
+                reims_vgpu_dirty_hash_range(d, d->hjob[j].s, d->hjob[j].slices, d->hjob[j].n, p0, p1,
+                                            d->hjob[j].base, d->hjob[j].moved);
+            }
             rcu_read_unlock();
             qemu_mutex_lock(&d->lock);
             if (++d->hjob[j].done == d->hjob[j].total) {
@@ -6167,6 +6197,81 @@ static void reims_vgpu_dirty_hash_help(ReimsVgpuDirty *d)
 /* Pages past which a set's hash is cut into chunks for the workers, and the chunk. */
 #define REIMS_VGPU_DIRTY_HASH_SPLIT_MIN 256
 #define REIMS_VGPU_DIRTY_HASH_CHUNK 128
+
+/*
+ * TEMP lab REBASE_SPLIT (live REBASE_SPLIT=on|off, else REIMS_VGPU_LAB_REBASE_SPLIT=off to disable): whether a
+ * rebase of many pages hashes them on the workers. b287: a landed 5K frame's rebase hashed ~14 000 pages on the
+ * drain under `lock`, 41 % of the landing and ~6 % of the busy drain on full-screen Maps.
+ */
+static bool reims_vgpu_dirty_rebase_split_on(void)
+{
+    static int env = -1;
+    int v = reims_vgpu_lab_live("REBASE_SPLIT");
+
+    if (v >= 0) {
+        return v == 1;
+    }
+    if (qatomic_read(&env) < 0) {
+        const char *e = getenv("REIMS_VGPU_LAB_REBASE_SPLIT");
+
+        qatomic_set(&env, !(e && strcmp(e, "off") == 0));
+    }
+    return qatomic_read(&env) == 1;
+}
+
+/*
+ * TEMP lab REBASE_SPLIT: hash pages `idx[0..nidx)` of `s` into `out`, split over the workers (and this thread) when
+ * there are many and a job slot is free, else here. Called without `lock`, under the RCU read lock; the caller owns
+ * those slots of `out` for the duration (the set's `hash_busy` for `hash`; for `vhash`, a concurrent evaluation
+ * only ever stores the same page's current hash there).
+ */
+static void reims_vgpu_dirty_rehash(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s, const ReimsVgpuDirtySlice *slices,
+                                    int n, const size_t *idx, size_t nidx, uint64_t *out)
+{
+    bool split = false;
+
+    if (nidx >= REIMS_VGPU_DIRTY_HASH_SPLIT_MIN && reims_vgpu_dirty_rebase_split_on()) {
+        int j;
+
+        qemu_mutex_lock(&d->lock);
+        if (d->od_nworkers > 0) {
+            for (j = 0; j < REIMS_VGPU_DIRTY_HJOBS && d->hjob[j].busy; j++) {
+            }
+            if (j < REIMS_VGPU_DIRTY_HJOBS) {
+                d->hjob[j].s = s;
+                d->hjob[j].slices = slices;
+                d->hjob[j].n = n;
+                d->hjob[j].moved = NULL;
+                d->hjob[j].base = false;
+                d->hjob[j].idx = idx;
+                d->hjob[j].nidx = nidx;
+                d->hjob[j].out = out;
+                d->hjob[j].chunk = REIMS_VGPU_DIRTY_HASH_CHUNK;
+                d->hjob[j].next = d->hjob[j].done = 0;
+                d->hjob[j].total = (nidx + REIMS_VGPU_DIRTY_HASH_CHUNK - 1) / REIMS_VGPU_DIRTY_HASH_CHUNK;
+                d->hjob[j].busy = true;
+                split = true;
+                d->lab_rebase_split++;
+                qemu_cond_broadcast(&d->od_work_cond);
+                while (d->hjob[j].done < d->hjob[j].total) {
+                    if (!reims_vgpu_dirty_hash_help_one(d, j)) {
+                        qemu_cond_wait(&d->split_cond, &d->lock);
+                    }
+                }
+                d->hjob[j].busy = false;
+                d->hjob[j].s = NULL;
+                d->hjob[j].idx = NULL;
+                d->hjob[j].out = NULL;
+                d->hjob[j].nidx = 0;
+                d->hjob[j].total = d->hjob[j].done = d->hjob[j].next = 0;
+            }
+        }
+        qemu_mutex_unlock(&d->lock);
+    }
+    if (!split) {
+        reims_vgpu_dirty_rehash_idx(s, slices, n, idx, 0, nidx, out);
+    }
+}
 
 /*
  * Lab DIRTY_HASH: bring hashed set `s` (claimed for `epoch` by the caller) up to date by comparing
@@ -7224,6 +7329,35 @@ void reims_vgpu_dirty_sync_ahead(ReimsVgpuDirty *d, const uint64_t *tokens, size
 }
 
 /*
+ * TEMP lab REBASE_SPLIT: the indices into `s->pages` of `gpas[0..count)` (sorted `pages`, binary search), into
+ * `idx` (sized `count`); returns how many were found.
+ */
+static size_t reims_vgpu_dirty_rebase_indices(const ReimsVgpuDirtySet *s, const uint64_t *gpas, size_t count,
+                                              size_t *idx)
+{
+    size_t k, m = 0;
+
+    for (k = 0; k < count; k++) {
+        uint64_t gpa = gpas[k] & ~(s->page_size - 1);
+        size_t lo = 0, hi = s->count;
+
+        while (lo < hi) {   /* `pages` is sorted */
+            size_t mid = lo + (hi - lo) / 2;
+
+            if (s->pages[mid] < gpa) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo < s->count && s->pages[lo] == gpa) {
+            idx[m++] = lo;
+        }
+    }
+    return m;
+}
+
+/*
  * The device itself just stored into these pages of `token`'s set (a writeback landing the frame
  * the GPU rendered there). A hashed set cannot tell those stores from the guest's: its next sync
  * sees the pages' content move and reports the device's own frame as the guest writing the
@@ -7238,9 +7372,9 @@ void reims_vgpu_dirty_rebase(ReimsVgpuDirty *d, uint64_t token, const uint64_t *
 {
     ReimsVgpuDirtySlice *slices = NULL;
     ReimsVgpuDirtySet *s;
-    uint64_t done = 0;
+    size_t *idx = NULL;
+    size_t m;
     int cap = 0, n;
-    size_t k;
 
     token &= ~REIMS_VGPU_DIRTY_TOKEN_LAGGED;
     if (!d || !token || !gpas || count == 0) {
@@ -7257,37 +7391,29 @@ void reims_vgpu_dirty_rebase(ReimsVgpuDirty *d, uint64_t token, const uint64_t *
     if (s && !s->hash && s->vhash && s->vhash_base) {
         /*
          * TEMP lab DIRTY_VERIFY: a hypervisor-answered set never sees the device's stores, but its baseline must
-         * hold their bytes, or a guest store of those same bytes later reads as moved content. Under `lock`, which
-         * every evaluation reading `vhash` holds.
+         * hold their bytes, or a guest store of those same bytes later reads as moved content. The indices are
+         * taken under `lock`; the hashes (REBASE_SPLIT: on the workers when there are many) outside it, under RCU,
+         * which keeps the set and its `vhash` alive. An evaluation meanwhile stores only a page's current hash
+         * into its slot, the same value this rebase takes, so neither can hide a guest store from the other.
          */
         qemu_mutex_unlock(&d->lock);
         n = reims_vgpu_dirty_ram_slices_into(&slices, &cap);
+        idx = g_new(size_t, count);
+        rcu_read_lock();
         qemu_mutex_lock(&d->lock);
         s = g_hash_table_lookup(d->sets, &token);
         if (s && s->vhash && s->vhash_base) {
-            rcu_read_lock();
-            for (k = 0; k < count; k++) {
-                uint64_t gpa = gpas[k] & ~(s->page_size - 1);
-                size_t lo = 0, hi = s->count;
+            uint64_t *out = s->vhash;
 
-                while (lo < hi) {   /* `pages` is sorted */
-                    size_t mid = lo + (hi - lo) / 2;
-
-                    if (s->pages[mid] < gpa) {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                if (lo < s->count && s->pages[lo] == gpa &&
-                    reims_vgpu_dirty_page_hash(slices, n, gpa, s->page_size, &s->vhash[lo])) {
-                    done++;
-                }
-            }
-            rcu_read_unlock();
+            m = reims_vgpu_dirty_rebase_indices(s, gpas, count, idx);
+            qemu_mutex_unlock(&d->lock);
+            reims_vgpu_dirty_rehash(d, s, slices, n, idx, m, out);
+            qemu_mutex_lock(&d->lock);
+            d->lab_vhash_rebase += m;
         }
-        d->lab_vhash_rebase += done;
         qemu_mutex_unlock(&d->lock);
+        rcu_read_unlock();
+        g_free(idx);
         g_free(slices);
         return;
     }
@@ -7301,34 +7427,13 @@ void reims_vgpu_dirty_rebase(ReimsVgpuDirty *d, uint64_t token, const uint64_t *
     qemu_mutex_unlock(&d->lock);
 
     n = reims_vgpu_dirty_ram_slices_into(&slices, &cap);
+    idx = g_new(size_t, count);
     rcu_read_lock();   /* the set (RCU-freed) and guest RAM stay put while hashing */
-    for (k = 0; k < count; k++) {
-        uint64_t gpa = gpas[k] & ~(s->page_size - 1);
-        size_t lo = 0, hi = s->count;
-        int si;
-
-        while (lo < hi) {   /* `pages` is sorted */
-            size_t mid = lo + (hi - lo) / 2;
-
-            if (s->pages[mid] < gpa) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        if (lo >= s->count || s->pages[lo] != gpa) {
-            continue;
-        }
-        si = reims_vgpu_dirty_slice_of(slices, n, gpa);
-        if (si < 0 || gpa + s->page_size > slices[si].gpa + slices[si].len) {
-            continue;   /* outside guest RAM, or straddling two ranges: its sync keeps reading it as written */
-        }
-        s->hash[lo] = reims_vgpu_dirty_hash_bytes((const uint8_t *)memory_region_get_ram_ptr(slices[si].mr) +
-                                                  slices[si].offset + (gpa - slices[si].gpa),
-                                                  s->page_size);
-        done++;
-    }
+    m = reims_vgpu_dirty_rebase_indices(s, gpas, count, idx);
+    /* A page outside guest RAM, or straddling two ranges, keeps its hash: its sync keeps reading it as written. */
+    reims_vgpu_dirty_rehash(d, s, slices, n, idx, m, s->hash);
     rcu_read_unlock();
+    g_free(idx);
     g_free(slices);
 
     qemu_mutex_lock(&d->lock);
@@ -7336,7 +7441,7 @@ void reims_vgpu_dirty_rebase(ReimsVgpuDirty *d, uint64_t token, const uint64_t *
     if (s) {
         s->hash_busy = false;
     }
-    d->lab_rebase_pages += done;
+    d->lab_rebase_pages += m;
     qemu_cond_broadcast(&d->synced_cond);
     qemu_mutex_unlock(&d->lock);
 }
@@ -8277,7 +8382,7 @@ static void reims_vgpu_dirty_hash_report(ReimsVgpuDirty *d)
             " ahead_hit=%" PRIu64 " ahead_busy=%" PRIu64 " ahead_full=%" PRIu64
             " rebase=%" PRIu64 " rebase_pages=%" PRIu64 " rebase_unhashed=%" PRIu64
             " verify_sets=%" PRIu64 " verify_base_us=%" PRIu64 " verify_same=%" PRIu64
-            " verify_moved=%" PRIu64 " verify_rebase=%" PRIu64 "\n",
+            " verify_moved=%" PRIu64 " verify_rebase=%" PRIu64 " rebase_split=%" PRIu64 "\n",
             d->lab_hash_sets, d->lab_hash_syncs, d->lab_hash_pages,
             d->lab_hash_ns / 1000, d->lab_hash_dirty, d->lab_hash_fg,
             d->lab_hash_fg_ns / 1000, d->lab_hash_waits, qatomic_read(&d->lab_hash_noram),
@@ -8286,8 +8391,9 @@ static void reims_vgpu_dirty_hash_report(ReimsVgpuDirty *d)
             d->lab_ahead_busy, d->lab_ahead_full,
             d->lab_rebase_calls, d->lab_rebase_pages, d->lab_rebase_unhashed,
             qatomic_read(&d->lab_vhash_sets), qatomic_read(&d->lab_vhash_base_ns) / 1000,
-            d->lab_vhash_same, d->lab_vhash_moved, d->lab_vhash_rebase);
+            d->lab_vhash_same, d->lab_vhash_moved, d->lab_vhash_rebase, d->lab_rebase_split);
     d->lab_rebase_calls = d->lab_rebase_pages = d->lab_rebase_unhashed = 0;
+    d->lab_rebase_split = 0;
     qatomic_set(&d->lab_vhash_sets, 0);
     qatomic_set(&d->lab_vhash_base_ns, 0);
     d->lab_vhash_same = d->lab_vhash_moved = d->lab_vhash_rebase = 0;
