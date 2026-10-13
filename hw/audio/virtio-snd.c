@@ -289,6 +289,11 @@ uint32_t virtio_snd_set_pcm_params(VirtIOSound *s,
     st_params->channels = params->channels;
     st_params->format = params->format;
     st_params->rate = params->rate;
+    /* TEMP lab (2026-10-13, audio clicks): how much the guest queues ahead. */
+    fprintf(stderr, "virtio-snd: stream %u params: buffer %u bytes, period %u bytes, "
+            "%u ch, format %u, rate idx %u\n", stream_id, st_params->buffer_bytes,
+            st_params->period_bytes, st_params->channels, st_params->format,
+            st_params->rate);
 
     return cpu_to_le32(VIRTIO_SND_S_OK);
 }
@@ -1155,6 +1160,15 @@ static void virtio_snd_pcm_out_cb(void *data, int available)
     size_t size;
 
     WITH_QEMU_LOCK_GUARD(&stream->queue_mutex) {
+        /* TEMP lab (2026-10-13, audio clicks): the guest left nothing queued. */
+        if (QSIMPLEQ_EMPTY(&stream->queue) && stream->active && available > 0) {
+            static uint64_t starved;
+            uint64_t n = ++starved;
+            if (!(n & (n - 1))) {
+                fprintf(stderr, "virtio-snd: stream %u starved %" PRIu64 " (backend wants %d bytes)\n",
+                        stream->id, n, available);
+            }
+        }
         while (!QSIMPLEQ_EMPTY(&stream->queue)) {
             buffer = QSIMPLEQ_FIRST(&stream->queue);
             if (!virtio_queue_ready(buffer->vq)) {

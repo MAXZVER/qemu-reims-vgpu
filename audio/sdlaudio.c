@@ -26,6 +26,7 @@
 #include <SDL.h>
 #include <SDL_thread.h>
 #include "qemu/module.h"
+#include "qemu/timer.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "qemu/audio.h"
@@ -57,6 +58,27 @@ typedef struct SDLVoiceOut {
     int initialized;
     Audiodev *dev;
     SDL_AudioDeviceID devid;
+    /*
+     * TEMP lab (2026-10-13, b374-b378): a cushion between the guest and SDL.
+     * QEMU refills the ring on its 10 ms audio timer while SDL drains it from
+     * its own thread; a guest that queues little ahead (virtio-sound on macOS)
+     * leaves the ring short when an SDL period falls just before a refill, and
+     * SDL plays silence - 3-6 clicks of 3-7 ms per 20 s, with any SDL buffer.
+     * While `priming`, the callback plays silence and consumes nothing until
+     * the ring holds `prefill` bytes; an underrun primes again, so the cushion
+     * is restored instead of lost. QEMU_SDL_OUT_PREFILL_MS (0 = off).
+     *
+     * And the guest is drained at the real-time rate (`rate`, as the wav
+     * backend does), not by whatever ring space an SDL period just freed:
+     * macOS clocks its stream by the completions, and bursty ones made it
+     * drop audio (b378, buffer-count=8: a third of the tone lost in 10 ms
+     * chunks). The rate starts at zero; the cushion is what accumulates
+     * while the callback primes.
+     */
+    size_t prefill;
+    bool priming;
+    uint64_t underruns;
+    RateCtl rate;
 } SDLVoiceOut;
 
 typedef struct SDLVoiceIn {
@@ -217,6 +239,23 @@ static void sdl_callback_out(void *opaque, Uint8 *buf, int len)
     SDLVoiceOut *sdl = opaque;
     HWVoiceOut *hw = &sdl->hw;
 
+    if (!sdl->exit && sdl->prefill) {
+        if (sdl->priming && hw->pending_emul < sdl->prefill) {
+            audio_pcm_info_clear_buf(&hw->info, buf,
+                                     len / hw->info.bytes_per_frame);
+            return;
+        }
+        sdl->priming = false;
+        if (hw->pending_emul < (size_t)len) {
+            sdl->priming = true;
+            uint64_t n = ++sdl->underruns;
+            if (!(n & (n - 1))) {   /* 1st, 2nd, 4th, 8th... */
+                fprintf(stderr, "sdl: output underrun %" PRIu64 " (ring %zu of %d bytes): re-priming\n",
+                        n, hw->pending_emul, len);
+            }
+        }
+    }
+
     if (!sdl->exit) {
 
         while (hw->pending_emul && len) {
@@ -303,11 +342,53 @@ static void sdl_callback_in(void *opaque, Uint8 *buf, int len)
         SDL_UnlockAudioDevice(sdl->devid);                     \
     }
 
-SDL_WRAPPER_FUNC(buffer_get_free, size_t, (HWVoiceOut *hw), (hw), Out)
 SDL_WRAPPER_FUNC(get_buffer_out, void *, (HWVoiceOut *hw, size_t *size),
                  (hw, size), Out)
-SDL_WRAPPER_FUNC(put_buffer_out, size_t,
-                 (HWVoiceOut *hw, void *buf, size_t size), (hw, buf, size), Out)
+
+static size_t sdl_buffer_get_free(HWVoiceOut *hw)
+{
+    SDLVoiceOut *sdl = (SDLVoiceOut *)hw;
+    size_t free;
+
+    if (sdl->prefill) {
+        /* TEMP lab: how late the audio timer runs (the main loop holds it). */
+        static int64_t last, worst, n;
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        int64_t gap = last ? now - last : 0;
+        last = now;
+        worst = MAX(worst, gap);
+        if (gap > 25 * SCALE_MS) {
+            fprintf(stderr, "sdl: audio timer late: %" PRId64 " ms since the last run\n",
+                    gap / SCALE_MS);
+        }
+        if (++n % 6000 == 0) {
+            fprintf(stderr, "sdl: audio timer worst gap %" PRId64 " ms over the last 6000 runs\n",
+                    worst / SCALE_MS);
+            worst = 0;
+        }
+    }
+    SDL_LockAudioDevice(sdl->devid);
+    free = audio_generic_buffer_get_free(hw);
+    if (sdl->prefill) {
+        free = MIN(free, audio_rate_peek_bytes(&sdl->rate, &hw->info));
+    }
+    SDL_UnlockAudioDevice(sdl->devid);
+    return free;
+}
+
+static size_t sdl_put_buffer_out(HWVoiceOut *hw, void *buf, size_t size)
+{
+    SDLVoiceOut *sdl = (SDLVoiceOut *)hw;
+    size_t ret;
+
+    SDL_LockAudioDevice(sdl->devid);
+    ret = audio_generic_put_buffer_out(hw, buf, size);
+    if (sdl->prefill) {
+        audio_rate_add_bytes(&sdl->rate, ret);
+    }
+    SDL_UnlockAudioDevice(sdl->devid);
+    return ret;
+}
 SDL_WRAPPER_FUNC(write, size_t,
                  (HWVoiceOut *hw, void *buf, size_t size), (hw, buf, size), Out)
 SDL_WRAPPER_FUNC(read, size_t, (HWVoiceIn *hw, void *buf, size_t size),
@@ -363,6 +444,21 @@ static int sdl_init_out(HWVoiceOut *hw, struct audsettings *as)
     hw->samples = (spdo->has_buffer_count ? spdo->buffer_count : 4) *
         obt.samples;
 
+    {
+        const char *ms = getenv("QEMU_SDL_OUT_PREFILL_MS");
+        size_t want = ms ? (size_t)atoi(ms) * obt.freq / 1000 *
+            hw->info.bytes_per_frame : 0;
+        /* the ring must hold the cushion plus one SDL period */
+        size_t room = (hw->samples - obt.samples) * hw->info.bytes_per_frame;
+        sdl->prefill = MIN(want, room);
+        sdl->priming = true;
+        sdl->underruns = 0;
+        if (ms) {
+            fprintf(stderr, "sdl: output %d Hz, period %d frames, ring %zu frames, prefill %zu bytes\n",
+                    obt.freq, obt.samples, hw->samples, sdl->prefill);
+        }
+    }
+
     sdl->initialized = 1;
     sdl->exit = 0;
     return 0;
@@ -372,6 +468,18 @@ static void sdl_enable_out(HWVoiceOut *hw, bool enable)
 {
     SDLVoiceOut *sdl = (SDLVoiceOut *)hw;
 
+    if (enable) {
+        SDL_LockAudioDevice(sdl->devid);
+        sdl->priming = true;
+        /*
+         * No head start: the guest is drained strictly in real time (b381: a
+         * cushion pulled ahead at once - completions bursting 60 ms early -
+         * threw the guest's clock and made it worse); the cushion builds while
+         * the callback is priming and plays silence.
+         */
+        audio_rate_start(&sdl->rate);
+        SDL_UnlockAudioDevice(sdl->devid);
+    }
     SDL_PauseAudioDevice(sdl->devid, !enable);
 }
 
