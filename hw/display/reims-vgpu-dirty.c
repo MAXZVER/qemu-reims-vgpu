@@ -868,6 +868,7 @@ struct ReimsVgpuDirty {
      * of waiting for `wp_mutex`. (A fault still opens only its page: see the fault hook.)
      */
     bool wp_calm;
+    bool wp_layout;   /* TEMP lab (b357) REIMS_VGPU_LAB_DIRTY_WP_LAYOUT=1: big sets' layout at protect */
     /*
      * Lab DIRTY_HASH_DUE (on by default; =off restores the old window): the background hashes a
      * hashed set when its next read is due — 4 doorbells from its shortest recent read gap past its last read — instead of at every
@@ -897,6 +898,8 @@ struct ReimsVgpuDirty {
     int wp_merge_slices_cap;
     GArray *wp_merge_runs;                  /* scratch, under `wp_mutex` */
     uint64_t lab_wp_merge_spans, lab_wp_merge_runs, lab_wp_merge_pages, lab_wp_merge_fault;
+    /* TEMP lab (b357): remaps by size - 1, 2-16, 17-256, >256 pages - count and time. */
+    uint64_t lab_wp_rm_n[4], lab_wp_rm_ns[4];
     /*
      * TEMP lab REIMS_VGPU_LAB_UNTRACK_POPULATE=on: the queried (not hashed) sets this tracker stops
      * tracking have their writable pages' second-level entries filled in for write on threads of
@@ -1194,6 +1197,13 @@ static uint64_t reims_vgpu_dirty_hash_max_live;
  */
 static uint64_t reims_vgpu_dirty_wp_streak_live, reims_vgpu_dirty_wp_age_live;
 /*
+ * TEMP lab live DIRTY_WP_THREAD_DUTY=<percent> (0 = not set): the WP thread's duty, REIMS_VGPU_LAB_DIRTY_WP_THREAD_DUTY
+ * (30) otherwise. b348 (Intel, full-screen Maps): the thread ran at its 30 % cap the whole time (~700 run remaps a
+ * second, ~0.4 ms each) and finished 0-2 protects a second, while the drain's most-synced sets were 5K surfaces
+ * (10 800 pages, gen 1, clean streak 165-377) left unprotected - each sync of one a run of hypervisor queries.
+ */
+static uint64_t reims_vgpu_dirty_wp_thread_duty_live;
+/*
  * TEMP lab live DIRTY_HASH_BG_MAX=<pages> (0 = no bound): a hashed set larger than this is not hashed by
  * the background prefetch at every doorbell, only when a read needs it (split across the workers) or
  * a pass names it ahead. hq080: hashing the 5K sets (10.8k pages) in the background as well tied up
@@ -1286,6 +1296,8 @@ static void reims_vgpu_dirty_gap_refresh(void)
     qatomic_set(&reims_vgpu_dirty_wp_streak_live, v > 0 ? (uint64_t)v : 0);
     v = reims_vgpu_lab_live_num("DIRTY_WP_AGE_MS");
     qatomic_set(&reims_vgpu_dirty_wp_age_live, v > 0 ? (uint64_t)v : 0);
+    v = reims_vgpu_lab_live_num("DIRTY_WP_THREAD_DUTY");
+    qatomic_set(&reims_vgpu_dirty_wp_thread_duty_live, v > 0 ? (uint64_t)MIN(v, 100) : 0);
     v = reims_vgpu_lab_live_num("DIRTY_HASH_BG_MAX");
     qatomic_set(&reims_vgpu_dirty_hash_bg_max_live, v < 0 ? reims_vgpu_dirty_hash_bg_max_default : (uint64_t)v);
     qatomic_set(&reims_vgpu_dirty_hash_bg_once_live, reims_vgpu_lab_live("DIRTY_HASH_BG_ONCE") == 1);
@@ -2118,7 +2130,15 @@ static int reims_vgpu_dirty_wp_remap(ReimsVgpuDirty *d, uint64_t gpa, uint64_t s
             clear_bit_atomic(a >> qemu_target_page_bits(), d->wp_bits);
         }
     }
-    d->lab_wp_remap_ns += get_clock() - t0;
+    {
+        int64_t ns = get_clock() - t0;
+        uint64_t np = size >> qemu_target_page_bits();
+        int b = np <= 1 ? 0 : np <= 16 ? 1 : np <= 256 ? 2 : 3;
+
+        d->lab_wp_remap_ns += ns;
+        d->lab_wp_rm_n[b]++;   /* TEMP lab (b357) */
+        d->lab_wp_rm_ns[b] += ns;
+    }
     d->lab_wp_remaps++;
     return rc;
 }
@@ -2516,6 +2536,80 @@ static void reims_vgpu_dirty_wp_invalidate(void)
  * read-only page goes back for a later pass. n151: the LIFO step spent its whole duty on
  * short-lived sets while the hottest ones (clean for 1 400-3 600 syncs) waited.
  */
+/*
+ * TEMP lab (b357): the layout of a big set taken for protection - its runs, the gaps between them by
+ * size, how many gap pages other sets track or hold read-only, and how many remaps a protect would
+ * take if gaps up to 16 / 64 / 256 pages were bridged (all of them, or only untracked writable ones).
+ * `lock` and `wp_mutex` held.
+ */
+static void reims_vgpu_dirty_wp_layout(ReimsVgpuDirty *d, const ReimsVgpuDirtySet *s)
+{
+    static int64_t sec_ns;
+    static unsigned in_sec;
+    const int shift = qemu_target_page_bits();
+    const uint64_t per = s->page_size >> shift;
+    uint64_t gb[5] = { 0 }, gp[5] = { 0 }, gt[5] = { 0 }, gr[5] = { 0 };
+    uint64_t c16 = 1, c64 = 1, c256 = 1, u16 = 1, u64 = 1, u256 = 1, prev_end, span;
+    int64_t now = get_clock();
+    size_t p;
+
+    if (!d->wp_layout || !d->wp_bits || (uint64_t)s->count * per < 1024) {
+        return;
+    }
+    if (now - sec_ns > NANOSECONDS_PER_SECOND) {
+        sec_ns = now;
+        in_sec = 0;
+    }
+    if (++in_sec > 20) {
+        return;
+    }
+    WITH_RCU_READ_LOCK_GUARD() {
+        const ReimsVgpuDirtyTrk *t = qatomic_rcu_read(&d->trk);
+
+        prev_end = (s->pages[0] >> shift) + per;
+        for (p = 1; p < s->count; p++) {
+            uint64_t pfn = s->pages[p] >> shift, gap, q, tn = 0, rn = 0;
+            int b;
+            bool clean;
+
+            if (pfn <= prev_end) {
+                prev_end = MAX(prev_end, pfn + per);
+                continue;
+            }
+            gap = pfn - prev_end;
+            b = gap <= 16 ? 0 : gap <= 64 ? 1 : gap <= 256 ? 2 : gap <= 1024 ? 3 : 4;
+            if (gap <= 1024) {
+                for (q = prev_end; q < pfn; q++) {
+                    tn += t && q < t->n && qatomic_read(&t->c[q]) != 0;
+                    rn += q < d->wp_bits_n && test_bit(q, d->wp_bits);
+                }
+            }
+            gb[b]++;
+            gp[b] += gap;
+            gt[b] += tn;
+            gr[b] += rn;
+            clean = tn == 0 && rn == 0;
+            c16 += gap > 16;
+            c64 += gap > 64;
+            c256 += gap > 256;
+            u16 += !(clean && gap <= 16);
+            u64 += !(clean && gap <= 64);
+            u256 += !(clean && gap <= 256);
+            prev_end = pfn + per;
+        }
+    }
+    span = prev_end - (s->pages[0] >> shift);
+    fprintf(stderr, "reims-dirty-wp-layout pages=%" PRIu64 " runs=%u span=%" PRIu64 " streak=%u"
+            " gaps=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+            " gpages=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+            " gtrk=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+            " gro=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+            " calls=%" PRIu64 "/%" PRIu64 "/%" PRIu64 " ucalls=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "\n",
+            (uint64_t)s->count * per, s->nruns, span, s->wp_streak,
+            gb[0], gb[1], gb[2], gb[3], gb[4], gp[0], gp[1], gp[2], gp[3],
+            gt[0], gt[1], gt[2], gt[3], gr[0], gr[1], gr[2], gr[3], c16, c64, c256, u16, u64, u256);
+}
+
 static bool reims_vgpu_dirty_wp_pick_hot(ReimsVgpuDirty *d)
 {
     while (!d->wp_cur && d->wp_queue->len) {
@@ -2592,6 +2686,7 @@ static bool reims_vgpu_dirty_wp_pick_hot(ReimsVgpuDirty *d)
             reims_vgpu_dirty_wp_count(d, c, true);   /* TEMP lab DIRTY_WP_OVERLAP */
             d->wp_cur = token;
             g_array_append_val(d->wp_list, token);
+            reims_vgpu_dirty_wp_layout(d, c);   /* TEMP lab (b357) */
         }
     }
     return d->wp_cur != 0;
@@ -3264,6 +3359,7 @@ static void *reims_vgpu_dirty_wp_thread_fn(void *opaque)
             int64_t t0 = get_clock();
             bool more = reims_vgpu_dirty_wp_step(d);
             int64_t spent = get_clock() - t0;
+            int64_t duty = qatomic_read(&reims_vgpu_dirty_wp_thread_duty_live) ?: d->wp_thread_duty;
             int64_t rest_us;
 
             if (!more) {
@@ -3273,7 +3369,7 @@ static void *reims_vgpu_dirty_wp_thread_fn(void *opaque)
                 g_usleep(50);   /* give back first: pages a guest is writing fault one by one */
                 continue;
             }
-            rest_us = spent * (100 - d->wp_thread_duty) / d->wp_thread_duty / 1000;
+            rest_us = spent * (100 - duty) / duty / 1000;
             g_usleep(MAX(rest_us, MAX((int64_t)d->wp_delay_ms * 1000, 250)));
         }
     }
@@ -7031,6 +7127,14 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                         d->lab_wp_heal_skipped, d->lab_wp_hole_drops, d->wp_calm, d->lab_wp_young,
                         d->lab_wp_dead, d->lab_wp_yields, d->wp_merge, d->lab_wp_merge_spans,
                         d->lab_wp_merge_runs, d->lab_wp_merge_pages, d->lab_wp_merge_fault);
+                fprintf(stderr, "reims-dirty-wp-rm n1=%" PRIu64 " us1=%" PRIu64 " n16=%" PRIu64
+                        " us16=%" PRIu64 " n256=%" PRIu64 " us256=%" PRIu64 " nbig=%" PRIu64
+                        " usbig=%" PRIu64 "\n",   /* TEMP lab (b357) */
+                        d->lab_wp_rm_n[0], d->lab_wp_rm_ns[0] / 1000, d->lab_wp_rm_n[1],
+                        d->lab_wp_rm_ns[1] / 1000, d->lab_wp_rm_n[2], d->lab_wp_rm_ns[2] / 1000,
+                        d->lab_wp_rm_n[3], d->lab_wp_rm_ns[3] / 1000);
+                memset(d->lab_wp_rm_n, 0, sizeof(d->lab_wp_rm_n));
+                memset(d->lab_wp_rm_ns, 0, sizeof(d->lab_wp_rm_ns));
                 d->lab_wp_young = d->lab_wp_dead = d->lab_wp_yields = 0;
                 d->lab_wp_merge_spans = d->lab_wp_merge_runs = 0;   /* TEMP lab DIRTY_WP_MERGE */
                 d->lab_wp_merge_pages = d->lab_wp_merge_fault = 0;
@@ -7747,6 +7851,7 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
              */
             d->wp_overlap = !(getenv("REIMS_VGPU_LAB_DIRTY_WP_OVERLAP") &&
                               strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_OVERLAP"), "off") == 0);
+            d->wp_layout = getenv("REIMS_VGPU_LAB_DIRTY_WP_LAYOUT") != NULL;   /* TEMP lab (b357) */
             d->wp_calm = !(getenv("REIMS_VGPU_LAB_DIRTY_WP_CALM") &&
                            strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_CALM"), "off") == 0);
             /* 1 s plus 2 ms a run (its protect and give-back cost ~0.7 ms); the stress rows use 0. */
