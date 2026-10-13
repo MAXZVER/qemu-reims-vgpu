@@ -12,6 +12,7 @@
 #include "cpu.h"
 #include "qemu/typedefs.h"
 #include "system/address-spaces.h"
+#include "system/physmem.h"
 #include "system/ioport.h"
 #include "gdbstub/helpers.h"
 #include "qemu/accel.h"
@@ -620,9 +621,10 @@ void whpx_set_registers(CPUState *cpu, WHPXStateLevel level)
          */
         whpx_set_xcrs(cpu);
 
-        if (whpx_is_xsave_enabled(cpu) &&
-            whpx_xsave_valid[cpu->cpu_index]) {
-            whpx_set_xsave_state(cpu);
+        if (whpx_is_xsave_enabled(cpu)) {
+            if (whpx_xsave_valid[cpu->cpu_index]) {
+                whpx_set_xsave_state(cpu);
+            }
         } else {
             whpx_set_legacy_fp_registers(cpu, level);
         }
@@ -1144,6 +1146,7 @@ static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
     WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
     int ret;
 
+    /* Keep WHPX MMIO on the BQL-protected emulator path until the lockless fast path is proven safe for macOS. */
     if (whpx_mmio_fast_load(cpu, exit_ctx)) {
         return 0;
     }
@@ -1182,6 +1185,209 @@ static int whpx_handle_msr_from_gpf(CPUState *cpu)
     return 0;
 }
 
+static unsigned int whpx_diag_a2_total;
+
+typedef struct WhpxIdtWatch {
+    bool valid;
+    uint64_t va;
+    uint64_t cr3;
+    hwaddr pa;
+    uint8_t bytes[512];
+    unsigned reports;
+} WhpxIdtWatch;
+
+static WhpxIdtWatch whpx_idt_watch;
+
+static bool whpx_diag_translate_idt(uint64_t va, uint64_t cr3,
+                                    hwaddr *physical)
+{
+    const uint64_t mask = 0x000ffffffffff000ULL;
+    const unsigned shifts[] = {39, 30, 21, 12};
+    uint64_t table = cr3 & mask;
+
+    for (unsigned i = 0; i < 4; ++i) {
+        unsigned shift = shifts[i];
+        uint64_t index = (va >> shift) & 511;
+        uint64_t entry = 0;
+
+        physical_memory_read(
+            table + index * 8, &entry, sizeof(entry));
+
+        if (!(entry & 1)) {
+            return false;
+        }
+
+        if ((shift == 30 || shift == 21) &&
+            (entry & 0x80)) {
+            uint64_t size = 1ULL << shift;
+            *physical = (entry & mask & ~(size - 1)) |
+                        (va & (size - 1));
+            return true;
+        }
+
+        table = entry & mask;
+    }
+
+    *physical = table | (va & 0xfff);
+    return true;
+}
+
+static void whpx_diag_idt_check(CPUState *cpu,
+                                const char *stage,
+                                unsigned exit_reason)
+{
+    WHV_REGISTER_NAME names[2] = {
+        WHvX64RegisterIdtr,
+        WHvX64RegisterCr3
+    };
+    WHV_REGISTER_VALUE values[2] = {0};
+    uint8_t current[512];
+    uint64_t va, cr3;
+    hwaddr pa;
+    HRESULT hr;
+    WhpxIdtWatch *w = &whpx_idt_watch;
+
+    static unsigned int diagnostic_count;
+    static int watch_idt = -1;
+    bool probe;
+
+    if (cpu->cpu_index != 0) {
+        return;
+    }
+
+    if (G_UNLIKELY(watch_idt < 0)) {
+        watch_idt = g_getenv("WHPX_WATCH_IDT") != NULL;
+    }
+
+    probe = whpx_diag_a2_total != 0 &&
+            diagnostic_count < 6 && ++diagnostic_count <= 6;
+
+    if (probe) {
+        error_report(
+            "WHPX-IDT-PROBE entered stage=%s a2=%u enabled=%u",
+            stage, whpx_diag_a2_total,
+            (unsigned)watch_idt);
+    }
+
+    if (!watch_idt ||
+        whpx_diag_a2_total == 0) {
+        return;
+    }
+
+    hr = whp_dispatch.WHvGetVirtualProcessorRegisters(
+        whpx_global.partition, cpu->cpu_index,
+        names, 2, values);
+
+    if (probe) {
+        error_report(
+            "WHPX-IDT-PROBE registers hr=%08lx "
+            "idtr=%016llx limit=%u cr3=%016llx",
+            (unsigned long)hr,
+            (unsigned long long)values[0].Table.Base,
+            (unsigned)values[0].Table.Limit,
+            (unsigned long long)values[1].Reg64);
+    }
+
+    if (FAILED(hr)) {
+        return;
+    }
+
+    va = values[0].Table.Base;
+    cr3 = values[1].Reg64;
+
+    /*
+     * Watch the observed Sonoma kernel IDT layout.
+     * Avoid tracking earlier firmware IDT tables.
+     */
+    if ((va >> 48) != 0xffff ||
+        (va & 0xfffffULL) != 0x83000 ||
+        values[0].Table.Limit < 511) {
+        return;
+    }
+
+    if (!whpx_diag_translate_idt(va, cr3, &pa)) {
+        if (probe) {
+            error_report("WHPX-IDT-PROBE translation failed");
+        }
+        return;
+    }
+
+    if (probe) {
+        error_report(
+            "WHPX-IDT-PROBE translated pa=%016llx",
+            (unsigned long long)pa);
+    }
+
+    if ((pa & 0xfff) > (4096 - sizeof(current))) {
+        return;
+    }
+
+    physical_memory_read(pa, current, sizeof(current));
+
+    if (!w->valid ||
+        w->va != va ||
+        w->pa != pa ||
+        w->cr3 != cr3) {
+
+        error_report(
+            "WHPX-IDT-BASELINE stage=%s a2=%u "
+            "va=%016llx pa=%016llx cr3=%016llx",
+            stage, whpx_diag_a2_total,
+            (unsigned long long)va,
+            (unsigned long long)pa,
+            (unsigned long long)cr3);
+
+        w->va = va;
+        w->pa = pa;
+        w->cr3 = cr3;
+        memcpy(w->bytes, current, sizeof(current));
+        w->valid = true;
+        return;
+    }
+
+    if (memcmp(w->bytes, current, sizeof(current)) != 0) {
+        if (w->reports < 3) {
+            error_report(
+                "WHPX-IDT-CHANGE stage=%s a2=%u "
+                "rip=%016llx exit=%u pa=%016llx",
+                stage, whpx_diag_a2_total,
+                (unsigned long long)
+                    cpu->accel->exit_ctx.VpContext.Rip,
+                exit_reason,
+                (unsigned long long)pa);
+
+            for (unsigned i = 0; i < 32; ++i) {
+                unsigned off = i * 16;
+
+                if (memcmp(w->bytes + off,
+                           current + off, 16) != 0) {
+                    uint64_t old_lo, old_hi, new_lo, new_hi;
+
+                    memcpy(&old_lo, w->bytes + off, 8);
+                    memcpy(&old_hi, w->bytes + off + 8, 8);
+                    memcpy(&new_lo, current + off, 8);
+                    memcpy(&new_hi, current + off + 8, 8);
+
+                    error_report(
+                        "WHPX-IDT-VECTOR %u "
+                        "old=%016llx:%016llx "
+                        "new=%016llx:%016llx",
+                        i,
+                        (unsigned long long)old_hi,
+                        (unsigned long long)old_lo,
+                        (unsigned long long)new_hi,
+                        (unsigned long long)new_lo);
+                }
+            }
+        }
+        ++w->reports;
+        memcpy(w->bytes, current, sizeof(current));
+    }
+}
+
+static bool whpx_paused_pf_valid;
+static WHV_VP_EXCEPTION_CONTEXT whpx_paused_pf_ctx;
+
 static void whpx_inject_back_pf(CPUState *cpu)
 {
     WHV_VP_EXCEPTION_CONTEXT *ctx = &cpu->accel->exit_ctx.VpException;
@@ -1193,7 +1399,41 @@ static void whpx_inject_back_pf(CPUState *cpu)
     reg.ExceptionEvent.Vector = ctx->ExceptionType;
     reg.ExceptionEvent.ErrorCode = ctx->ErrorCode;
     reg.ExceptionEvent.ExceptionParameter = ctx->ExceptionParameter;
-    whpx_set_reg(cpu, WHvRegisterPendingEvent, reg);
+
+    {
+        static unsigned int probe_count;
+        WHV_REGISTER_NAME pending_name = WHvRegisterPendingEvent;
+        HRESULT set_hr;
+
+        set_hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
+            whpx_global.partition, cpu->cpu_index,
+            &pending_name, 1, &reg);
+
+        if (cpu->cpu_index == 0 && probe_count < 8 && ++probe_count <= 8) {
+            WHV_REGISTER_NAME rdi_name = WHvX64RegisterRdi;
+            WHV_REGISTER_VALUE rdi = {};
+            HRESULT get_hr = whp_dispatch.WHvGetVirtualProcessorRegisters(
+                whpx_global.partition, cpu->cpu_index,
+                &rdi_name, 1, &rdi);
+            error_report(
+                "WHPX-PF-PROBE n=%u "
+                "rdi=%016llx get_hr=%08lx "
+                "inject_hr=%08lx vector=%u address=%016llx",
+                probe_count,
+                (unsigned long long)rdi.Reg64,
+                (unsigned long)get_hr,
+                (unsigned long)set_hr,
+                (unsigned)ctx->ExceptionType,
+                (unsigned long long)ctx->ExceptionParameter);
+        }
+
+        if (FAILED(set_hr)) {
+            error_report(
+                "WHPX-PF-PROBE injection failed hr=%08lx",
+                (unsigned long)set_hr);
+        }
+    }
+
 }
 
 static void whpx_inject_back_gpf(CPUState *cpu)
@@ -1634,7 +1874,9 @@ static UINT64 whpx_get_default_exceptions(void)
      * and the VP dies with an UnrecoverableException. Intercepting and
      * re-injecting the fault as a pending event keeps the guest in control.
      */
-    intercepts |= 1UL << WHvX64ExceptionTypePageFault;
+    if (!g_getenv("WHPX_NATIVE_PF")) {
+        intercepts |= 1UL << WHvX64ExceptionTypePageFault;
+    }
 
     return intercepts;
 }
@@ -2131,7 +2373,17 @@ static void whpx_vcpu_pre_run(CPUState *cpu)
     UINT32 reg_count = 0;
     WHV_REGISTER_VALUE reg_values[3];
     WHV_REGISTER_NAME reg_names[3];
-    int irr = apic_get_highest_priority_irr(x86_cpu->apic_state);
+    int irr;
+
+    if (whpx_irqchip_in_kernel() &&
+        !(qatomic_read(&cpu->interrupt_request) &
+          (CPU_INTERRUPT_NMI | CPU_INTERRUPT_SMI | CPU_INTERRUPT_INIT |
+           CPU_INTERRUPT_TPR | CPU_INTERRUPT_HARD))) {
+        vcpu->ready_for_pic_interrupt = false;
+        return;
+    }
+
+    irr = apic_get_highest_priority_irr(x86_cpu->apic_state);
 
     memset(&new_int, 0, sizeof(new_int));
     memset(reg_values, 0, sizeof(reg_values));
@@ -2447,6 +2699,37 @@ int whpx_vcpu_run(CPUState *cpu)
 
         whpx_inject_exceptions(cpu);
 
+        if (cpu->cpu_index == 0 && whpx_paused_pf_valid) {
+            WHV_VP_EXCEPTION_CONTEXT previous_ctx =
+                vcpu->exit_ctx.VpException;
+            WHV_REGISTER_NAME pending_name = WHvRegisterPendingEvent;
+            WHV_REGISTER_VALUE pending_reg = {};
+            HRESULT pending_hr;
+
+            vcpu->exit_ctx.VpException = whpx_paused_pf_ctx;
+            whpx_inject_back_pf(cpu);
+
+            pending_hr = whp_dispatch.WHvGetVirtualProcessorRegisters(
+                whpx_global.partition, cpu->cpu_index,
+                &pending_name, 1, &pending_reg);
+
+            error_report(
+                "WHPX-PF-RESUME cpu=%d address=%016llx "
+                "hr=%08lx pending=%u vector=%u",
+                cpu->cpu_index,
+                (unsigned long long)
+                    whpx_paused_pf_ctx.ExceptionParameter,
+                (unsigned long)pending_hr,
+                SUCCEEDED(pending_hr)
+                    ? (unsigned)pending_reg.ExceptionEvent.EventPending : 0,
+                SUCCEEDED(pending_hr)
+                    ? (unsigned)pending_reg.ExceptionEvent.Vector : 0);
+
+            vcpu->exit_ctx.VpException = previous_ctx;
+            whpx_paused_pf_valid = false;
+        }
+        whpx_diag_idt_check(cpu, "pre", 0);
+
         hr = whp_dispatch.WHvRunVirtualProcessor(
             whpx->partition, cpu->cpu_index,
             &vcpu->exit_ctx, sizeof(vcpu->exit_ctx));
@@ -2465,6 +2748,10 @@ int whpx_vcpu_run(CPUState *cpu)
         }
 
         whpx_vcpu_post_run(cpu);
+
+        whpx_diag_idt_check(
+            cpu, "post",
+            (unsigned)vcpu->exit_ctx.ExitReason);
 
         switch (vcpu->exit_ctx.ExitReason) {
         case WHvRunVpExitReasonMemoryAccess:
@@ -2512,7 +2799,7 @@ int whpx_vcpu_run(CPUState *cpu)
             WHV_REGISTER_VALUE reg_values[3] = {0};
             WHV_REGISTER_NAME reg_names[3];
             UINT32 reg_count;
-            bool is_known_msr = 0; 
+            bool is_known_msr = 0;
             bool raises_gpf = false;
             uint64_t val;
 
@@ -2867,14 +3154,106 @@ int whpx_vcpu_run(CPUState *cpu)
             break;
         }
         case WHvRunVpExitReasonException:
+            if (cpu->cpu_index == 0) {
+                static unsigned int diag_events;
+                const WHV_VP_EXCEPTION_CONTEXT *ex =
+                    &vcpu->exit_ctx.VpException;
+
+                ++diag_events;
+
+                if (0 && (diag_events <= 32 || diag_events % 1024 == 0)) {
+                    error_report(
+                        "WHPX-DIAG exception n=%u cpu=%d type=%u "
+                        "rip=%016llx error=%08x address=%016llx",
+                        diag_events,
+                        cpu->cpu_index,
+                        (unsigned)ex->ExceptionType,
+                        (unsigned long long)vcpu->exit_ctx.VpContext.Rip,
+                        (unsigned)ex->ErrorCode,
+                        (unsigned long long)ex->ExceptionParameter);
+                }
+            }
             if (vcpu->exit_ctx.VpException.ExceptionType ==
                 WHvX64ExceptionTypePageFault) {
+
+                static unsigned int pf_stops = 0;
+                static unsigned int a2_seen = 0;
+                static int stop_first_pf = -1;
+
+                if (G_UNLIKELY(stop_first_pf < 0)) {
+                    stop_first_pf = g_getenv("WHPX_STOP_FIRST_PF") != NULL;
+                }
+
+                if (cpu->cpu_index == 0 &&
+                    vcpu->exit_ctx.VpException.ExceptionParameter == 0xa2) {
+                    ++a2_seen;
+                    ++whpx_diag_a2_total;
+                }
+                if (cpu->cpu_index == 0 &&
+                    stop_first_pf &&
+                    (pf_stops == 0 ||
+                     (pf_stops == 1 && a2_seen == 1) ||
+                     (pf_stops == 2 &&
+                      a2_seen == (g_getenv("WHPX_A2_STOP_AT")
+                        ? (unsigned int)g_ascii_strtoull(
+                            g_getenv("WHPX_A2_STOP_AT"), NULL, 10)
+                        : 8)) ||
+                     (pf_stops == 3 && a2_seen == 90))) {
+                    ++pf_stops;
+                    error_report(
+                        "WHPX-PF-SNAPSHOT phase=%u cpu=%d rip=%016llx "
+                        "address=%016llx",
+                        pf_stops,
+                        cpu->cpu_index,
+                        (unsigned long long)
+                            vcpu->exit_ctx.VpContext.Rip,
+                        (unsigned long long)
+                            vcpu->exit_ctx.VpException.ExceptionParameter);
+
+                    /*
+                     * Preserve this intercepted fault across QMP pause.
+                     * Reinject after register synchronization on resume.
+                     */
+                    whpx_paused_pf_ctx = vcpu->exit_ctx.VpException;
+                    whpx_paused_pf_valid = true;
+
+                    whpx_get_registers(cpu, WHPX_LEVEL_FULL_STATE);
+
+                    bql_lock();
+                    vm_stop(RUN_STATE_PAUSED);
+                    bql_unlock();
+
+                    cpu->exception_index = EXCP_INTERRUPT;
+                    ret = 1;
+                    break;
+                }
                 /*
                  * Deliver the #PF straight back to the guest as a pending
                  * exception (mirrors the GPF handling): routing it through
                  * EXCP_DEBUG loses the fault in the core when no debugger
                  * is attached.
                  */
+                {
+                    static unsigned int queue_probe_count;
+                    if (cpu->cpu_index == 0 && ++queue_probe_count <= 8) {
+                        WHV_REGISTER_NAME name = WHvRegisterPendingEvent;
+                        WHV_REGISTER_VALUE value = {};
+                        HRESULT probe_hr =
+                            whp_dispatch.WHvGetVirtualProcessorRegisters(
+                                whpx->partition, cpu->cpu_index,
+                                &name, 1, &value);
+
+                        error_report(
+                            "WHPX-QUEUE n=%u hr=%08lx pending=%u vector=%u",
+                            queue_probe_count,
+                            (unsigned long)probe_hr,
+                            SUCCEEDED(probe_hr)
+                                ? (unsigned)value.ExceptionEvent.EventPending : 0,
+                            SUCCEEDED(probe_hr)
+                                ? (unsigned)value.ExceptionEvent.Vector : 0);
+                    }
+                }
+
                 whpx_inject_back_pf(cpu);
                 ret = 0;
                 break;
@@ -2920,7 +3299,37 @@ int whpx_vcpu_run(CPUState *cpu)
         default:
             error_report("WHPX: Unexpected VP exit code %d",
                          vcpu->exit_ctx.ExitReason);
+
+            if (vcpu->exit_ctx.ExitReason ==
+                WHvRunVpExitReasonUnrecoverableException) {
+                error_report(
+                    "WHPX-A2-TOTAL cpu=%d faults=%u",
+                    cpu->cpu_index, whpx_diag_a2_total);
+                error_report(
+                    "WHPX-DIAG UNRECOVERABLE cpu=%d "
+                    "rip=%016llx rflags=%016llx",
+                    cpu->cpu_index,
+                    (unsigned long long)vcpu->exit_ctx.VpContext.Rip,
+                    (unsigned long long)vcpu->exit_ctx.VpContext.Rflags);
+            }
+
             whpx_get_registers(cpu, WHPX_LEVEL_FULL_STATE);
+
+            if (vcpu->exit_ctx.ExitReason ==
+                WHvRunVpExitReasonUnrecoverableException) {
+                CPUX86State *d = &X86_CPU(cpu)->env;
+
+                error_report(
+                    "WHPX-DIAG registers cpu=%d "
+                    "cr2=%016llx cr3=%016llx cr4=%016llx "
+                    "efer=%016llx",
+                    cpu->cpu_index,
+                    (unsigned long long)d->cr[2],
+                    (unsigned long long)d->cr[3],
+                    (unsigned long long)d->cr[4],
+                    (unsigned long long)d->efer);
+            }
+
             bql_lock();
             vm_stop(RUN_STATE_PAUSED);
             bql_unlock();

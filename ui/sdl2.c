@@ -255,6 +255,12 @@ static void sdl_grab_start(struct sdl2_console *scon)
     if (!con || !qemu_console_is_graphic(con)) {
         return;
     }
+
+    /* Absolute USB tablet input works without capturing the host mouse. */
+    if (!gui_fullscreen &&
+        (qemu_input_is_absolute(con) || absolute_enabled)) {
+        return;
+    }
     /*
      * If the application is not active, do not try to enter grab state. This
      * prevents 'SDL_WM_GrabInput(SDL_GRAB_ON)' from blocking all the

@@ -287,6 +287,7 @@ fail:
      * No POSIX mmap on Windows: packed aliasing views are unavailable, so every
      * scattered GVA mapping takes the product copying rails instead.
      */
+    failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_ALIAS;
     return -1;
 #else
     /*

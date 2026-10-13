@@ -662,7 +662,7 @@ static void whpx_accel_instance_init(Object *obj)
     whpx->hyperv_enlightenments_enabled = false;
     whpx->ignore_unknown_msr = true;
     whpx->intercept_msr_gp = false;
-    whpx->separate_security_domain = true;
+    whpx->separate_security_domain = false;
 }
 
 static const TypeInfo whpx_accel_type = {
