@@ -114,6 +114,12 @@ struct VirtIOSoundPCMBuffer {
     /* Used for the TX queue for lazy I/O copy from `elem` */
     bool populated;
     /*
+     * TEMP lab (QEMU_VSND_EARLY_PCT): the TX message's payload size, and whether `elem` already went back to the
+     * guest before its copy in `data` finished playing (then `elem` is NULL and only `data` is left).
+     */
+    size_t full;
+    bool returned;
+    /*
      * VirtIOSoundPCMBuffer is an unsized type because it ends with an array of
      * bytes. The size of `data` is determined from the I/O message's read-only
      * or write-only size when allocating VirtIOSoundPCMBuffer.

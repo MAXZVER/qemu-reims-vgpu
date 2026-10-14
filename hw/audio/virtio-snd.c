@@ -20,6 +20,7 @@
 #include "qemu/log.h"
 #include "qemu/error-report.h"
 #include "qemu/lockable.h"
+#include "qemu/timer.h"
 #include "system/runstate.h"
 #include "trace.h"
 #include "qapi/error.h"
@@ -36,6 +37,7 @@ static void virtio_snd_process_cmdq(VirtIOSound *s);
 static void virtio_snd_pcm_flush(VirtIOSoundPCMStream *stream);
 static void virtio_snd_pcm_in_cb(void *data, int available);
 static void virtio_snd_unrealize(DeviceState *dev);
+static void vsnd_lab_note_tx(size_t size);   /* TEMP lab (QEMU_VSND_EARLY_PCT) */
 
 static uint32_t supported_formats = BIT(VIRTIO_SND_PCM_FMT_S8)
                                   | BIT(VIRTIO_SND_PCM_FMT_U8)
@@ -905,8 +907,10 @@ static void virtio_snd_handle_tx_xfer(VirtIODevice *vdev, VirtQueue *vq)
             buffer->populated = false;
             buffer->vq = vq;
             buffer->size = size;
+            buffer->full = size;
             buffer->offset = 0;
             stream->latency_bytes += size;
+            vsnd_lab_note_tx(size);   /* TEMP lab (QEMU_VSND_EARLY_PCT) */
 
             QSIMPLEQ_INSERT_TAIL(&stream->queue, buffer, entry);
         }
@@ -1118,6 +1122,121 @@ error_cleanup:
     virtio_snd_unrealize(dev);
 }
 
+/*
+ * TEMP lab (QEMU_VSND_EARLY_PCT=N, 2026-10-14): macOS's AppleVirtIOSound keeps one TX period (85 ms) out and hands
+ * the next only after that one completes, so a device that completes a period when its last byte reaches the audio
+ * backend starves while the guest turns around (journal 2026-10-07-devices, b380-b384). Its bytes are copied into
+ * `data` before any of them play, so the element can go back to the guest early: once no more than N % of the
+ * period is left unplayed, the guest gets it back and its next period arrives while this one still plays from the
+ * copy. 0 (default) keeps the stock behaviour. The device's latency report counts the copy until it has played.
+ */
+static unsigned vsnd_lab_early_pct(void)
+{
+    static int pct = -1;
+
+    if (pct < 0) {
+        const char *e = getenv("QEMU_VSND_EARLY_PCT");
+        pct = e ? MIN(100, MAX(0, atoi(e))) : 0;
+        fprintf(stderr, "virtio-snd: early return at %d %% of a period left (QEMU_VSND_EARLY_PCT)\n", pct);
+    }
+    return pct;
+}
+
+/* TEMP lab: TX periods, early returns, starvations and the guest's turnaround, one line every 5 s. */
+static struct {
+    QemuMutex lock;
+    int64_t window_ns, last_return_ns;
+    uint64_t tx, tx_bytes, early, final, starved, turn_n, turn_ns, turn_max_ns;
+} vsnd_lab;
+
+static void vsnd_lab_report_locked(int64_t now)
+{
+    if (!vsnd_lab.window_ns) {
+        vsnd_lab.window_ns = now;
+        return;
+    }
+    if (now - vsnd_lab.window_ns < 5 * NANOSECONDS_PER_SECOND) {
+        return;
+    }
+    fprintf(stderr, "virtio-snd-lab win_ms=%" PRId64 " tx=%" PRIu64 " tx_kb=%" PRIu64 " early=%" PRIu64
+            " final=%" PRIu64 " starved=%" PRIu64 " turn_avg_us=%" PRIu64 " turn_max_us=%" PRIu64 "\n",
+            (now - vsnd_lab.window_ns) / SCALE_MS, vsnd_lab.tx, vsnd_lab.tx_bytes >> 10, vsnd_lab.early,
+            vsnd_lab.final, vsnd_lab.starved,
+            vsnd_lab.turn_n ? vsnd_lab.turn_ns / vsnd_lab.turn_n / SCALE_US : 0, vsnd_lab.turn_max_ns / SCALE_US);
+    vsnd_lab.window_ns = now;
+    vsnd_lab.tx = vsnd_lab.tx_bytes = vsnd_lab.early = vsnd_lab.final = vsnd_lab.starved = 0;
+    vsnd_lab.turn_n = vsnd_lab.turn_ns = vsnd_lab.turn_max_ns = 0;
+}
+
+static void vsnd_lab_lock(void)
+{
+    static gsize done;
+
+    if (g_once_init_enter(&done)) {
+        qemu_mutex_init(&vsnd_lab.lock);
+        g_once_init_leave(&done, 1);
+    }
+    qemu_mutex_lock(&vsnd_lab.lock);
+}
+
+static void vsnd_lab_note_tx(size_t size)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+    vsnd_lab_lock();
+    vsnd_lab.tx++;
+    vsnd_lab.tx_bytes += size;
+    if (vsnd_lab.last_return_ns) {
+        int64_t turn = now - vsnd_lab.last_return_ns;
+
+        vsnd_lab.turn_n++;
+        vsnd_lab.turn_ns += turn;
+        vsnd_lab.turn_max_ns = MAX(vsnd_lab.turn_max_ns, (uint64_t)turn);
+        vsnd_lab.last_return_ns = 0;
+    }
+    vsnd_lab_report_locked(now);
+    qemu_mutex_unlock(&vsnd_lab.lock);
+}
+
+static void vsnd_lab_note_return(bool early)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+    vsnd_lab_lock();
+    if (early) {
+        vsnd_lab.early++;
+    } else {
+        vsnd_lab.final++;
+    }
+    vsnd_lab.last_return_ns = now;
+    vsnd_lab_report_locked(now);
+    qemu_mutex_unlock(&vsnd_lab.lock);
+}
+
+static void vsnd_lab_note_starved(void)
+{
+    vsnd_lab_lock();
+    vsnd_lab.starved++;
+    qemu_mutex_unlock(&vsnd_lab.lock);
+}
+
+/*
+ * TEMP lab (QEMU_VSND_LATENCY=0): the latency each TX status reports. b440: returning a period early made the guest
+ * wait that much longer before its next one (turnaround ~30 -> ~50 ms), as if it paces by the queued bytes this field
+ * reports; 0 tells it nothing is queued. Unset: the bytes still to play (stock).
+ */
+static uint32_t vsnd_lab_latency(VirtIOSoundPCMStream *s)
+{
+    static int report = -1;
+
+    if (report < 0) {
+        const char *e = getenv("QEMU_VSND_LATENCY");
+        report = !(e && !strcmp(e, "0"));
+        fprintf(stderr, "virtio-snd: TX latency report %s (QEMU_VSND_LATENCY)\n", report ? "queued bytes" : "0");
+    }
+    return report ? s->latency_bytes : 0;
+}
+
 static inline void update_latency(VirtIOSoundPCMStream *s, size_t used)
 {
     s->latency_bytes = s->latency_bytes > used ?
@@ -1128,9 +1247,18 @@ static inline void return_tx_buffer(VirtIOSoundPCMStream *stream,
                                     VirtIOSoundPCMBuffer *buffer)
 {
     virtio_snd_pcm_status resp = { 0 };
+
+    if (buffer->returned) {
+        /* TEMP lab (QEMU_VSND_EARLY_PCT): the guest has had the element back; only the copy is left. */
+        update_latency(stream, buffer->size);
+        QSIMPLEQ_REMOVE(&stream->queue, buffer, VirtIOSoundPCMBuffer, entry);
+        virtio_snd_pcm_buffer_free(buffer);
+        return;
+    }
+    vsnd_lab_note_return(false);
     resp.status = cpu_to_le32(VIRTIO_SND_S_OK);
     update_latency(stream, buffer->size);
-    resp.latency_bytes = cpu_to_le32(stream->latency_bytes);
+    resp.latency_bytes = cpu_to_le32(vsnd_lab_latency(stream));
     iov_from_buf(buffer->elem->in_sg,
                  buffer->elem->in_num,
                  0,
@@ -1145,6 +1273,26 @@ static inline void return_tx_buffer(VirtIOSoundPCMStream *stream,
                     VirtIOSoundPCMBuffer,
                     entry);
     virtio_snd_pcm_buffer_free(buffer);
+}
+
+/*
+ * TEMP lab (QEMU_VSND_EARLY_PCT): give a populated TX element back to the guest while its copy in `data` still has
+ * `buffer->size` bytes to play; the buffer stays queued until they have.
+ */
+static inline void return_tx_buffer_early(VirtIOSoundPCMStream *stream,
+                                          VirtIOSoundPCMBuffer *buffer)
+{
+    virtio_snd_pcm_status resp = { 0 };
+
+    resp.status = cpu_to_le32(VIRTIO_SND_S_OK);
+    resp.latency_bytes = cpu_to_le32(vsnd_lab_latency(stream));
+    iov_from_buf(buffer->elem->in_sg, buffer->elem->in_num, 0, &resp, sizeof(virtio_snd_pcm_status));
+    virtqueue_push(buffer->vq, buffer->elem, sizeof(virtio_snd_pcm_status));
+    virtio_notify(VIRTIO_DEVICE(stream->s), buffer->vq);
+    g_free(buffer->elem);
+    buffer->elem = NULL;
+    buffer->returned = true;
+    vsnd_lab_note_return(true);
 }
 
 /*
@@ -1168,6 +1316,7 @@ static void virtio_snd_pcm_out_cb(void *data, int available)
                 fprintf(stderr, "virtio-snd: stream %u starved %" PRIu64 " (backend wants %d bytes)\n",
                         stream->id, n, available);
             }
+            vsnd_lab_note_starved();
         }
         while (!QSIMPLEQ_EMPTY(&stream->queue)) {
             buffer = QSIMPLEQ_FIRST(&stream->queue);
@@ -1187,6 +1336,10 @@ static void virtio_snd_pcm_out_cb(void *data, int available)
                            buffer->size);
                 buffer->populated = true;
             }
+            if (!buffer->returned &&
+                (uint64_t)buffer->size * 100 <= (uint64_t)buffer->full * vsnd_lab_early_pct()) {
+                return_tx_buffer_early(stream, buffer);   /* TEMP lab (QEMU_VSND_EARLY_PCT=100: at once) */
+            }
             for (;;) {
                 size = audio_be_write(stream->s->audio_be,
                                  stream->voice.out,
@@ -1205,6 +1358,10 @@ static void virtio_snd_pcm_out_cb(void *data, int available)
                 if (buffer->size < 1) {
                     return_tx_buffer(stream, buffer);
                     break;
+                }
+                if (!buffer->returned &&
+                    (uint64_t)buffer->size * 100 <= (uint64_t)buffer->full * vsnd_lab_early_pct()) {
+                    return_tx_buffer_early(stream, buffer);   /* TEMP lab (QEMU_VSND_EARLY_PCT) */
                 }
                 if (!available) {
                     break;
