@@ -8116,9 +8116,14 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
             d->wp_overlap = !(getenv("REIMS_VGPU_LAB_DIRTY_WP_OVERLAP") &&
                               strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_OVERLAP"), "off") == 0);
             d->wp_layout = getenv("REIMS_VGPU_LAB_DIRTY_WP_LAYOUT") != NULL;   /* TEMP lab (b357) */
-            /* TEMP lab DIRTY_WP_BRIDGE (b451, opt-in for its A/B): see `wp_bridge`. */
-            d->wp_bridge = d->wp_mode && d->wp_overlap && getenv("REIMS_VGPU_LAB_DIRTY_WP_BRIDGE") &&
-                           strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_BRIDGE"), "on") == 0;
+            /*
+             * TEMP lab DIRTY_WP_BRIDGE (see `wp_bridge`): on by default since b453 (Intel, ABAB, work USB config):
+             * canvas 5K 36.5/32.9 -> 47.1/40.8 fps (+27 %), Maps 31.9/28.5 -> 32.2/32.9 (+8 %), 0 artifacts,
+             * 0 panics; dirty-stress bridge rows 0 violations. `=off` restores the previous WP admission.
+             */
+            d->wp_bridge = d->wp_mode && d->wp_overlap &&
+                           !(getenv("REIMS_VGPU_LAB_DIRTY_WP_BRIDGE") &&
+                             strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_BRIDGE"), "off") == 0);
             d->wp_fast_streak = getenv("REIMS_VGPU_LAB_DIRTY_WP_FAST_STREAK") ?
                                 MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_FAST_STREAK"))) : 16;
             if (d->wp_bridge) {
