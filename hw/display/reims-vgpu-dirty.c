@@ -855,6 +855,19 @@ struct ReimsVgpuDirty {
      * waits, and a fault itself gives back at most REIMS_WP_FAIR_FAULT_SPANS spans.
      */
     unsigned wp_fair;   /* bits: 1 give-back stops, 2 step yields, 4 fault budget, 8 protect yields */
+    /*
+     * TEMP lab DIRTY_WP_ORPHAN_CALM (=on, A/B): orphans (read-only runs of sets the guest freed) are not given back
+     * while sets keep being freed (a UI transition) - at most `wp_orphan_hold_ms` - and protects wait with them; a
+     * guest store into one still faults it back. b454 F0: at Safari's full-screen exit the WP thread remapped
+     * 2000-2400 runs (50-106k pages, ~950 ms) a second, outside any duty, in exactly the seconds every guest exit
+     * cost 250-300 us and the audio stopped. b447's 3 ms rest between give-back steps never lowered that rate.
+     */
+    bool wp_orphan_calm;
+    int64_t wp_orphaned_ns, wp_orphan_hold_since;
+    uint32_t wp_orphan_quiet_ms, wp_orphan_hold_ms;
+    /* TEMP lab (b454): remaps by cause - protect, fault, orphan give-back, dropping give-back, other - per second. */
+    uint64_t lab_wp_cause_n[5], lab_wp_cause_pages[5], lab_wp_held;
+    int64_t lab_wp_cause_last;
     uint64_t lab_wp_fwait_ns, lab_wp_fwait_max_ns, lab_wp_fhold_ns, lab_wp_fhold_max_ns, lab_wp_fslow;
     uint64_t lab_wp_protects, lab_wp_faults, lab_wp_refused, lab_wp_chunks, lab_wp_remaps;
     /*
@@ -2168,6 +2181,10 @@ static void reims_vgpu_dirty_wp_count(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s, b
 }
 
 /* One remap of [gpa, gpa+size), with `wp_bits` kept equal to what is read-only. `wp_mutex` held. */
+/* TEMP lab (b454): what the next remaps on this thread are for (lab_wp_cause_n). */
+enum { WP_CAUSE_PROTECT, WP_CAUSE_FAULT, WP_CAUSE_ORPHAN, WP_CAUSE_DROP, WP_CAUSE_OTHER };
+static __thread int reims_wp_cause = WP_CAUSE_OTHER;
+
 static int reims_vgpu_dirty_wp_remap(ReimsVgpuDirty *d, uint64_t gpa, uint64_t size, bool writable)
 {
     const uint64_t step = 1ULL << qemu_target_page_bits();
@@ -2195,6 +2212,24 @@ static int reims_vgpu_dirty_wp_remap(ReimsVgpuDirty *d, uint64_t gpa, uint64_t s
         d->lab_wp_remap_ns += ns;
         d->lab_wp_rm_n[b]++;   /* TEMP lab (b357) */
         d->lab_wp_rm_ns[b] += ns;
+        d->lab_wp_cause_n[reims_wp_cause]++;   /* TEMP lab (b454) */
+        d->lab_wp_cause_pages[reims_wp_cause] += np;
+        if (t0 - d->lab_wp_cause_last >= NANOSECONDS_PER_SECOND) {
+            if (d->lab_wp_cause_last) {
+                fprintf(stderr, "reims-dirty-wp-cause epoch_ms=%" PRId64 " protect=%" PRIu64 "/%" PRIu64
+                        " fault=%" PRIu64 "/%" PRIu64 " orphan=%" PRIu64 "/%" PRIu64 " drop=%" PRIu64 "/%" PRIu64
+                        " other=%" PRIu64 "/%" PRIu64 " held=%" PRIu64 " orphans_left=%u\n",
+                        g_get_real_time() / 1000,
+                        d->lab_wp_cause_n[0], d->lab_wp_cause_pages[0], d->lab_wp_cause_n[1], d->lab_wp_cause_pages[1],
+                        d->lab_wp_cause_n[2], d->lab_wp_cause_pages[2], d->lab_wp_cause_n[3], d->lab_wp_cause_pages[3],
+                        d->lab_wp_cause_n[4], d->lab_wp_cause_pages[4], d->lab_wp_held,
+                        d->wp_orphans ? d->wp_orphans->len : 0);
+            }
+            memset(d->lab_wp_cause_n, 0, sizeof(d->lab_wp_cause_n));
+            memset(d->lab_wp_cause_pages, 0, sizeof(d->lab_wp_cause_pages));
+            d->lab_wp_held = 0;
+            d->lab_wp_cause_last = t0;
+        }
     }
     d->lab_wp_remaps++;
     return rc;
@@ -2333,6 +2368,7 @@ static void reims_vgpu_dirty_wp_orphan(ReimsVgpuDirty *d, const ReimsVgpuDirtySe
             ReimsVgpuDirtyRun r = { .gpa = s->pages[p], .size = end - s->pages[p] };
 
             g_array_append_val(d->wp_orphans, r);
+            qatomic_set(&d->wp_orphaned_ns, get_clock());   /* TEMP lab DIRTY_WP_ORPHAN_CALM */
         }
         p = q;
     }
@@ -2460,6 +2496,7 @@ static bool reims_vgpu_dirty_wp_fault(uint64_t gpa)
         return false;
     }
     t_wait = get_clock();
+    reims_wp_cause = WP_CAUSE_FAULT;   /* TEMP lab (b454) */
     qatomic_inc(&d->wp_waiters);
     qemu_mutex_lock(&d->wp_mutex);
     qatomic_dec(&d->wp_waiters);
@@ -2556,7 +2593,26 @@ static bool reims_vgpu_dirty_wp_fault(uint64_t gpa)
                 if (d->wp_calm) {
                     reims_vgpu_dirty_wp_bury(d);   /* a set untracked since the last step */
                 }
-                reims_vgpu_dirty_wp_release_orphans(d, &budget);
+                if (d->wp_orphan_calm) {
+                    /*
+                     * TEMP lab DIRTY_WP_ORPHAN_CALM: the orphan run holding the page, not the first runs of the
+                     * list - with the orphans held, a guest filling a freed surface again would otherwise fault
+                     * page by page.
+                     */
+                    guint k;
+
+                    for (k = 0; k < d->wp_orphans->len; k++) {
+                        ReimsVgpuDirtyRun r = g_array_index(d->wp_orphans, ReimsVgpuDirtyRun, k);
+
+                        if (gpa >= r.gpa && gpa < r.gpa + r.size) {
+                            g_array_remove_index_fast(d->wp_orphans, k);
+                            reims_vgpu_dirty_wp_release_merged(d, &r, 1, &budget);
+                            break;
+                        }
+                    }
+                } else {
+                    reims_vgpu_dirty_wp_release_orphans(d, &budget);
+                }
             }
         }
         if (reims_vgpu_dirty_wp_ro(d, gpa)) {
@@ -3150,6 +3206,7 @@ static int64_t reims_vgpu_dirty_wp_protect_chunk(ReimsVgpuDirty *d, uint64_t tok
 
     n = reims_vgpu_dirty_ram_slices_into(&d->wp_slices, &d->wp_slices_cap);
     t0 = get_clock();
+    reims_wp_cause = WP_CAUSE_PROTECT;   /* TEMP lab (b454) */
     if (d->wp_nopause) {
 #ifndef REIMS_DIRTY_STRESS
         /* Nothing here needs the BQL; a vCPU's MMIO exit would wait through the remaps for it. */
@@ -3376,7 +3433,7 @@ static int64_t reims_vgpu_dirty_wp_protect_chunk(ReimsVgpuDirty *d, uint64_t tok
 static bool reims_vgpu_dirty_wp_step(ReimsVgpuDirty *d)
 {
     int budget = d->wp_chunk;
-    bool more = false;
+    bool more = false, held;
     guint i;
 
     d->wp_delay_ms = 0;
@@ -3405,13 +3462,30 @@ static bool reims_vgpu_dirty_wp_step(ReimsVgpuDirty *d)
         reims_vgpu_dirty_wp_bury(d);   /* lab DIRTY_WP_CALM */
     }
     reims_wp_in_step = true;   /* TEMP lab DIRTY_WP_FAIR */
-    if (reims_vgpu_dirty_wp_merge_on(d)) {
+    reims_wp_cause = WP_CAUSE_ORPHAN;   /* TEMP lab (b454) */
+    held = false;
+    if (d->wp_orphan_calm && d->wp_orphans->len) {
+        /* TEMP lab DIRTY_WP_ORPHAN_CALM: not while sets are still being freed, up to the hold limit. */
+        int64_t now = get_clock();
+
+        if (!d->wp_orphan_hold_since) {
+            d->wp_orphan_hold_since = now;
+        }
+        held = now - qatomic_read(&d->wp_orphaned_ns) < (int64_t)d->wp_orphan_quiet_ms * SCALE_MS &&
+               now - d->wp_orphan_hold_since < (int64_t)d->wp_orphan_hold_ms * SCALE_MS;
+        if (held) {
+            d->lab_wp_held++;
+        } else {
+            d->wp_orphan_hold_since = 0;
+        }
+    }
+    if (reims_vgpu_dirty_wp_merge_on(d) && !held) {
         reims_vgpu_dirty_wp_release_orphans(d, &budget);   /* TEMP lab DIRTY_WP_MERGE */
         if (d->wp_fair & 2) {
             reims_vgpu_dirty_wp_yield(d);   /* the give-back stopped early for a waiting fault */
         }
     }
-    while (budget > 0 && d->wp_orphans->len) {
+    while (!held && budget > 0 && d->wp_orphans->len) {
         ReimsVgpuDirtyRun r = g_array_index(d->wp_orphans, ReimsVgpuDirtyRun, d->wp_orphans->len - 1);
 
         g_array_set_size(d->wp_orphans, d->wp_orphans->len - 1);
@@ -3420,6 +3494,7 @@ static bool reims_vgpu_dirty_wp_step(ReimsVgpuDirty *d)
             reims_vgpu_dirty_wp_yield(d);   /* a fault waits for one run, not 32 */
         }
     }
+    reims_wp_cause = WP_CAUSE_DROP;   /* TEMP lab (b454) */
     for (i = 0; i < d->wp_list->len && budget > 0;) {
         uint64_t token = g_array_index(d->wp_list, uint64_t, i);
         ReimsVgpuDirtySet *s;
@@ -3505,8 +3580,12 @@ static bool reims_vgpu_dirty_wp_step(ReimsVgpuDirty *d)
         more = s && s->wp_state == WP_DROPPING;
         qemu_mutex_unlock(&d->lock);
     }
+    d->wp_giving_back = more || (d->wp_orphans->len && !held);
+    if (held && !more) {
+        /* TEMP lab DIRTY_WP_ORPHAN_CALM: come back when the freeing may have stopped; no protect meanwhile. */
+        d->wp_delay_ms = d->wp_orphan_quiet_ms;
+    }
     more = more || d->wp_orphans->len;
-    d->wp_giving_back = more;
     /*
      * The duty gate is checked here and not only in the pacing timer: the step
      * is also scheduled straight away by faults, untracks and a set reaching its
@@ -3561,6 +3640,7 @@ static bool reims_vgpu_dirty_wp_step(ReimsVgpuDirty *d)
         qemu_mutex_unlock(&d->lock);
     }
     reims_wp_in_step = false;
+    reims_wp_cause = WP_CAUSE_OTHER;
     qemu_mutex_unlock(&d->wp_mutex);
     return more;
 }
@@ -8196,6 +8276,16 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                            strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_FAIR"), "off") == 0) ? 15 : 0;
             if (getenv("REIMS_VGPU_LAB_DIRTY_WP_FAIR_MASK")) {   /* TEMP lab: which parts (stress bisect) */
                 d->wp_fair &= atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_FAIR_MASK"));
+            }
+            d->wp_orphan_calm = getenv("REIMS_VGPU_LAB_DIRTY_WP_ORPHAN_CALM") &&   /* TEMP lab */
+                                strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_ORPHAN_CALM"), "on") == 0;
+            d->wp_orphan_quiet_ms = getenv("REIMS_VGPU_LAB_DIRTY_WP_ORPHAN_QUIET_MS") ?
+                                    MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_ORPHAN_QUIET_MS"))) : 300;
+            d->wp_orphan_hold_ms = getenv("REIMS_VGPU_LAB_DIRTY_WP_ORPHAN_HOLD_MS") ?
+                                   MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_ORPHAN_HOLD_MS"))) : 3000;
+            if (d->wp_orphan_calm) {
+                fprintf(stderr, "reims-dirty-wp orphan calm on: quiet %u ms, hold <= %u ms\n",
+                        d->wp_orphan_quiet_ms, d->wp_orphan_hold_ms);
             }
             /* 1 s plus 2 ms a run (its protect and give-back cost ~0.7 ms); the stress rows use 0. */
             d->wp_age_ms = 1000;
