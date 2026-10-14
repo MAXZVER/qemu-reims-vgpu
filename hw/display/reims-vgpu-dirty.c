@@ -2337,7 +2337,9 @@ static int64_t reims_vgpu_dirty_wp_age_need(const ReimsVgpuDirty *d, const Reims
         return (int64_t)live * SCALE_MS;
     }
     if (d->wp_bridge && s->gen <= 1 && !s->wp_lost) {
-        return 250 * SCALE_MS;   /* TEMP lab DIRTY_WP_BRIDGE: never written yet */
+        /* TEMP lab DIRTY_WP_BRIDGE: never written yet - at most 250 ms. */
+        return MIN(250 * SCALE_MS,
+                   (int64_t)d->wp_age_ms * SCALE_MS + (int64_t)d->wp_age_run_us * s->nruns * SCALE_US);
     }
     return (int64_t)d->wp_age_ms * SCALE_MS + (int64_t)d->wp_age_run_us * s->nruns * SCALE_US;
 }
