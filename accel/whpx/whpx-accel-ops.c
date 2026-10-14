@@ -34,6 +34,23 @@ static void *whpx_cpu_thread_fn(void *arg)
     current_cpu = cpu;
 
     whpx_lab_pin_pcores("vcpu");
+    {
+        /*
+         * TEMP lab QEMU_LAB_VCPU_PRIO=<Windows thread priority, -2..2, 15>: the vCPU threads above the device's
+         * threads. b449: at a UI transition a guest TLB shootdown waits 8-32 ms for a vCPU to answer its IPI - a
+         * halted vCPU's host thread woken but not running while the drain, recorder, lane and helper threads
+         * (normal priority, spinning between jobs) hold the cores.
+         */
+        const char *e = getenv("QEMU_LAB_VCPU_PRIO");
+
+        if (e && *e) {
+            int p = atoi(e);
+
+            if (SetThreadPriority(GetCurrentThread(), p) && cpu->cpu_index == 0) {
+                fprintf(stderr, "whpx: vCPU thread priority %d (QEMU_LAB_VCPU_PRIO)\n", p);
+            }
+        }
+    }
     r = whpx_init_vcpu(cpu);
     if (r < 0) {
         fprintf(stderr, "whpx_init_vcpu failed: %s\n", strerror(-r));

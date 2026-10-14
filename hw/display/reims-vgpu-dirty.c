@@ -836,8 +836,8 @@ struct ReimsVgpuDirty {
      * per pfn, the hashed and the logged (query-synced) sets that hold the page (under `lock`, read racily by the
      * step: a logged set that comes in between is covered by the marks of the bridged pages). `wp_bridged` keeps the
      * gap runs made read-only for an invalidate; an untrack orphans the read-only runs of an unlisted set.
-     * The switch also queues a set its syncs never found written (gen 1) after `wp_fast_streak` clean syncs and
-     * 250 ms of life, and protects such never-written sets from 16 pages: hashed ones (not 64) and queried ones (not
+     * The switch also queues a set its syncs never found written (gen 1) after `wp_fast_streak` clean syncs (the
+     * age gate unchanged), and protects such never-written sets from 16 pages: hashed ones (not 64) and queried ones (not
      * `wp_min_pages`, 2048 - the canvas surfaces turned out to be queried sets of a few runs, never protected).
      */
     bool wp_bridge;
@@ -2337,11 +2337,11 @@ static int64_t reims_vgpu_dirty_wp_age_need(const ReimsVgpuDirty *d, const Reims
     if (live) {
         return (int64_t)live * SCALE_MS;
     }
-    if (d->wp_bridge && s->gen <= 1 && !s->wp_lost) {
-        /* TEMP lab DIRTY_WP_BRIDGE: never written yet - at most 250 ms. */
-        return MIN(250 * SCALE_MS,
-                   (int64_t)d->wp_age_ms * SCALE_MS + (int64_t)d->wp_age_run_us * s->nruns * SCALE_US);
-    }
+    /*
+     * DIRTY_WP_BRIDGE keeps this age, per-run part included: b451 capped it at 250 ms for never-written sets, and
+     * the WP thread then took Maps' scattered 5K surfaces (~2300 runs) at once - 600-900 remaps a second at its
+     * full duty, 0-1 protects, Maps 41.8 -> 32.6 fps.
+     */
     return (int64_t)d->wp_age_ms * SCALE_MS + (int64_t)d->wp_age_run_us * s->nruns * SCALE_US;
 }
 
