@@ -39,6 +39,8 @@ static void virtio_snd_pcm_in_cb(void *data, int available);
 static void virtio_snd_unrealize(DeviceState *dev);
 static void vsnd_lab_note_tx(size_t size);   /* TEMP lab (QEMU_VSND_EARLY_PCT) */
 static void vsnd_lab_jitter_admit(VirtIOSoundPCMStream *stream);   /* TEMP lab (QEMU_VSND_JITTER_MS) */
+static unsigned vsnd_lab_jitter_ms(void);
+static size_t vsnd_lab_ms_bytes(VirtIOSoundPCMStream *stream, unsigned ms);
 
 static uint32_t supported_formats = BIT(VIRTIO_SND_PCM_FMT_S8)
                                   | BIT(VIRTIO_SND_PCM_FMT_U8)
@@ -1237,6 +1239,27 @@ static uint32_t vsnd_lab_latency(VirtIOSoundPCMStream *s)
         report = !(e && !strcmp(e, "0"));
         fprintf(stderr, "virtio-snd: TX latency report %s (QEMU_VSND_LATENCY)\n", report ? "queued bytes" : "0");
     }
+    if (report && vsnd_lab_jitter_ms() && s->info.direction == VIRTIO_SND_D_OUTPUT) {
+        /*
+         * TEMP lab (QEMU_VSND_JITTER_HIDE=1): the cushion is the device's, not the guest's to spend. b455: macOS
+         * paces its next period by the latency each status reports, so a truthful report of the jitter buffer made
+         * it send that much later and the cushion drained (starved 73-91 per 5 s against 237-264 stock). Hidden,
+         * it sends as if the queue were short and the held-back period (no room: not returned) is the brake.
+         */
+        static int hide = -1;
+
+        if (hide < 0) {
+            const char *e = getenv("QEMU_VSND_JITTER_HIDE");
+            hide = e && !strcmp(e, "1");
+            fprintf(stderr, "virtio-snd: jitter cushion %s the latency report (QEMU_VSND_JITTER_HIDE)\n",
+                    hide ? "hidden from" : "counted in");
+        }
+        if (hide) {
+            size_t c = vsnd_lab_ms_bytes(s, vsnd_lab_jitter_ms());
+
+            return s->latency_bytes > c ? s->latency_bytes - c : 0;
+        }
+    }
     return report ? s->latency_bytes : 0;
 }
 
@@ -1396,9 +1419,24 @@ static void virtio_snd_pcm_out_cb(void *data, int available)
             stream->lab_primed = false;   /* TEMP lab (QEMU_VSND_JITTER_MS): build the cushion again */
         }
         if (vsnd_lab_jitter_ms() && stream->active && !stream->lab_primed) {
-            /* TEMP lab (QEMU_VSND_JITTER_MS): nothing plays until the cushion is buffered. */
+            /*
+             * TEMP lab (QEMU_VSND_JITTER_MS): nothing plays until the cushion is buffered - and the backend gets
+             * silence meanwhile, as from a real card: given nothing, its rate control counts the time as owed and
+             * takes the next bytes as one catch-up burst, which drained the cushion at once (b455: 16 starvations a
+             * second with a 120 ms cushion and the guest exactly on time).
+             */
+            static const uint8_t zeros[4096];
+
             vsnd_lab_jitter_admit(stream);
             if (stream->latency_bytes < vsnd_lab_ms_bytes(stream, vsnd_lab_jitter_ms())) {
+                while (available > 0) {
+                    size_t z = audio_be_write(stream->s->audio_be, stream->voice.out, (void *)zeros,
+                                              MIN((size_t)available, sizeof(zeros)));
+                    if (!z) {
+                        break;
+                    }
+                    available -= z;
+                }
                 return;
             }
             stream->lab_primed = true;
