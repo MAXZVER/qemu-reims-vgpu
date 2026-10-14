@@ -3360,6 +3360,33 @@ static void xhci_db_bh(void *opaque)
     }
 }
 
+/*
+ * TEMP lab (QEMU_XHCI_LAB_DBGAP=1, 2026-10-14): guest audio drops 30-190 ms under a 5K canvas with no BQL hold,
+ * BH or timer >= 8 ms in QEMU (b445). Who went quiet - the guest's iso doorbells, or QEMU after them? Logs a doorbell
+ * that comes more than 25 ms after the previous one on an endpoint already rung 500 times (a stream).
+ */
+static void xhci_lab_note_doorbell(XHCIState *xhci, unsigned int slot, unsigned int epid)
+{
+    static int on = -1;
+    int64_t now, last, gap;
+
+    if (on < 0) {
+        const char *e = getenv("QEMU_XHCI_LAB_DBGAP");
+        on = e && !strcmp(e, "1");
+    }
+    if (!on || slot < 1 || slot > XHCI_MAXSLOTS || epid > 31) {
+        return;
+    }
+    now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    last = qatomic_xchg(&xhci->lab_db_last[slot][epid], now);
+    gap = last ? now - last : 0;
+    if (qatomic_fetch_inc(&xhci->lab_db_n[slot][epid]) >= 500 && gap > 25 * SCALE_MS) {
+        fprintf(stderr, "xhci-lab dbgap %s slot %u ep %u gap %" PRId64 " ms at %" PRId64 "\n",
+                object_get_canonical_path_component(OBJECT(xhci->hostOpaque)) ?: "?", slot, epid,
+                gap / SCALE_MS, (int64_t)(g_get_real_time() / 1000));
+    }
+}
+
 static void xhci_doorbell_write(void *ptr, hwaddr reg,
                                 uint64_t val, unsigned size)
 {
@@ -3367,6 +3394,9 @@ static void xhci_doorbell_write(void *ptr, hwaddr reg,
     unsigned int epid, streamid;
 
     trace_usb_xhci_doorbell_write(reg, val);
+    if (reg) {
+        xhci_lab_note_doorbell(xhci, reg >> 2, val & 0xff);
+    }
     if (xhci->lab_nobql && !bql_locked()) {
         unsigned int slot = reg >> 2;
 

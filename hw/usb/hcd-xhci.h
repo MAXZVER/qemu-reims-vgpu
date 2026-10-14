@@ -242,6 +242,10 @@ typedef struct XHCIState {
     QEMUBH *db_bh;
     uint32_t db_pending[XHCI_MAXSLOTS + 1];   /* by slot id: bit n = endpoint id n */
     int db_cmd;
+
+    /* TEMP lab (QEMU_XHCI_LAB_DBGAP=1): when the guest last rang each slot/endpoint, and how often. */
+    int64_t lab_db_last[XHCI_MAXSLOTS + 1][32];
+    uint32_t lab_db_n[XHCI_MAXSLOTS + 1][32];
 } XHCIState;
 
 extern const VMStateDescription vmstate_xhci;

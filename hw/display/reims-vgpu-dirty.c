@@ -3366,7 +3366,19 @@ static void *reims_vgpu_dirty_wp_thread_fn(void *opaque)
                 break;
             }
             if (d->wp_giving_back) {
-                g_usleep(50);   /* give back first: pages a guest is writing fault one by one */
+                /*
+                 * Give back first: pages a guest is writing fault one by one. TEMP lab
+                 * (REIMS_VGPU_LAB_DIRTY_WP_GIVEBACK_US, default 50, 2026-10-14): the rest between give-back
+                 * steps. b446: the guest's audio doorbells paused 50-190 ms exactly while ~2.5k orphan
+                 * remaps went back to back (1.2 s) when Safari left full screen - is it the remap burst?
+                 */
+                static int64_t giveback_us = -1;
+
+                if (giveback_us < 0) {
+                    const char *e = getenv("REIMS_VGPU_LAB_DIRTY_WP_GIVEBACK_US");
+                    giveback_us = e ? MAX(0, atoi(e)) : 50;
+                }
+                g_usleep(giveback_us);
                 continue;
             }
             rest_us = spent * (100 - duty) / duty / 1000;
