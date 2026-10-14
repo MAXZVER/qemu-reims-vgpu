@@ -1328,7 +1328,7 @@ static inline void return_tx_buffer_early(VirtIOSoundPCMStream *stream,
  * (a UI transition stalls them 30-150 ms) is a gap. Here a TX period is copied and given back as it arrives, while
  * at most C ms plus one period sit copied but unplayed (more waits in the queue, un-returned, until there is room);
  * playback starts only once C ms are buffered, and again after an underrun. The latency report stays truthful: the
- * copied bytes still to play. 0 / unset: stock.
+ * copied bytes still to play. QEMU_VSND_JITTER_MS=0: stock (default 120 ms, b459).
  */
 static unsigned vsnd_lab_jitter_ms(void)
 {
@@ -1336,7 +1336,11 @@ static unsigned vsnd_lab_jitter_ms(void)
 
     if (ms < 0) {
         const char *e = getenv("QEMU_VSND_JITTER_MS");
-        ms = e ? MIN(1000, MAX(0, atoi(e))) : 0;
+        /*
+         * 120 ms by default since b459 (SDL backend into a real-time sink, canvas 5K + full-screen exit): usb-audio
+         * 5 gaps of 32-626 ms; virtio-sound with this cushion 0 gaps and 0 starvations after the start. 0: stock.
+         */
+        ms = e ? MIN(1000, MAX(0, atoi(e))) : 120;
         fprintf(stderr, "virtio-snd: jitter buffer %d ms (QEMU_VSND_JITTER_MS)\n", ms);
     }
     return ms;
