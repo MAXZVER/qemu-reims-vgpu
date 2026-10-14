@@ -837,7 +837,8 @@ struct ReimsVgpuDirty {
      * step: a logged set that comes in between is covered by the marks of the bridged pages). `wp_bridged` keeps the
      * gap runs made read-only for an invalidate; an untrack orphans the read-only runs of an unlisted set.
      * The switch also queues a set its syncs never found written (gen 1) after `wp_fast_streak` clean syncs and
-     * 250 ms of life, and protects hashed sets from 16 pages (not 64).
+     * 250 ms of life, and protects such never-written sets from 16 pages: hashed ones (not 64) and queried ones (not
+     * `wp_min_pages`, 2048 - the canvas surfaces turned out to be queried sets of a few runs, never protected).
      */
     bool wp_bridge;
     uint32_t wp_fast_streak;
@@ -5190,7 +5191,14 @@ static bool reims_vgpu_dirty_eval_set(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
     qatomic_set(&s->eval_seq, s->eval_seq + 1);   /* even again */
     s->seen_seq = d->global_seq;
     if (d->wp_mode && d->wp_active && !by_harvest && s->wp_state == WP_NONE && s->gen != 0 &&
-        s->count * (s->page_size >> shift) >= d->wp_min_pages) {   /* lab DIRTY_WP */
+        (s->count * (s->page_size >> shift) >= d->wp_min_pages ||
+         /*
+          * TEMP lab DIRTY_WP_BRIDGE: a queried set below the minimum too, from 16 pages, while no sync has found it
+          * written. b450 canvas 5K: the costly 256/57-page surfaces were queried sets (few runs, so the cost model
+          * did not hash them) and never reached the 2048-page minimum - 0 clean-streak, never protected.
+          */
+         (d->wp_bridge && s->gen <= 1 && !s->wp_lost && s->count * (s->page_size >> shift) >= 16))) {
+        /* lab DIRTY_WP */
         uint32_t need = (uint32_t)(qatomic_read(&reims_vgpu_dirty_wp_streak_live) ?: d->wp_streak_need)
                         << MIN(s->wp_lost, 6);   /* TEMP lab live DIRTY_WP_STREAK */
 
