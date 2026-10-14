@@ -825,6 +825,27 @@ struct ReimsVgpuDirty {
      */
     uint16_t *wp_refs;
     bool wp_overlap;
+    /*
+     * TEMP lab REIMS_VGPU_LAB_DIRTY_WP_BRIDGE=on (b451): a protect remaps a set's runs together with the gaps between
+     * them when every gap page is already read-only or held only by hashed sets. b439/b450 canvas 5K: the clean
+     * surfaces (256 and 57 pages, live the whole run) sit in runs of ~4 pages interleaved with each other; a remap
+     * costs ~0.4 ms a call whatever its size, so a protect took ~60 remaps and the thread at its 30 % duty protected
+     * ~10 sets a second while ~3000 foreground hashes a second (15-28 % of the drain) went to sets never written.
+     * A hashed set's generation moves only on its own hashes, so a remap that drops a page's dirty bits loses it
+     * nothing; a store into a bridged page faults and gets the page back like an orphan's. `wp_hc` / `wp_lc` count,
+     * per pfn, the hashed and the logged (query-synced) sets that hold the page (under `lock`, read racily by the
+     * step: a logged set that comes in between is covered by the marks of the bridged pages). `wp_bridged` keeps the
+     * gap runs made read-only for an invalidate; an untrack orphans the read-only runs of an unlisted set.
+     * The switch also queues a set its syncs never found written (gen 1) after `wp_fast_streak` clean syncs and
+     * 250 ms of life, and protects hashed sets from 16 pages (not 64).
+     */
+    bool wp_bridge;
+    uint32_t wp_fast_streak;
+    uint16_t *wp_hc, *wp_lc;
+    GArray *wp_bridged;
+    GArray *wp_bridge_marks;
+    uint64_t lab_wp_br_spans, lab_wp_br_runs, lab_wp_br_ro, lab_wp_br_hashed;
+    uint64_t lab_wp_br_stop_log, lab_wp_br_stop_free, lab_wp_br_stop_far, lab_wp_br_orphaned;
     uint64_t lab_wp_protects, lab_wp_faults, lab_wp_refused, lab_wp_chunks, lab_wp_remaps;
     /*
      * TEMP lab (n148): why the protect step passed over a queued set — gone or no longer WP_NONE,
@@ -1328,6 +1349,31 @@ static bool reims_vgpu_dirty_tight_on(ReimsVgpuDirty *d)
 static void reims_vgpu_dirty_trk_free(ReimsVgpuDirtyTrk *t)
 {
     g_free(t);
+}
+
+/* TEMP lab DIRTY_WP_BRIDGE: count `s`'s target pages in (1) or out (-1) of `wp_hc` / `wp_lc`. d->lock held. */
+static void reims_vgpu_dirty_wp_hold_add(ReimsVgpuDirty *d, const ReimsVgpuDirtySet *s, int delta)
+{
+    const int shift = qemu_target_page_bits();
+    uint16_t *c = s->hash ? d->wp_hc : d->wp_lc;
+    uint64_t per, n = 1ULL << (36 - shift);
+    size_t i;
+
+    if (!c) {
+        return;
+    }
+    per = s->page_size >> shift;
+    for (i = 0; i < s->count; i++) {
+        uint64_t pfn = s->pages[i] >> shift, k;
+
+        for (k = 0; k < per && pfn + k < n; k++) {
+            uint16_t v = c[pfn + k];
+
+            if (delta > 0 ? v < UINT16_MAX : v > 0) {
+                qatomic_set(&c[pfn + k], (uint16_t)(v + delta));
+            }
+        }
+    }
 }
 
 /*
@@ -1994,6 +2040,7 @@ uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
         reims_vgpu_lab_rec(d, &r);
     }
     reims_vgpu_dirty_trk_add(d, s, 1);   /* TEMP lab DIRTY_TIGHT */
+    reims_vgpu_dirty_wp_hold_add(d, s, 1);   /* TEMP lab DIRTY_WP_BRIDGE */
     qemu_mutex_lock(&d->sets_lock);
     g_hash_table_insert(d->sets, g_memdup2(&token, sizeof(token)), s);
     qemu_mutex_unlock(&d->sets_lock);
@@ -2289,7 +2336,23 @@ static int64_t reims_vgpu_dirty_wp_age_need(const ReimsVgpuDirty *d, const Reims
     if (live) {
         return (int64_t)live * SCALE_MS;
     }
+    if (d->wp_bridge && s->gen <= 1 && !s->wp_lost) {
+        return 250 * SCALE_MS;   /* TEMP lab DIRTY_WP_BRIDGE: never written yet */
+    }
     return (int64_t)d->wp_age_ms * SCALE_MS + (int64_t)d->wp_age_run_us * s->nruns * SCALE_US;
+}
+
+/*
+ * TEMP lab DIRTY_WP_BRIDGE: the clean streak a set needs before it is queued - `need`, or `wp_fast_streak` for a set
+ * no sync ever found written (b439 canvas: the costly sets lived the whole 20 s run, written once at most, and
+ * 88 % of the foreground cost came after their 16th clean sync, 52 % after the 128th).
+ */
+static uint32_t reims_vgpu_dirty_wp_need(const ReimsVgpuDirty *d, const ReimsVgpuDirtySet *s, uint32_t need)
+{
+    if (d->wp_bridge && s->gen <= 1 && !s->wp_lost) {
+        return MIN(need, d->wp_fast_streak);
+    }
+    return need;
 }
 
 /*
@@ -2524,6 +2587,11 @@ static void reims_vgpu_dirty_wp_invalidate(void)
     }
     g_array_set_size(d->wp_list, 0);
     d->wp_cur = 0;
+    if (d->wp_bridged && d->wp_bridged->len) {
+        /* TEMP lab DIRTY_WP_BRIDGE: the bridged gaps belong to no listed set; give them back too. */
+        g_array_append_vals(d->wp_orphans, d->wp_bridged->data, d->wp_bridged->len);
+        g_array_set_size(d->wp_bridged, 0);
+    }
     qemu_mutex_unlock(&d->wp_mutex);
     REIMS_WP_BH_SCHEDULE(d->wp_bh);
 }
@@ -2872,6 +2940,119 @@ static size_t reims_vgpu_dirty_wp_release_merged(ReimsVgpuDirty *d, const ReimsV
     return i;
 }
 
+/*
+ * TEMP lab DIRTY_WP_BRIDGE: the run of `s` at page index `p` ends at `*end`, its next run at index `q`. Takes the
+ * following runs into one remap while each gap up to the next run is at most `wp_merge_gap` pages, stays inside
+ * the RAM slice, and holds only pages that are read-only already or held by hashed sets alone (none by a logged
+ * set, none by no set). `wp_bridge_marks` gets what the protect marks written after the remap: the runs and the gap
+ * pages that were writable (a read-only one cannot have been stored to, and marking it would read as a write);
+ * `wp_bridged` the gaps made read-only. Returns the index after the last run taken. `wp_mutex` held, `lock` not.
+ */
+static size_t reims_vgpu_dirty_wp_bridge(ReimsVgpuDirty *d, const ReimsVgpuDirtySet *s, size_t p, size_t q,
+                                         uint64_t *end, int n)
+{
+    const int shift = qemu_target_page_bits();
+    const uint64_t pg = 1ULL << shift;
+    const uint64_t gap_max = (uint64_t)d->wp_merge_gap << shift;
+    ReimsVgpuDirtyRun r = { .gpa = s->pages[p], .size = *end - s->pages[p] };
+    uint64_t slice_end;
+    size_t taken = 0;
+    int si;
+
+    g_array_set_size(d->wp_bridge_marks, 0);
+    g_array_append_val(d->wp_bridge_marks, r);
+    si = reims_vgpu_dirty_slice_of(d->wp_slices, n, s->pages[p]);
+    if (si < 0) {
+        return q;
+    }
+    slice_end = d->wp_slices[si].gpa + d->wp_slices[si].len;
+    while (q < s->count) {
+        uint64_t g = s->pages[q], e2, a, nro = 0, nh = 0;
+        size_t q2;
+        bool ok = true;
+
+        if (g - *end > gap_max) {
+            d->lab_wp_br_stop_far++;
+            break;
+        }
+        q2 = reims_vgpu_dirty_wp_run(s, q, &e2);
+        if (e2 > slice_end) {
+            d->lab_wp_br_stop_far++;
+            break;
+        }
+        for (a = *end; a < g; a += pg) {
+            uint64_t pfn = a >> shift;
+
+            if (test_bit(pfn, d->wp_bits)) {
+                nro++;
+            } else if (qatomic_read(&d->wp_lc[pfn])) {
+                d->lab_wp_br_stop_log++;
+                ok = false;
+                break;
+            } else if (!qatomic_read(&d->wp_hc[pfn])) {
+                d->lab_wp_br_stop_free++;
+                ok = false;
+                break;
+            } else {
+                nh++;
+            }
+        }
+        if (!ok) {
+            break;
+        }
+        for (a = *end; a < g;) {
+            uint64_t from;
+
+            if (test_bit(a >> shift, d->wp_bits)) {
+                a += pg;
+                continue;
+            }
+            for (from = a; a < g && !test_bit(a >> shift, d->wp_bits); a += pg) {
+            }
+            r.gpa = from;
+            r.size = a - from;
+            g_array_append_val(d->wp_bridge_marks, r);
+            g_array_append_val(d->wp_bridged, r);
+        }
+        r.gpa = g;
+        r.size = e2 - g;
+        g_array_append_val(d->wp_bridge_marks, r);
+        d->lab_wp_br_runs++;
+        d->lab_wp_br_ro += nro;
+        d->lab_wp_br_hashed += nh;
+        *end = e2;
+        q = q2;
+        taken++;
+    }
+    d->lab_wp_br_spans += taken != 0;
+    return q;
+}
+
+/*
+ * TEMP lab DIRTY_WP_BRIDGE: drop the bridged gaps no page of which is read-only any more, once the list has grown.
+ * `wp_mutex` held.
+ */
+static void reims_vgpu_dirty_wp_bridged_prune(ReimsVgpuDirty *d)
+{
+    guint i, keep = 0;
+
+    if (d->wp_bridged->len < 65536) {
+        return;
+    }
+    for (i = 0; i < d->wp_bridged->len; i++) {
+        ReimsVgpuDirtyRun r = g_array_index(d->wp_bridged, ReimsVgpuDirtyRun, i);
+        uint64_t a;
+
+        for (a = r.gpa; a < r.gpa + r.size; a += 1ULL << qemu_target_page_bits()) {
+            if (reims_vgpu_dirty_wp_ro(d, a)) {
+                g_array_index(d->wp_bridged, ReimsVgpuDirtyRun, keep++) = r;
+                break;
+            }
+        }
+    }
+    g_array_set_size(d->wp_bridged, keep);
+}
+
 /* TEMP lab DIRTY_WP_MERGE: the runs of `s` from page index `p` on, into `wp_merge_runs`. */
 static void reims_vgpu_dirty_wp_set_runs(ReimsVgpuDirty *d, const ReimsVgpuDirtySet *s, size_t p)
 {
@@ -2978,8 +3159,22 @@ static int64_t reims_vgpu_dirty_wp_protect_chunk(ReimsVgpuDirty *d, uint64_t tok
                     break;
                 }
             }
-            rc = reims_vgpu_dirty_wp_remap(d, s->pages[p], end - s->pages[p], false);
-            reims_vgpu_dirty_wp_mark(d->wp_slices, n, s->pages[p], end);
+            if (d->wp_bridge && d->wp_refs && !d->wp_hole) {
+                guint k;
+
+                /* TEMP lab DIRTY_WP_BRIDGE: the next runs too, over gaps that are read-only or hashed-only. */
+                q = reims_vgpu_dirty_wp_bridge(d, s, p, q, &end, n);
+                rc = reims_vgpu_dirty_wp_remap(d, s->pages[p], end - s->pages[p], false);
+                for (k = 0; k < d->wp_bridge_marks->len; k++) {
+                    ReimsVgpuDirtyRun *mr = &g_array_index(d->wp_bridge_marks, ReimsVgpuDirtyRun, k);
+
+                    reims_vgpu_dirty_wp_mark(d->wp_slices, n, mr->gpa, mr->gpa + mr->size);
+                }
+                reims_vgpu_dirty_wp_bridged_prune(d);
+            } else {
+                rc = reims_vgpu_dirty_wp_remap(d, s->pages[p], end - s->pages[p], false);
+                reims_vgpu_dirty_wp_mark(d->wp_slices, n, s->pages[p], end);
+            }
             if (d->wp_hole_bits && !rc) {   /* TEMP lab DIRTY_WP_HOLE */
                 uint64_t a;
 
@@ -3512,6 +3707,32 @@ void reims_vgpu_dirty_untrack(ReimsVgpuDirty *d, uint64_t token)
     if (!d || token == 0) {
         return;
     }
+    if (d->wp_bridge && d->wp_list && qatomic_read(&d->wp_bits)) {
+        /*
+         * TEMP lab DIRTY_WP_BRIDGE: an unlisted set's pages may be read-only in another set's bridged span; they
+         * go back on the orphan list with it. A racy look first, so most untracks take no `wp_mutex`.
+         */
+        ReimsVgpuDirtySet *us;
+        bool any;
+
+        qemu_mutex_lock(&d->lock);
+        us = g_hash_table_lookup(d->sets, &token);
+        any = us && !us->wp_listed && us->wp_state == WP_NONE && reims_vgpu_dirty_wp_any_ro(d, us, 0, us->count);
+        qemu_mutex_unlock(&d->lock);
+        if (any) {
+            qemu_mutex_lock(&d->wp_mutex);
+            qemu_mutex_lock(&d->lock);
+            us = g_hash_table_lookup(d->sets, &token);
+            any = us && !us->wp_listed && us->wp_state == WP_NONE;
+            qemu_mutex_unlock(&d->lock);
+            if (any) {
+                reims_vgpu_dirty_wp_orphan(d, us);   /* alive: only this untrack frees it */
+                d->lab_wp_br_orphaned++;
+                REIMS_WP_BH_SCHEDULE(d->wp_bh);
+            }
+            qemu_mutex_unlock(&d->wp_mutex);
+        }
+    }
     if (d->wp_list && !d->wp_calm) {   /* lab DIRTY_WP: its read-only runs outlive it, the step makes them writable */
         guint i;
 
@@ -3571,6 +3792,7 @@ void reims_vgpu_dirty_untrack(ReimsVgpuDirty *d, uint64_t token)
                 reims_vgpu_dirty_tab_del(d, token);
             }
             reims_vgpu_dirty_trk_add(d, oval, -1);   /* TEMP lab DIRTY_TIGHT */
+            reims_vgpu_dirty_wp_hold_add(d, oval, -1);   /* TEMP lab DIRTY_WP_BRIDGE */
             g_free(okey);
             d->lab_hash_sets -= ((ReimsVgpuDirtySet *)oval)->hash != NULL;   /* lab DIRTY_HASH */
             if (d->up_ready && (reims_vgpu_lab_live("UNTRACK_POPULATE") < 0 ? d->up_on
@@ -4964,6 +5186,8 @@ static bool reims_vgpu_dirty_eval_set(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
         s->count * (s->page_size >> shift) >= d->wp_min_pages) {   /* lab DIRTY_WP */
         uint32_t need = (uint32_t)(qatomic_read(&reims_vgpu_dirty_wp_streak_live) ?: d->wp_streak_need)
                         << MIN(s->wp_lost, 6);   /* TEMP lab live DIRTY_WP_STREAK */
+
+        need = reims_vgpu_dirty_wp_need(d, s, need);   /* TEMP lab DIRTY_WP_BRIDGE */
 
         s->wp_streak = any ? 0 : s->wp_streak + 1;
         /*
@@ -6508,6 +6732,8 @@ static void reims_vgpu_dirty_hash_sync(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
                                        qatomic_read(&reims_vgpu_dirty_wp_streak_live) ?: d->wp_streak_need)
                             << MIN(s->wp_lost, 6);
 
+            need = reims_vgpu_dirty_wp_need(d, s, need);   /* TEMP lab DIRTY_WP_BRIDGE */
+
             s->wp_streak = moved->len ? 0 : s->wp_streak + 1;
             if (s->wp_streak == need ||
                 ((d->wp_retry || d->wp_calm) && s->wp_streak > need && (s->wp_streak - need) % need == 0)) {
@@ -7147,6 +7373,17 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                         d->lab_wp_rm_n[3], d->lab_wp_rm_ns[3] / 1000);
                 memset(d->lab_wp_rm_n, 0, sizeof(d->lab_wp_rm_n));
                 memset(d->lab_wp_rm_ns, 0, sizeof(d->lab_wp_rm_ns));
+                if (d->wp_bridge) {   /* TEMP lab DIRTY_WP_BRIDGE */
+                    fprintf(stderr, "reims-dirty-wp-bridge spans=%" PRIu64 " runs=%" PRIu64 " gap_ro=%" PRIu64
+                            " gap_hashed=%" PRIu64 " stop_log=%" PRIu64 " stop_free=%" PRIu64 " stop_far=%" PRIu64
+                            " orphaned=%" PRIu64 " bridged=%u\n",
+                            d->lab_wp_br_spans, d->lab_wp_br_runs, d->lab_wp_br_ro, d->lab_wp_br_hashed,
+                            d->lab_wp_br_stop_log, d->lab_wp_br_stop_free, d->lab_wp_br_stop_far,
+                            d->lab_wp_br_orphaned, d->wp_bridged->len);
+                    d->lab_wp_br_spans = d->lab_wp_br_runs = d->lab_wp_br_ro = d->lab_wp_br_hashed = 0;
+                    d->lab_wp_br_stop_log = d->lab_wp_br_stop_free = d->lab_wp_br_stop_far = 0;
+                    d->lab_wp_br_orphaned = 0;
+                }
                 d->lab_wp_young = d->lab_wp_dead = d->lab_wp_yields = 0;
                 d->lab_wp_merge_spans = d->lab_wp_merge_runs = 0;   /* TEMP lab DIRTY_WP_MERGE */
                 d->lab_wp_merge_pages = d->lab_wp_merge_fault = 0;
@@ -7864,6 +8101,25 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
             d->wp_overlap = !(getenv("REIMS_VGPU_LAB_DIRTY_WP_OVERLAP") &&
                               strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_OVERLAP"), "off") == 0);
             d->wp_layout = getenv("REIMS_VGPU_LAB_DIRTY_WP_LAYOUT") != NULL;   /* TEMP lab (b357) */
+            /* TEMP lab DIRTY_WP_BRIDGE (b451, opt-in for its A/B): see `wp_bridge`. */
+            d->wp_bridge = d->wp_mode && d->wp_overlap && getenv("REIMS_VGPU_LAB_DIRTY_WP_BRIDGE") &&
+                           strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_BRIDGE"), "on") == 0;
+            d->wp_fast_streak = getenv("REIMS_VGPU_LAB_DIRTY_WP_FAST_STREAK") ?
+                                MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_FAST_STREAK"))) : 16;
+            if (d->wp_bridge) {
+                uint64_t np = 1ULL << (36 - qemu_target_page_bits());
+
+                d->wp_hc = g_new0(uint16_t, np);
+                d->wp_lc = g_new0(uint16_t, np);
+                d->wp_bridged = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyRun));
+                d->wp_bridge_marks = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyRun));
+                if (!getenv("REIMS_VGPU_LAB_DIRTY_WP_HASHED_MIN")) {
+                    reims_vgpu_dirty_wp_hashed_min_default = 16;
+                    qatomic_set(&reims_vgpu_dirty_wp_hashed_min_live, 16);
+                }
+                fprintf(stderr, "reims-dirty-wp bridge on: gap<=%u fast_streak=%u hashed_min=%" PRIu64 "\n",
+                        d->wp_merge_gap, d->wp_fast_streak, reims_vgpu_dirty_wp_hashed_min_default);
+            }
             d->wp_calm = !(getenv("REIMS_VGPU_LAB_DIRTY_WP_CALM") &&
                            strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_CALM"), "off") == 0);
             /* 1 s plus 2 ms a run (its protect and give-back cost ~0.7 ms); the stress rows use 0. */
