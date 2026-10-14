@@ -847,6 +847,15 @@ struct ReimsVgpuDirty {
     GArray *wp_bridge_marks;
     uint64_t lab_wp_br_spans, lab_wp_br_runs, lab_wp_br_ro, lab_wp_br_hashed;
     uint64_t lab_wp_br_stop_log, lab_wp_br_stop_free, lab_wp_br_stop_far, lab_wp_br_orphaned;
+    /*
+     * TEMP lab DIRTY_WP_FAIR (on; `=off` restores): a store fault never waits for a whole WP step. b452: at a UI
+     * transition one step held `wp_mutex` up to 72 ms (32 remaps of ~1 ms each, between them a plain unlock and lock
+     * that lets nobody in), MMIO exits averaged 0.5-1 ms against 3 us, and the guest's audio stopped 30-150 ms. Under
+     * it the protect loop, the merged give-back and the orphan release step aside after each remap while a fault
+     * waits, and a fault itself gives back at most REIMS_WP_FAIR_FAULT_SPANS spans.
+     */
+    unsigned wp_fair;   /* bits: 1 give-back stops, 2 step yields, 4 fault budget, 8 protect yields */
+    uint64_t lab_wp_fwait_ns, lab_wp_fwait_max_ns, lab_wp_fhold_ns, lab_wp_fhold_max_ns, lab_wp_fslow;
     uint64_t lab_wp_protects, lab_wp_faults, lab_wp_refused, lab_wp_chunks, lab_wp_remaps;
     /*
      * TEMP lab (n148): why the protect step passed over a queued set — gone or no longer WP_NONE,
@@ -2429,6 +2438,10 @@ static bool reims_vgpu_dirty_wp_merge_on(ReimsVgpuDirty *d)
 
 /* TEMP lab DIRTY_WP_MERGE: spans one store fault gives back before the step takes over. */
 #define REIMS_WP_MERGE_FAULT_SPANS 64
+#define REIMS_WP_FAIR_FAULT_SPANS 8   /* TEMP lab DIRTY_WP_FAIR: ~1 ms a remap at a transition */
+
+/* TEMP lab DIRTY_WP_FAIR: this thread runs the WP step (a give-back here may stop for a waiting fault). */
+static __thread bool reims_wp_in_step;
 
 /*
  * vCPU thread, a store exit at `gpa` (whpx_handle_mmio). The set holding the page stops being
@@ -2440,14 +2453,17 @@ static bool reims_vgpu_dirty_wp_fault(uint64_t gpa)
 {
     ReimsVgpuDirty *d = reims_vgpu_dirty_wp_dev;
     ReimsVgpuDirtySet *dropped = NULL;   /* TEMP lab DIRTY_WP_MERGE */
+    int64_t t_wait, t_held;
     guint i;
 
     if (!d || !qatomic_read(&d->wp_bits) || !reims_vgpu_dirty_wp_ro(d, gpa)) {
         return false;
     }
+    t_wait = get_clock();
     qatomic_inc(&d->wp_waiters);
     qemu_mutex_lock(&d->wp_mutex);
     qatomic_dec(&d->wp_waiters);
+    t_held = get_clock();
     if (reims_vgpu_dirty_wp_ro(d, gpa)) {
         for (i = 0; i < d->wp_list->len; i++) {
             uint64_t token = g_array_index(d->wp_list, uint64_t, i);
@@ -2516,7 +2532,7 @@ static bool reims_vgpu_dirty_wp_fault(uint64_t gpa)
          * DIRTY_WP_MERGE gives more back only under a query ticket with marks, which closes that.
          */
         if (reims_vgpu_dirty_wp_merge_on(d) && !d->wp_hole) {
-            int budget = REIMS_WP_MERGE_FAULT_SPANS;
+            int budget = (d->wp_fair & 4) ? REIMS_WP_FAIR_FAULT_SPANS : REIMS_WP_MERGE_FAULT_SPANS;
 
             d->lab_wp_merge_fault++;
             for (i = 0; i < d->wp_list->len && !dropped; i++) {
@@ -2548,6 +2564,16 @@ static bool reims_vgpu_dirty_wp_fault(uint64_t gpa)
         }
     }
     d->lab_wp_faults++;
+    {   /* TEMP lab DIRTY_WP_FAIR: how long the faulting vCPU stood still, waiting and inside */
+        int64_t now = get_clock();
+        uint64_t w = t_held - t_wait, h = now - t_held;
+
+        d->lab_wp_fwait_ns += w;
+        d->lab_wp_fwait_max_ns = MAX(d->lab_wp_fwait_max_ns, w);
+        d->lab_wp_fhold_ns += h;
+        d->lab_wp_fhold_max_ns = MAX(d->lab_wp_fhold_max_ns, h);
+        d->lab_wp_fslow += w + h >= 4 * SCALE_MS;
+    }
     qemu_mutex_unlock(&d->wp_mutex);
     REIMS_WP_BH_SCHEDULE(d->wp_bh);
     return true;
@@ -2884,6 +2910,14 @@ static size_t reims_vgpu_dirty_wp_release_merged(ReimsVgpuDirty *d, const ReimsV
         size_t i0 = i, k;
         int si;
 
+        if ((d->wp_fair & 1) && reims_wp_in_step && i && qatomic_read(&d->wp_waiters)) {
+            /*
+             * TEMP lab DIRTY_WP_FAIR: a fault waits; stop here (the caller consumes what was done and
+             * steps aside). Not a yield in here: `runs` points into a list the fault may change.
+             */
+            break;
+        }
+
         if (d->wp_refs && reims_vgpu_dirty_wp_run_kept(d, start, end)) {
             /* TEMP lab DIRTY_WP_OVERLAP: another set holds part of it; page by page. */
             reims_vgpu_dirty_wp_release(d, start, end, budget);
@@ -3218,8 +3252,13 @@ static int64_t reims_vgpu_dirty_wp_protect_chunk(ReimsVgpuDirty *d, uint64_t tok
                  */
                 bool ok;
 
-                qemu_mutex_unlock(&d->wp_mutex);
-                qemu_mutex_lock(&d->wp_mutex);
+                if (d->wp_fair & 8) {
+                    /* TEMP lab DIRTY_WP_FAIR: a plain unlock and lock lets nobody in (b452: 72 ms). */
+                    reims_vgpu_dirty_wp_yield(d);
+                } else {
+                    qemu_mutex_unlock(&d->wp_mutex);
+                    qemu_mutex_lock(&d->wp_mutex);
+                }
                 qemu_mutex_lock(&d->lock);
                 s = g_hash_table_lookup(d->sets, &token);
                 ok = s && s->wp_state == WP_PROTECTING && d->wp_cur == token;
@@ -3365,8 +3404,12 @@ static bool reims_vgpu_dirty_wp_step(ReimsVgpuDirty *d)
     if (d->wp_calm) {
         reims_vgpu_dirty_wp_bury(d);   /* lab DIRTY_WP_CALM */
     }
+    reims_wp_in_step = true;   /* TEMP lab DIRTY_WP_FAIR */
     if (reims_vgpu_dirty_wp_merge_on(d)) {
         reims_vgpu_dirty_wp_release_orphans(d, &budget);   /* TEMP lab DIRTY_WP_MERGE */
+        if (d->wp_fair & 2) {
+            reims_vgpu_dirty_wp_yield(d);   /* the give-back stopped early for a waiting fault */
+        }
     }
     while (budget > 0 && d->wp_orphans->len) {
         ReimsVgpuDirtyRun r = g_array_index(d->wp_orphans, ReimsVgpuDirtyRun, d->wp_orphans->len - 1);
@@ -3517,6 +3560,7 @@ static bool reims_vgpu_dirty_wp_step(ReimsVgpuDirty *d)
         more = d->wp_cur || d->wp_queue->len;
         qemu_mutex_unlock(&d->lock);
     }
+    reims_wp_in_step = false;
     qemu_mutex_unlock(&d->wp_mutex);
     return more;
 }
@@ -7388,6 +7432,12 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                         d->lab_wp_rm_n[3], d->lab_wp_rm_ns[3] / 1000);
                 memset(d->lab_wp_rm_n, 0, sizeof(d->lab_wp_rm_n));
                 memset(d->lab_wp_rm_ns, 0, sizeof(d->lab_wp_rm_ns));
+                fprintf(stderr, "reims-dirty-wp-fault fair=%u n=%" PRIu64 " wait_us=%" PRIu64 " wait_max_us=%" PRIu64
+                        " hold_us=%" PRIu64 " hold_max_us=%" PRIu64 " slow4ms=%" PRIu64 "\n",   /* TEMP lab DIRTY_WP_FAIR */
+                        d->wp_fair, d->lab_wp_faults, d->lab_wp_fwait_ns / 1000, d->lab_wp_fwait_max_ns / 1000,
+                        d->lab_wp_fhold_ns / 1000, d->lab_wp_fhold_max_ns / 1000, d->lab_wp_fslow);
+                d->lab_wp_fwait_ns = d->lab_wp_fwait_max_ns = d->lab_wp_fhold_ns = d->lab_wp_fhold_max_ns = 0;
+                d->lab_wp_fslow = 0;
                 if (d->wp_bridge) {   /* TEMP lab DIRTY_WP_BRIDGE */
                     fprintf(stderr, "reims-dirty-wp-bridge spans=%" PRIu64 " runs=%" PRIu64 " gap_ro=%" PRIu64
                             " gap_hashed=%" PRIu64 " stop_log=%" PRIu64 " stop_free=%" PRIu64 " stop_far=%" PRIu64
@@ -8142,6 +8192,11 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
             }
             d->wp_calm = !(getenv("REIMS_VGPU_LAB_DIRTY_WP_CALM") &&
                            strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_CALM"), "off") == 0);
+            d->wp_fair = !(getenv("REIMS_VGPU_LAB_DIRTY_WP_FAIR") &&   /* TEMP lab DIRTY_WP_FAIR */
+                           strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_FAIR"), "off") == 0) ? 15 : 0;
+            if (getenv("REIMS_VGPU_LAB_DIRTY_WP_FAIR_MASK")) {   /* TEMP lab: which parts (stress bisect) */
+                d->wp_fair &= atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_FAIR_MASK"));
+            }
             /* 1 s plus 2 ms a run (its protect and give-back cost ~0.7 ms); the stress rows use 0. */
             d->wp_age_ms = 1000;
             d->wp_age_run_us = 2000;

@@ -38,6 +38,7 @@ static void virtio_snd_pcm_flush(VirtIOSoundPCMStream *stream);
 static void virtio_snd_pcm_in_cb(void *data, int available);
 static void virtio_snd_unrealize(DeviceState *dev);
 static void vsnd_lab_note_tx(size_t size);   /* TEMP lab (QEMU_VSND_EARLY_PCT) */
+static void vsnd_lab_jitter_admit(VirtIOSoundPCMStream *stream);   /* TEMP lab (QEMU_VSND_JITTER_MS) */
 
 static uint32_t supported_formats = BIT(VIRTIO_SND_PCM_FMT_S8)
                                   | BIT(VIRTIO_SND_PCM_FMT_U8)
@@ -577,6 +578,7 @@ static void virtio_snd_handle_pcm_start_stop(VirtIOSound *s,
     if (stream) {
         WITH_QEMU_LOCK_GUARD(&stream->queue_mutex) {
             stream->active = start;
+            stream->lab_primed = false;   /* TEMP lab (QEMU_VSND_JITTER_MS) */
         }
         if (stream->info.direction == VIRTIO_SND_D_OUTPUT) {
             audio_be_set_active_out(s->audio_be, stream->voice.out, start);
@@ -913,6 +915,7 @@ static void virtio_snd_handle_tx_xfer(VirtIODevice *vdev, VirtQueue *vq)
             vsnd_lab_note_tx(size);   /* TEMP lab (QEMU_VSND_EARLY_PCT) */
 
             QSIMPLEQ_INSERT_TAIL(&stream->queue, buffer, entry);
+            vsnd_lab_jitter_admit(stream);   /* TEMP lab (QEMU_VSND_JITTER_MS): back to the guest at once */
         }
         continue;
 
@@ -1296,6 +1299,79 @@ static inline void return_tx_buffer_early(VirtIOSoundPCMStream *stream,
 }
 
 /*
+ * TEMP lab (QEMU_VSND_JITTER_MS=C, 2026-10-15): a jitter buffer in the device. macOS's AppleVirtIOSound keeps one
+ * 85 ms TX period out at a time and paces the next by its own clock and the latency we report, so a stock device
+ * that completes a period when its last byte reaches the backend runs dry on every turnaround, and any late vCPU
+ * (a UI transition stalls them 30-150 ms) is a gap. Here a TX period is copied and given back as it arrives, while
+ * at most C ms plus one period sit copied but unplayed (more waits in the queue, un-returned, until there is room);
+ * playback starts only once C ms are buffered, and again after an underrun. The latency report stays truthful: the
+ * copied bytes still to play. 0 / unset: stock.
+ */
+static unsigned vsnd_lab_jitter_ms(void)
+{
+    static int ms = -1;
+
+    if (ms < 0) {
+        const char *e = getenv("QEMU_VSND_JITTER_MS");
+        ms = e ? MIN(1000, MAX(0, atoi(e))) : 0;
+        fprintf(stderr, "virtio-snd: jitter buffer %d ms (QEMU_VSND_JITTER_MS)\n", ms);
+    }
+    return ms;
+}
+
+static size_t vsnd_lab_ms_bytes(VirtIOSoundPCMStream *stream, unsigned ms)
+{
+    size_t bps;
+
+    switch (stream->as.fmt) {
+    case AUDIO_FORMAT_U8:
+    case AUDIO_FORMAT_S8:
+        bps = 1;
+        break;
+    case AUDIO_FORMAT_U16:
+    case AUDIO_FORMAT_S16:
+        bps = 2;
+        break;
+    default:
+        bps = 4;
+        break;
+    }
+    return (size_t)stream->as.freq * stream->as.nchannels * bps * ms / 1000;
+}
+
+/* Give queued TX periods back to the guest while the unplayed copies stay within the cap. `queue_mutex` held. */
+static void vsnd_lab_jitter_admit(VirtIOSoundPCMStream *stream)
+{
+    VirtIOSoundPCMBuffer *buffer;
+    size_t held = 0, cap;
+    unsigned ms = vsnd_lab_jitter_ms();
+
+    if (!ms || !stream->active || stream->info.direction != VIRTIO_SND_D_OUTPUT) {
+        return;
+    }
+    cap = vsnd_lab_ms_bytes(stream, ms);
+    QSIMPLEQ_FOREACH(buffer, &stream->queue, entry) {
+        if (buffer->returned) {
+            held += buffer->size;
+            continue;
+        }
+        if (!virtio_queue_ready(buffer->vq)) {
+            return;
+        }
+        if (held > cap) {
+            return;   /* the oldest un-returned period waits for room; the ones behind it too */
+        }
+        if (!buffer->populated) {
+            iov_to_buf(buffer->elem->out_sg, buffer->elem->out_num, sizeof(virtio_snd_pcm_xfer),
+                       buffer->data, buffer->size);
+            buffer->populated = true;
+        }
+        return_tx_buffer_early(stream, buffer);
+        held += buffer->size;
+    }
+}
+
+/*
  * audio_be_* output callback.
  *
  * @data: VirtIOSoundPCMStream stream
@@ -1317,6 +1393,15 @@ static void virtio_snd_pcm_out_cb(void *data, int available)
                         stream->id, n, available);
             }
             vsnd_lab_note_starved();
+            stream->lab_primed = false;   /* TEMP lab (QEMU_VSND_JITTER_MS): build the cushion again */
+        }
+        if (vsnd_lab_jitter_ms() && stream->active && !stream->lab_primed) {
+            /* TEMP lab (QEMU_VSND_JITTER_MS): nothing plays until the cushion is buffered. */
+            vsnd_lab_jitter_admit(stream);
+            if (stream->latency_bytes < vsnd_lab_ms_bytes(stream, vsnd_lab_jitter_ms())) {
+                return;
+            }
+            stream->lab_primed = true;
         }
         while (!QSIMPLEQ_EMPTY(&stream->queue)) {
             buffer = QSIMPLEQ_FIRST(&stream->queue);
@@ -1371,6 +1456,7 @@ static void virtio_snd_pcm_out_cb(void *data, int available)
                 break;
             }
         }
+        vsnd_lab_jitter_admit(stream);   /* TEMP lab (QEMU_VSND_JITTER_MS): room made, the next periods go back */
     }
 }
 

@@ -156,6 +156,8 @@ struct VirtIOSoundPCMStream {
     bool active;
     uint32_t latency_bytes;
     QSIMPLEQ_HEAD(, VirtIOSoundPCMBuffer) queue;
+    /* TEMP lab (QEMU_VSND_JITTER_MS): playback waits until this much is buffered, again after an underrun. */
+    bool lab_primed;
 };
 
 /*

@@ -510,6 +510,16 @@ void whpx_lab_pin_ccd(const char *who)
 void (*whpx_wp_invalidate_hook)(void);
 static int whpx_wp_busy;
 static unsigned whpx_wp_gen;
+/* TEMP lab (b454): DIRTY_WP remaps per whpx-stats second - count, time, worst, pages. */
+static uint64_t whpx_lab_rm_n, whpx_lab_rm_ns, whpx_lab_rm_max_ns, whpx_lab_rm_pages;
+
+void whpx_lab_wp_remap_take(uint64_t *n, uint64_t *ns, uint64_t *max_ns, uint64_t *pages)
+{
+    *n = qatomic_xchg(&whpx_lab_rm_n, 0);
+    *ns = qatomic_xchg(&whpx_lab_rm_ns, 0);
+    *max_ns = qatomic_xchg(&whpx_lab_rm_max_ns, 0);
+    *pages = qatomic_xchg(&whpx_lab_rm_pages, 0);
+}
 
 /*
  * TEMP (lab, REIMS_VGPU_LAB_WP_POPULATE=read|write): refill the second-level translation of a range DIRTY_WP
@@ -584,6 +594,7 @@ int whpx_wp_remap(uint64_t gpa, uint64_t size, bool writable)
     MemoryRegionSection sec = memory_region_find(get_system_memory(), gpa, size);
     HRESULT hr;
     void *mem;
+    int64_t t_rm;
     int rc = 0;
 
     if (!sec.mr) {
@@ -596,6 +607,7 @@ int whpx_wp_remap(uint64_t gpa, uint64_t size, bool writable)
     }
     mem = memory_region_get_ram_ptr(sec.mr) + sec.offset_within_region;
     memory_region_unref(sec.mr);
+    t_rm = get_clock();
     qatomic_inc(&whpx_wp_busy);
     /*
      * Mapped over the live mapping: one call, and no moment where the range is
@@ -635,6 +647,15 @@ int whpx_wp_remap(uint64_t gpa, uint64_t size, bool writable)
     }
     qatomic_inc(&whpx_wp_gen);
     qatomic_dec(&whpx_wp_busy);
+    {   /* TEMP lab (b454) */
+        uint64_t d = get_clock() - t_rm, m;
+
+        qatomic_inc(&whpx_lab_rm_n);
+        qatomic_add(&whpx_lab_rm_ns, d);
+        qatomic_add(&whpx_lab_rm_pages, size >> 12);
+        while ((m = qatomic_read(&whpx_lab_rm_max_ns)) < d && qatomic_cmpxchg(&whpx_lab_rm_max_ns, m, d) != m) {
+        }
+    }
     return rc;
 }
 

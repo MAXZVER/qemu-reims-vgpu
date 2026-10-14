@@ -1281,6 +1281,13 @@ static void whpx_stats_maybe_print(void)
                            whpx_stats.run_ns / 1000000, whpx_stats.run_ecore_ns / 1000000,
                            whpx_stats.mmio_bql_ns / 1000,
                            whpx_stats.prerun_bql_ns / 1000, whpx_stats.prerun_n);
+    {   /* TEMP lab (b454): DIRTY_WP remaps in the same second */
+        uint64_t rn, rns, rmax, rpg;
+
+        whpx_lab_wp_remap_take(&rn, &rns, &rmax, &rpg);
+        g_string_append_printf(s, " wprm=%" PRIu64 "/%" PRIu64 "us wprm_max_us=%" PRIu64 " wprm_pages=%" PRIu64,
+                               rn, rns / 1000, rmax / 1000, rpg);
+    }
     whpx_stats.run_ns = whpx_stats.mmio_bql_ns = whpx_stats.prerun_bql_ns = 0;
     whpx_stats.run_ecore_ns = 0;
     whpx_stats.prerun_n = 0;
