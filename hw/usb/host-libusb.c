@@ -177,6 +177,31 @@ struct USBHostDevice {
     bool                             bh_postld_pending;
     Notifier                         exit;
 
+    /*
+     * TEMP lab (QEMU_USB_HOST_SLOW_ASYNC): the guest's device resets and endpoint clear-halts run on this device's
+     * own thread instead of the main loop. `slow_busy` (main loop only) holds from the request until the bottom
+     * half has taken the result; `slow_running` (under `slow_lock`) while the thread is inside libusb.
+     */
+    QemuThread                       slow_thread;
+    QemuMutex                        slow_lock;
+    QemuCond                         slow_cond;
+    QEMUBH                           *slow_bh;
+    bool                             slow_init;
+    bool                             slow_quit;
+    bool                             slow_running;
+    bool                             slow_busy;
+    int                              slow_op;
+    int                              slow_arg;
+    int                              slow_rc;
+    USBPacket                        *slow_pkt;
+    int64_t                          slow_t0;
+    /* A control request that came while busy: held (ep0 has one at a time) and handled after. */
+    struct {
+        USBPacket                    *p;
+        int                          request, value, index, length;
+        uint8_t                      *data;
+    } slow_ctl;
+
     /* request queues */
     QTAILQ_HEAD(, USBHostRequest)    requests;
     QTAILQ_HEAD(, USBHostIsoRing)    isorings;
@@ -1900,6 +1925,181 @@ fail:
     return -1;
 }
 
+/*
+ * TEMP lab (QEMU_USB_HOST_SLOW_ASYNC=on, 2026-10-14): a wedged Bluetooth adapter (AX201) froze the whole work VM - the
+ * guest re-reset it every ~5 s and each libusb_reset_device() through WinUSB held the main loop ~4.5 s under the BQL
+ * (QMP query-status 4.5 s, vCPU BQL waits 5-20 s per 5 s; QMP device_del of the adapter brought the loop back at
+ * once). With the switch on, a guest reset and an endpoint clear-halt are handed to this device's thread; until the
+ * bottom half has taken the result, every packet for the device is answered NAK and the controller is woken
+ * afterwards, so the guest sees a device that is busy for a while and the rest of the VM keeps running.
+ */
+enum { USB_HOST_SLOW_NONE, USB_HOST_SLOW_RESET, USB_HOST_SLOW_CLEAR_HALT };
+
+static void usb_host_handle_control(USBDevice *udev, USBPacket *p, int request, int value, int index, int length,
+                                    uint8_t *data);
+
+static bool usb_host_slow_async_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("QEMU_USB_HOST_SLOW_ASYNC");
+        on = e && (!strcmp(e, "on") || !strcmp(e, "1"));
+        info_report("usb-host: guest resets and clear-halts %s (QEMU_USB_HOST_SLOW_ASYNC)",
+                    on ? "on a per-device thread" : "in the main loop");
+    }
+    return on;
+}
+
+static void *usb_host_slow_thread(void *opaque)
+{
+    USBHostDevice *s = opaque;
+
+    qemu_mutex_lock(&s->slow_lock);
+    for (;;) {
+        int op, arg, rc = 0;
+
+        while (!s->slow_quit && !s->slow_running) {
+            qemu_cond_wait(&s->slow_cond, &s->slow_lock);
+        }
+        if (s->slow_quit) {
+            break;
+        }
+        op = s->slow_op;
+        arg = s->slow_arg;
+        qemu_mutex_unlock(&s->slow_lock);
+        if (op == USB_HOST_SLOW_RESET) {
+            rc = libusb_reset_device(s->dh);
+        } else if (op == USB_HOST_SLOW_CLEAR_HALT) {
+            rc = libusb_clear_halt(s->dh, arg);
+        }
+        qemu_mutex_lock(&s->slow_lock);
+        s->slow_rc = rc;
+        s->slow_running = false;
+        qemu_cond_broadcast(&s->slow_cond);
+        qemu_bh_schedule(s->slow_bh);
+    }
+    qemu_mutex_unlock(&s->slow_lock);
+    return NULL;
+}
+
+/* Main loop: wake every endpoint the guest was NAKed on while the operation ran. */
+static void usb_host_slow_wake(USBHostDevice *s)
+{
+    USBDevice *udev = USB_DEVICE(s);
+    int i;
+
+    usb_wakeup(&udev->ep_ctl, 0);
+    for (i = 1; i < USB_MAX_ENDPOINTS; i++) {
+        usb_wakeup(usb_ep_get(udev, USB_TOKEN_IN, i), 0);
+        usb_wakeup(usb_ep_get(udev, USB_TOKEN_OUT, i), 0);
+    }
+}
+
+static void usb_host_slow_bh(void *opaque)
+{
+    USBHostDevice *s = opaque;
+    USBDevice *udev = USB_DEVICE(s);
+    USBPacket *p = s->slow_pkt;
+    int op, arg, rc;
+    int64_t ms;
+
+    qemu_mutex_lock(&s->slow_lock);
+    if (s->slow_running || !s->slow_busy) {
+        qemu_mutex_unlock(&s->slow_lock);
+        return;
+    }
+    op = s->slow_op;
+    arg = s->slow_arg;
+    rc = s->slow_rc;
+    s->slow_op = USB_HOST_SLOW_NONE;
+    qemu_mutex_unlock(&s->slow_lock);
+    s->slow_busy = false;
+    s->slow_pkt = NULL;
+    ms = (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - s->slow_t0) / SCALE_MS;
+    if (ms >= 100 || rc != 0) {
+        info_report("usb-host %d.%d: %s took %" PRId64 " ms off the main loop (rc %d)", s->bus_num, s->addr,
+                    op == USB_HOST_SLOW_RESET ? "reset" : "clear-halt", ms, rc);
+    }
+    if (op == USB_HOST_SLOW_CLEAR_HALT && p) {
+        int pid = (arg & USB_DIR_IN) ? USB_TOKEN_IN : USB_TOKEN_OUT;
+
+        usb_ep_set_halted(udev, pid, arg & 0x0f, 0);
+        p->status = USB_RET_SUCCESS;
+        usb_generic_async_ctrl_complete(udev, p);
+    }
+    if (op == USB_HOST_SLOW_RESET && rc != 0) {
+        usb_host_nodev(s);
+        return;
+    }
+    usb_host_slow_wake(s);
+    if (s->slow_ctl.p) {
+        USBPacket *cp = s->slow_ctl.p;
+
+        s->slow_ctl.p = NULL;
+        usb_host_handle_control(udev, cp, s->slow_ctl.request, s->slow_ctl.value, s->slow_ctl.index,
+                                s->slow_ctl.length, s->slow_ctl.data);
+        if (cp->status != USB_RET_ASYNC) {
+            usb_generic_async_ctrl_complete(udev, cp);
+        }
+    }
+}
+
+/* Main loop: start `op` on the device's thread. False when the switch is off (the caller does it inline). */
+static bool usb_host_slow_start(USBHostDevice *s, int op, int arg, USBPacket *p)
+{
+    if (!usb_host_slow_async_on() || s->dh == NULL) {
+        return false;
+    }
+    if (!s->slow_init) {
+        qemu_mutex_init(&s->slow_lock);
+        qemu_cond_init(&s->slow_cond);
+        s->slow_bh = qemu_bh_new_guarded(usb_host_slow_bh, s, &DEVICE(s)->mem_reentrancy_guard);
+        s->slow_quit = false;
+        qemu_thread_create(&s->slow_thread, "usb-host-slow", usb_host_slow_thread, s, QEMU_THREAD_JOINABLE);
+        s->slow_init = true;
+    }
+    s->slow_busy = true;
+    s->slow_pkt = p;
+    s->slow_t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    qemu_mutex_lock(&s->slow_lock);
+    s->slow_op = op;
+    s->slow_arg = arg;
+    s->slow_running = true;
+    qemu_cond_broadcast(&s->slow_cond);
+    qemu_mutex_unlock(&s->slow_lock);
+    return true;
+}
+
+/*
+ * Before the handle goes away: wait for an operation still inside libusb (the device is leaving anyway) and drop
+ * whatever the bottom half would have done with it. A packet it held is failed.
+ */
+static void usb_host_slow_drain(USBHostDevice *s)
+{
+    if (!s->slow_init) {
+        return;
+    }
+    qemu_mutex_lock(&s->slow_lock);
+    while (s->slow_running) {
+        qemu_cond_wait(&s->slow_cond, &s->slow_lock);
+    }
+    s->slow_op = USB_HOST_SLOW_NONE;
+    qemu_mutex_unlock(&s->slow_lock);
+    qemu_bh_cancel(s->slow_bh);
+    if (s->slow_busy && s->slow_pkt) {
+        s->slow_pkt->status = USB_RET_NODEV;
+        usb_generic_async_ctrl_complete(USB_DEVICE(s), s->slow_pkt);
+    }
+    if (s->slow_ctl.p) {
+        s->slow_ctl.p->status = USB_RET_NODEV;
+        usb_generic_async_ctrl_complete(USB_DEVICE(s), s->slow_ctl.p);
+        s->slow_ctl.p = NULL;
+    }
+    s->slow_pkt = NULL;
+    s->slow_busy = false;
+}
+
 static void usb_host_abort_xfers(USBHostDevice *s)
 {
     USBHostRequest *r, *rtmp;
@@ -1943,6 +2143,7 @@ static int usb_host_close(USBHostDevice *s)
 
     trace_usb_host_close(s->bus_num, s->addr);
 
+    usb_host_slow_drain(s);   /* TEMP lab (QEMU_USB_HOST_SLOW_ASYNC) */
     usb_host_ahead_stop_all(s, USB_RET_NODEV);
     usb_host_abort_xfers(s);
     usb_host_ahead_free_all(s);
@@ -1988,6 +2189,13 @@ static void usb_host_exit_notifier(struct Notifier *n, void *data)
     USBHostDevice *s = container_of(n, USBHostDevice, exit);
 
     if (s->dh) {
+        if (s->slow_init) {   /* TEMP lab (QEMU_USB_HOST_SLOW_ASYNC): no reset beside the thread's */
+            qemu_mutex_lock(&s->slow_lock);
+            while (s->slow_running) {
+                qemu_cond_wait(&s->slow_cond, &s->slow_lock);
+            }
+            qemu_mutex_unlock(&s->slow_lock);
+        }
         usb_host_ahead_stop_all(s, USB_RET_NODEV);
         usb_host_abort_xfers(s);
         usb_host_release_interfaces(s);
@@ -2151,6 +2359,17 @@ static void usb_host_unrealize(USBDevice *udev)
         QTAILQ_REMOVE(&hostdevs, s, next);
     }
     usb_host_close(s);
+    if (s->slow_init) {   /* TEMP lab (QEMU_USB_HOST_SLOW_ASYNC): close drained it; stop the thread */
+        qemu_mutex_lock(&s->slow_lock);
+        s->slow_quit = true;
+        qemu_cond_broadcast(&s->slow_cond);
+        qemu_mutex_unlock(&s->slow_lock);
+        qemu_thread_join(&s->slow_thread);
+        qemu_bh_delete(s->slow_bh);
+        qemu_cond_destroy(&s->slow_cond);
+        qemu_mutex_destroy(&s->slow_lock);
+        s->slow_init = false;
+    }
 }
 
 static void usb_host_cancel_packet(USBDevice *udev, USBPacket *p)
@@ -2165,6 +2384,14 @@ static void usb_host_cancel_packet(USBDevice *udev, USBPacket *p)
 
     trace_usb_host_req_canceled(s->bus_num, s->addr, p);
 
+    if (p == s->slow_pkt) {   /* TEMP lab (QEMU_USB_HOST_SLOW_ASYNC): the operation runs on, nothing to complete */
+        s->slow_pkt = NULL;
+        return;
+    }
+    if (p == s->slow_ctl.p) {
+        s->slow_ctl.p = NULL;
+        return;
+    }
     if (s->ahead[p->ep->nr & 15] && s->ahead[p->ep->nr & 15]->parked == p) {
         s->ahead[p->ep->nr & 15]->parked = NULL;
         return;
@@ -2370,6 +2597,17 @@ static void usb_host_handle_control(USBDevice *udev, USBPacket *p,
         trace_usb_host_req_emulated(s->bus_num, s->addr, p, p->status);
         return;
     }
+    if (s->slow_busy && !s->slow_ctl.p) {
+        /* TEMP lab (QEMU_USB_HOST_SLOW_ASYNC): held until the reset or clear-halt in flight is done. */
+        s->slow_ctl.p = p;
+        s->slow_ctl.request = request;
+        s->slow_ctl.value = value;
+        s->slow_ctl.index = index;
+        s->slow_ctl.length = length;
+        s->slow_ctl.data = data;
+        p->status = USB_RET_ASYNC;
+        return;
+    }
 
     switch (request) {
     case DeviceOutRequest | USB_REQ_SET_ADDRESS:
@@ -2390,6 +2628,10 @@ static void usb_host_handle_control(USBDevice *udev, USBPacket *p,
     case EndpointOutRequest | USB_REQ_CLEAR_FEATURE:
         if (value == 0) { /* clear halt */
             int pid = (index & USB_DIR_IN) ? USB_TOKEN_IN : USB_TOKEN_OUT;
+            if (usb_host_slow_start(s, USB_HOST_SLOW_CLEAR_HALT, index, p)) {
+                p->status = USB_RET_ASYNC;   /* TEMP lab (QEMU_USB_HOST_SLOW_ASYNC) */
+                return;
+            }
             libusb_clear_halt(s->dh, index);
             usb_ep_set_halted(udev, pid, index & 0x0f, 0);
             trace_usb_host_req_emulated(s->bus_num, s->addr, p, p->status);
@@ -2454,6 +2696,12 @@ static void usb_host_handle_data(USBDevice *udev, USBPacket *p)
     if (p->ep->halted) {
         p->status = USB_RET_STALL;
         trace_usb_host_req_emulated(s->bus_num, s->addr, p, p->status);
+        return;
+    }
+    if (s->slow_busy && !usb_host_use_combining(p->ep) &&
+        usb_ep_get_type(udev, p->pid, p->ep->nr) != USB_ENDPOINT_XFER_ISOC) {
+        /* TEMP lab (QEMU_USB_HOST_SLOW_ASYNC): busy with a reset or clear-halt; the bottom half wakes the ep. */
+        p->status = USB_RET_NAK;
         return;
     }
 
@@ -2580,6 +2828,12 @@ static void usb_host_handle_reset(USBDevice *udev)
     trace_usb_host_reset(s->bus_num, s->addr);
 
     usb_host_ahead_stop_all(s, USB_RET_NODEV);
+    if (s->slow_busy) {
+        return;   /* TEMP lab (QEMU_USB_HOST_SLOW_ASYNC): the reset or clear-halt in flight covers this one */
+    }
+    if (usb_host_slow_start(s, USB_HOST_SLOW_RESET, 0, NULL)) {
+        return;
+    }
     rc = libusb_reset_device(s->dh);
     if (rc != 0) {
         usb_host_nodev(s);
