@@ -831,6 +831,7 @@ struct MemoryRegion {
     bool rom_device;
     bool flush_coalesced_mmio;
     bool lockless_io;
+    bool lab_fast_store;   /* TEMP lab: WHPX decodes plain stores into it without the BQL */
     bool unmergeable;
     uint8_t dirty_log_mask;
     bool is_iommu;
@@ -2333,6 +2334,13 @@ void memory_region_clear_flush_coalesced(MemoryRegion *mr);
  * @mr: the memory region to be updated.
  */
 void memory_region_enable_lockless_io(MemoryRegion *mr);
+
+/*
+ * TEMP lab (2026-10-14): lockless I/O whose plain register stores the WHPX vCPU loop handles without the BQL even when
+ * QEMU_WHPX_MMIO_FAST_STORE is off (that switch stays the display device's). The region's write handler must be safe
+ * without the BQL.
+ */
+void memory_region_enable_lab_fast_store(MemoryRegion *mr);
 
 /**
  * memory_region_add_eventfd: Request an eventfd to be triggered when a word

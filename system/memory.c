@@ -2580,6 +2580,12 @@ void memory_region_enable_lockless_io(MemoryRegion *mr)
     mr->disable_reentrancy_guard = true;
 }
 
+void memory_region_enable_lab_fast_store(MemoryRegion *mr)
+{
+    memory_region_enable_lockless_io(mr);
+    mr->lab_fast_store = true;
+}
+
 void memory_region_add_eventfd(MemoryRegion *mr,
                                hwaddr addr,
                                unsigned size,

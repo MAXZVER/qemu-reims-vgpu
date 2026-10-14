@@ -1496,6 +1496,7 @@ static bool whpx_mmio_fast_store(CPUState *cpu,
     mr = address_space_translate(&address_space_memory, ctx->Gpa, &xlat, &len,
                                  true, attrs);
     if (!mr->lockless_io || len < size ||
+        (!whpx_mmio_fast_store_path() && !mr->lab_fast_store) ||
         memory_access_is_direct(mr, true, attrs)) {
         return false;
     }
@@ -1540,8 +1541,7 @@ static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
 
     cpu->accel->mmio_fast = whpx_mmio_fast_path() &&
                             (whpx_mmio_fast_load(cpu, exit_ctx) ||
-                             (whpx_mmio_fast_store_path() &&
-                              whpx_mmio_fast_store(cpu, exit_ctx)));
+                             whpx_mmio_fast_store(cpu, exit_ctx));   /* gated per region inside */
     if (cpu->accel->mmio_fast) {
         if (whpx_stats_on()) {
             whpx_stats_mmio_page(ctx->Gpa);

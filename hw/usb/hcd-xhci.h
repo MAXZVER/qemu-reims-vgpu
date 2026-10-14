@@ -170,6 +170,13 @@ typedef struct XHCIInterrupter {
     unsigned int ev_buffer_put;
     unsigned int ev_buffer_get;
 
+    /*
+     * TEMP lab (QEMU_XHCI_IMOD_MIN_US): interrupt moderation. The last interrupt sent and a timer that sends the
+     * one held back until the interval has passed. Not migrated (lab).
+     */
+    int64_t mod_last_ns;
+    QEMUTimer *mod_timer;
+    struct XHCIState *mod_xhci;
 } XHCIInterrupter;
 
 typedef struct XHCIState {
@@ -223,6 +230,18 @@ typedef struct XHCIState {
     XHCIRing cmd_ring;
 
     bool nec_quirks;
+
+    /*
+     * TEMP lab (QEMU_XHCI_NOBQL=on): the runtime (interrupter) registers and the doorbells are reached from vCPU
+     * threads without the BQL. `ilock` guards every interrupter's state and the event rings; BQL before `ilock`
+     * whenever both are held. A doorbell rung without the BQL only marks `db_pending` / `db_cmd` and schedules
+     * `db_bh`, which kicks under the BQL in the main loop.
+     */
+    bool lab_nobql;
+    QemuMutex ilock;
+    QEMUBH *db_bh;
+    uint32_t db_pending[XHCI_MAXSLOTS + 1];   /* by slot id: bit n = endpoint id n */
+    int db_cmd;
 } XHCIState;
 
 extern const VMStateDescription vmstate_xhci;
