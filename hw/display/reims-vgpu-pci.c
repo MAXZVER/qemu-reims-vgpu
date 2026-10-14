@@ -169,6 +169,65 @@ struct ReimsVGPUPCIState {
 
 /* ---------- HostOps (GPA R/W + BH; Linux has no map_pages / xreg) ---------- */
 
+#if defined(_WIN32)
+#include <windows.h>
+#include <memoryapi.h>
+
+typedef PVOID (WINAPI *PFN_VirtualAlloc2)(
+    HANDLE Process,
+    PVOID BaseAddress,
+    SIZE_T Size,
+    ULONG AllocationType,
+    ULONG PageProtection,
+    MEM_EXTENDED_PARAMETER* ExtendedParameters,
+    ULONG ParameterCount
+);
+
+typedef PVOID (WINAPI *PFN_MapViewOfFile3)(
+    HANDLE FileMapping,
+    HANDLE Process,
+    PVOID BaseAddress,
+    ULONG64 Offset,
+    SIZE_T ViewSize,
+    ULONG AllocationType,
+    ULONG PageProtection,
+    MEM_EXTENDED_PARAMETER* ExtendedParameters,
+    ULONG ParameterCount
+);
+
+typedef BOOL (WINAPI *PFN_UnmapViewOfFileEx)(
+    PVOID BaseAddress,
+    ULONG UnmapFlags
+);
+
+static PFN_VirtualAlloc2 s_pfn_VirtualAlloc2 = NULL;
+static PFN_MapViewOfFile3 s_pfn_MapViewOfFile3 = NULL;
+static PFN_UnmapViewOfFileEx s_pfn_UnmapViewOfFileEx = NULL;
+static bool s_win32_mem_apis_initialized = false;
+
+static bool reims_vgpu_pci_init_win32_mem_apis(void)
+{
+    if (s_win32_mem_apis_initialized) {
+        return (s_pfn_VirtualAlloc2 != NULL &&
+                s_pfn_MapViewOfFile3 != NULL &&
+                s_pfn_UnmapViewOfFileEx != NULL);
+    }
+    HMODULE hKb = GetModuleHandleW(L"kernelbase.dll");
+    if (!hKb) {
+        hKb = LoadLibraryW(L"kernelbase.dll");
+    }
+    if (hKb) {
+        s_pfn_VirtualAlloc2 = (PFN_VirtualAlloc2)GetProcAddress(hKb, "VirtualAlloc2");
+        s_pfn_MapViewOfFile3 = (PFN_MapViewOfFile3)GetProcAddress(hKb, "MapViewOfFile3");
+        s_pfn_UnmapViewOfFileEx = (PFN_UnmapViewOfFileEx)GetProcAddress(hKb, "UnmapViewOfFileEx");
+    }
+    s_win32_mem_apis_initialized = true;
+    return (s_pfn_VirtualAlloc2 != NULL &&
+            s_pfn_MapViewOfFile3 != NULL &&
+            s_pfn_UnmapViewOfFileEx != NULL);
+}
+#endif
+
 static int reims_vgpu_pci_read_xreg(void *ctx, uint32_t index, uint64_t *out)
 {
     (void)ctx;
@@ -284,11 +343,99 @@ fail:
 
 #if defined(_WIN32)
     /*
-     * No POSIX mmap on Windows: packed aliasing views are unavailable, so every
-     * scattered GVA mapping takes the product copying rails instead.
+     * Windows WHPX memory aliasing:
+     * When guest RAM is backed by a Win32 section (CreateFileMappingW),
+     * recreate that virtual shape with VirtualAlloc2 placeholder reservation,
+     * VirtualFreeEx page splitting, and MapViewOfFile3. This is a true alias,
+     * not a copy: guest CPU writes and GPU reads address the same physical pages.
      */
-    failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_ALIAS;
-    return -1;
+    {
+        size_t total = count * page;
+        uint8_t *view;
+        ReimsVGPUPCIPageView held;
+
+        if (!reims_vgpu_pci_init_win32_mem_apis()) {
+            failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_ALIAS;
+            return -1;
+        }
+
+        view = (uint8_t *)s_pfn_VirtualAlloc2(
+            GetCurrentProcess(), NULL, total,
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+            PAGE_NOACCESS, NULL, 0);
+        if (!view) {
+            failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_RESERVATION;
+            failure->host_errno = (int)GetLastError();
+            return -1;
+        }
+
+        for (i = 0; i < count - 1; i++) {
+            if (!VirtualFreeEx(GetCurrentProcess(), view + i * page, page,
+                               MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+                failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_RESERVATION;
+                failure->host_errno = (int)GetLastError();
+                failure->page_index = i;
+                VirtualFree(view, 0, MEM_RELEASE);
+                return -1;
+            }
+        }
+
+        rcu_read_lock();
+        for (i = 0; i < count; i++) {
+            hwaddr xlat, plen = page;
+            MemoryRegion *mr;
+            uint8_t *hva;
+            RAMBlock *rb;
+            ram_addr_t rb_offset;
+            HANDLE hSec;
+            void *mapped;
+
+            mr = address_space_translate(&address_space_memory, gpas[i],
+                                         &xlat, &plen, true,
+                                         MEMTXATTRS_UNSPECIFIED);
+            if (!mr || !memory_region_is_ram(mr) || plen < page) {
+                failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_INVALID_GUEST_PAGE;
+                failure->page_index = i;
+                goto win32_alias_fail_locked;
+            }
+            hva = (uint8_t *)memory_region_get_ram_ptr(mr) + xlat;
+            rb = qemu_ram_block_from_host(hva, false, &rb_offset);
+            hSec = (HANDLE)qemu_ram_get_win32_section(rb);
+            if (!rb || !hSec) {
+                failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_ALIAS;
+                failure->page_index = i;
+                goto win32_alias_fail_locked;
+            }
+            mapped = s_pfn_MapViewOfFile3(
+                hSec, GetCurrentProcess(), view + i * page,
+                rb_offset, page,
+                MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0);
+            if (!mapped) {
+                failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_ALIAS;
+                failure->host_errno = (int)GetLastError();
+                failure->page_index = i;
+                goto win32_alias_fail_locked;
+            }
+        }
+        rcu_read_unlock();
+
+        held.ptr = view;
+        held.len = total;
+        g_array_append_val(s->page_views, held);
+        s->page_view_live_bytes += total;
+        s->page_view_live_pages += count;
+        s->page_views_created++;
+        *out_ptr = view;
+        return 0;
+
+win32_alias_fail_locked:
+        rcu_read_unlock();
+        for (size_t k = 0; k < i; k++) {
+            s_pfn_UnmapViewOfFileEx(view + k * page, 0);
+        }
+        VirtualFree(view, 0, MEM_RELEASE);
+        return -1;
+    }
 #else
     /*
      * A task GVA is linear even when its guest-physical pages are not. When
@@ -393,7 +540,16 @@ static void reims_vgpu_pci_unmap_pages(void *ctx, void *ptr, size_t len)
         if (view->ptr != ptr || view->len != len) {
             continue;
         }
-#ifndef _WIN32
+#if defined(_WIN32)
+        if (s_pfn_UnmapViewOfFileEx) {
+            size_t page_count = view->len >> REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64;
+            const size_t page_sz = (size_t)1 << REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64;
+            for (size_t k = 0; k < page_count; k++) {
+                s_pfn_UnmapViewOfFileEx((uint8_t *)view->ptr + k * page_sz, 0);
+            }
+        }
+        VirtualFree(view->ptr, 0, MEM_RELEASE);
+#else
         munmap(view->ptr, view->len);
 #endif
         s->page_view_live_bytes -= view->len;
@@ -1448,16 +1604,25 @@ static void reims_vgpu_pci_exit(PCIDevice *pdev)
     }
     reims_vgpu_pci_stop_backend(s);
     if (s->page_views) {
-#ifndef _WIN32
         size_t i;
 
         for (i = 0; i < s->page_views->len; i++) {
             ReimsVGPUPCIPageView *view =
                 &g_array_index(s->page_views, ReimsVGPUPCIPageView, i);
+#if defined(_WIN32)
+            if (s_pfn_UnmapViewOfFileEx) {
+                size_t page_count = view->len >> REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64;
+                const size_t page_sz = (size_t)1 << REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64;
+                for (size_t k = 0; k < page_count; k++) {
+                    s_pfn_UnmapViewOfFileEx((uint8_t *)view->ptr + k * page_sz, 0);
+                }
+            }
+            VirtualFree(view->ptr, 0, MEM_RELEASE);
+#else
             munmap(view->ptr, view->len);
+#endif
             s->page_views_destroyed++;
         }
-#endif
         g_array_free(s->page_views, true);
         s->page_views = NULL;
     }

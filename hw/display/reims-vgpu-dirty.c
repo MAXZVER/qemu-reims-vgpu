@@ -16,6 +16,8 @@
 #include "system/physmem.h"
 #include "system/ram_addr.h"
 #include "system/ramlist.h"
+#include "system/whpx.h"
+#include "reims-vgpu-dirty-query.h"
 
 #include "reims-vgpu-dirty.h"
 
@@ -136,6 +138,8 @@ struct ReimsVgpuDirty {
     bool od_prefetch;
     /* Signalled when an on-demand sync finishes; see claim_epoch. */
     QemuCond synced_cond;
+    /* Serializes hypervisor sync queries between foreground and background */
+    QemuMutex sync_lock;
 };
 
 static void reims_vgpu_dirty_set_free(gpointer p)
@@ -152,6 +156,7 @@ ReimsVgpuDirty *reims_vgpu_dirty_new(void)
     ReimsVgpuDirty *d = g_new0(ReimsVgpuDirty, 1);
 
     qemu_mutex_init(&d->lock);
+    qemu_mutex_init(&d->sync_lock);
     qemu_cond_init(&d->synced_cond);
     d->sets = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free,
                                     reims_vgpu_dirty_set_free);
@@ -184,6 +189,7 @@ void reims_vgpu_dirty_free(ReimsVgpuDirty *d)
     }
     g_free(d->page_seq);
     qemu_cond_destroy(&d->synced_cond);
+    qemu_mutex_destroy(&d->sync_lock);
     qemu_mutex_destroy(&d->lock);
     g_free(d);
 }
@@ -308,7 +314,19 @@ void reims_vgpu_dirty_untrack(ReimsVgpuDirty *d, uint64_t token)
 
 /* Bounded host-query diagnostics. These parent/child times must not be summed. */
 static uint64_t profile_calls, profile_total, profile_wait, profile_plan;
+static uint64_t profile_fg_calls, profile_fg_us, profile_fg_max;
+static uint64_t profile_claim_waits, profile_claim_us, profile_claim_max;
+static uint64_t profile_bg_calls, profile_bg_us, profile_bg_max;
 static uint64_t profile_query, profile_finish, profile_pages, profile_ranges, profile_last;
+static void profile_max(uint64_t *value, uint64_t sample)
+{
+    uint64_t old = qatomic_read(value);
+    while (sample > old) {
+        uint64_t found = qatomic_cmpxchg(value, old, sample);
+        if (found == old) { break; }
+        old = found;
+    }
+}
 static void reims_vgpu_dirty_profile(void)
 {
     uint64_t now = g_get_monotonic_time();
@@ -318,19 +336,28 @@ static void reims_vgpu_dirty_profile(void)
     }
     fprintf(stderr, "REIMS_DIRTY_PROFILE calls=%" PRIu64 " total_us=%" PRIu64
             " wait_us=%" PRIu64 " plan_us=%" PRIu64 " query_us=%" PRIu64
-            " finish_us=%" PRIu64 " pages=%" PRIu64 " ranges=%" PRIu64 "\n",
+            " finish_us=%" PRIu64 " pages=%" PRIu64 " ranges=%" PRIu64
+            " mono_us=%" PRIu64 " fg_calls=%" PRIu64 " fg_us=%" PRIu64
+            " fg_max_us=%" PRIu64 " claim_waits=%" PRIu64 " claim_us=%" PRIu64
+            " claim_max_us=%" PRIu64 " bg_calls=%" PRIu64 " bg_us=%" PRIu64
+            " bg_max_us=%" PRIu64 "\n",
             qatomic_xchg(&profile_calls, 0), qatomic_xchg(&profile_total, 0),
             qatomic_xchg(&profile_wait, 0), qatomic_xchg(&profile_plan, 0),
             qatomic_xchg(&profile_query, 0), qatomic_xchg(&profile_finish, 0),
-            qatomic_xchg(&profile_pages, 0), qatomic_xchg(&profile_ranges, 0));
+            qatomic_xchg(&profile_pages, 0), qatomic_xchg(&profile_ranges, 0), now,
+            qatomic_xchg(&profile_fg_calls, 0), qatomic_xchg(&profile_fg_us, 0),
+            qatomic_xchg(&profile_fg_max, 0), qatomic_xchg(&profile_claim_waits, 0),
+            qatomic_xchg(&profile_claim_us, 0), qatomic_xchg(&profile_claim_max, 0),
+            qatomic_xchg(&profile_bg_calls, 0), qatomic_xchg(&profile_bg_us, 0),
+            qatomic_xchg(&profile_bg_max, 0));
 }
 
-static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token);
+static void reims_vgpu_dirty_sync_sets(ReimsVgpuDirty *d, uint64_t target_token);
 
 uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token)
 {
     ReimsVgpuDirtySet *s;
-    uint64_t gen = 0;
+    uint64_t gen = 0, started = g_get_monotonic_time();
     bool stale;
 
     if (!d || token == 0) {
@@ -338,19 +365,27 @@ uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token)
     }
     qemu_mutex_lock(&d->lock);
     s = g_hash_table_lookup(d->sets, &token);
-    stale = s && d->ondemand && s->synced_epoch < d->epoch;
-    qemu_mutex_unlock(&d->lock);
-    if (stale) {
-        reims_vgpu_dirty_sync_one(d, token);
+    if (!s) {
+        qemu_mutex_unlock(&d->lock);
+        return 0;
     }
-    qemu_mutex_lock(&d->lock);
-    s = g_hash_table_lookup(d->sets, &token);
+    stale = d->ondemand && s->synced_epoch < d->epoch;
+    if (stale) {
+        qemu_mutex_unlock(&d->lock);
+        reims_vgpu_dirty_sync_sets(d, token);
+        qemu_mutex_lock(&d->lock);
+        s = g_hash_table_lookup(d->sets, &token);
+    }
     if (s) {
         gen = s->gen;
         s->last_query_epoch = d->epoch;
     }
     d->reads_since_harvest++;
     qemu_mutex_unlock(&d->lock);
+    uint64_t elapsed = g_get_monotonic_time() - started;
+    qatomic_fetch_add(&profile_fg_calls, 1);
+    qatomic_fetch_add(&profile_fg_us, elapsed);
+    profile_max(&profile_fg_max, elapsed);
     reims_vgpu_dirty_profile();
     return gen;
 }
@@ -374,7 +409,7 @@ int64_t reims_vgpu_dirty_written_since(ReimsVgpuDirty *d, uint64_t token,
          * miss what the guest wrote since; bring the set up to date first.
          */
         qemu_mutex_unlock(&d->lock);
-        reims_vgpu_dirty_sync_one(d, token);
+        reims_vgpu_dirty_sync_sets(d, token);
         qemu_mutex_lock(&d->lock);
         s = g_hash_table_lookup(d->sets, &token);
     }
@@ -591,7 +626,9 @@ static void reims_vgpu_dirty_consume_set(ReimsVgpuDirty *d,
             }
             reims_vgpu_dirty_page_seq_cover(d, pfn + 1);
             d->page_seq[pfn] = ++d->global_seq;
-            g_array_append_val(written, rec);
+            if (written) {
+                g_array_append_val(written, rec);
+            }
         }
     }
 }
@@ -779,7 +816,10 @@ static void reims_vgpu_dirty_clear_written(GArray *written,
  * pages, ~12 ms a harvest, against ~3M pages and ~35 ms for all of RAM; 1024
  * measured no better.
  */
-#define REIMS_VGPU_DIRTY_SYNC_GAP_PAGES 256
+static uint64_t reims_vgpu_dirty_sync_gap_pages(void)
+{
+    return 256;
+}
 
 /*
  * Bring the dirty bitmap up to date for the tracked pages, not all of RAM.
@@ -890,7 +930,8 @@ static void reims_vgpu_dirty_sync_tracked(ReimsVgpuDirty *d,
                 for (;;) {
                     next = find_next_bit(d->sync_pages, end, last + 1);
                     if (next >= end ||
-                        next - last - 1 > REIMS_VGPU_DIRTY_SYNC_GAP_PAGES) {
+                        !reims_dirty_query_joins(last + 1, next,
+                            reims_vgpu_dirty_sync_gap_pages())) {
                         break;
                     }
                     last = next;
@@ -956,7 +997,9 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
     qemu_mutex_unlock(&d->lock);
 
     /* One sync covering every tracked page, then only reads. */
+    qemu_mutex_lock(&d->sync_lock);
     reims_vgpu_dirty_sync_tracked(d, slices, n, NULL);
+    qemu_mutex_unlock(&d->sync_lock);
 
     written = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyWritten));
     /*
@@ -1061,45 +1104,67 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
  * The set's page list is copied out under the lock and re-looked-up after the
  * sync, so an untrack meanwhile is an answer rather than a use after free.
  */
-static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token)
+static void reims_vgpu_dirty_sync_sets(ReimsVgpuDirty *d, uint64_t target_token)
 {
-    const int shift = qemu_target_page_bits();
     ReimsVgpuDirtySlice *slices = NULL;
     int cap = 0, n, i;
-    ReimsVgpuDirtySet *s;
-    g_autofree uint64_t *pages = NULL;
-    g_autoptr(GArray) ranges = NULL;
-    g_autoptr(GArray) written = NULL;
+    ReimsVgpuDirtySet *target_set;
+    g_autoptr(GArray) tokens = NULL;
     g_autoptr(GArray) hit = NULL;
-    size_t count, p;
-    uint64_t page_size, epoch;
-    uint64_t started = g_get_monotonic_time(), waited, planned, query_us = 0, range_count = 0;
+    GHashTableIter it;
+    gpointer key, val;
+    uint64_t epoch, claim_started = 0;
+    uint64_t started = g_get_monotonic_time(), waited, planned, finished, pages = 0;
+    guint t;
 
     qemu_mutex_lock(&d->lock);
-    s = g_hash_table_lookup(d->sets, &token);
-    if (!s) {
+    target_set = g_hash_table_lookup(d->sets, &target_token);
+    if (!target_set) {
         qemu_mutex_unlock(&d->lock);
         return;
     }
     epoch = d->epoch;
     /*
-     * Up to date already, or being brought up to date for this epoch by the
-     * other thread (drain or prefetch): wait for that one rather than repeat
-     * its hypervisor calls. The claimant holds no lock while it syncs.
+     * Up to date already, or being brought up to date for this epoch by
+     * another thread: wait for that one rather than repeat its hypervisor calls.
      */
-    while (s && s->synced_epoch < epoch && s->claim_epoch >= epoch) {
+    while (target_set && target_set->synced_epoch < epoch && target_set->claim_epoch >= epoch) {
+        if (!claim_started) { claim_started = g_get_monotonic_time(); }
         qemu_cond_wait(&d->synced_cond, &d->lock);
-        s = g_hash_table_lookup(d->sets, &token);
+        target_set = g_hash_table_lookup(d->sets, &target_token);
     }
-    if (!s || s->synced_epoch >= epoch) {
+    if (claim_started) {
+        uint64_t elapsed = g_get_monotonic_time() - claim_started;
+        qatomic_fetch_add(&profile_claim_waits, 1);
+        qatomic_fetch_add(&profile_claim_us, elapsed);
+        profile_max(&profile_claim_max, elapsed);
+    }
+    if (!target_set || target_set->synced_epoch >= epoch) {
         qemu_mutex_unlock(&d->lock);
         return;
     }
     waited = g_get_monotonic_time();
-    s->claim_epoch = epoch;
-    count = s->count;
-    page_size = s->page_size;
-    pages = g_memdup2(s->pages, count * sizeof(uint64_t));
+
+    /* Target set is confirmed stale and unclaimed for this epoch. Claim it. */
+    target_set->claim_epoch = epoch;
+    tokens = g_array_new(FALSE, FALSE, sizeof(uint64_t));
+    g_array_append_val(tokens, target_token);
+    pages += target_set->count;
+
+    /* Batch-claim all other active stale sets */
+    g_hash_table_iter_init(&it, d->sets);
+    while (g_hash_table_iter_next(&it, &key, &val)) {
+        uint64_t tok = *(const uint64_t *)key;
+        ReimsVgpuDirtySet *set = val;
+        if (tok != target_token &&
+            set->synced_epoch < epoch &&
+            set->last_query_epoch + 2 >= epoch &&
+            set->claim_epoch == 0) {
+            set->claim_epoch = epoch;
+            g_array_append_val(tokens, tok);
+            pages += set->count;
+        }
+    }
     qemu_mutex_unlock(&d->lock);
 
     n = reims_vgpu_dirty_ram_slices_into(&slices, &cap);
@@ -1109,86 +1174,48 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token)
     }
     qemu_mutex_unlock(&d->lock);
 
-    /* Contiguous runs of this set's pages, per logged region. */
-    ranges = g_array_new(FALSE, FALSE, sizeof(MemoryRegionRange));
-    for (i = 0; i < n; i++) {
-        const ReimsVgpuDirtySlice *sl = &slices[i];
-        bool seen = false;
-        int j;
-
-        for (j = 0; j < i; j++) {
-            seen |= slices[j].logged && slices[j].mr == sl->mr;
-        }
-        if (!sl->logged || seen) {
-            continue;
-        }
-        g_array_set_size(ranges, 0);
-        for (j = i; j < n; j++) {
-            const ReimsVgpuDirtySlice *sj = &slices[j];
-            MemoryRegionRange r = { 0, 0 };
-            bool open = false;
-
-            if (!sj->logged || sj->mr != sl->mr) {
-                continue;
-            }
-            for (p = 0; p < count; p++) {
-                uint64_t gpa = pages[p];
-
-                if (gpa < sj->gpa || gpa - sj->gpa >= sj->len) {
-                    continue;
-                }
-                if (open && r.start + r.len + REIMS_VGPU_DIRTY_SYNC_GAP_PAGES *
-                    (1ULL << shift) >= sj->offset + (gpa - sj->gpa)) {
-                    r.len = sj->offset + (gpa - sj->gpa) + page_size - r.start;
-                    continue;
-                }
-                if (open) {
-                    g_array_append_val(ranges, r);
-                }
-                r.start = sj->offset + (gpa - sj->gpa);
-                r.len = page_size;
-                open = true;
-            }
-            if (open) {
-                g_array_append_val(ranges, r);
-            }
-        }
-        planned = g_get_monotonic_time();
-        range_count += ranges->len;
-        memory_region_sync_dirty_ranges(sl->mr,
-                                        &g_array_index(ranges,
-                                                       MemoryRegionRange, 0),
-                                        ranges->len);
-        query_us += g_get_monotonic_time() - planned;
-    }
-
     planned = g_get_monotonic_time();
-    written = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyWritten));
+    qemu_mutex_lock(&d->sync_lock);
+    reims_vgpu_dirty_sync_tracked(d, slices, n, tokens);
+    qemu_mutex_unlock(&d->sync_lock);
+    finished = g_get_monotonic_time();
+
     hit = g_array_new(FALSE, FALSE, sizeof(size_t));
     qemu_mutex_lock(&d->lock);
-    s = g_hash_table_lookup(d->sets, &token);
-    if (s) {
-        reims_vgpu_dirty_consume_set(d, s, slices, n, written);
-        if (reims_vgpu_dirty_eval_set(d, s, slices, n, hit, false)) {
+    /* Consume before evaluating: overlapping sets share page_seq, so one
+     * consuming a bit must not make a peer's generation appear clean. */
+    for (t = 0; t < tokens->len; t++) {
+        uint64_t tok = g_array_index(tokens, uint64_t, t);
+        ReimsVgpuDirtySet *set = g_hash_table_lookup(d->sets, &tok);
+        if (set) {
+            reims_vgpu_dirty_consume_set(d, set, slices, n, NULL);
+        }
+    }
+    for (t = 0; t < tokens->len; t++) {
+        uint64_t tok = g_array_index(tokens, uint64_t, t);
+        ReimsVgpuDirtySet *set = g_hash_table_lookup(d->sets, &tok);
+        if (!set) {
+            continue; /* Untracked during the query; never dereference it. */
+        }
+        if (reims_vgpu_dirty_eval_set(d, set, slices, n, hit, false)) {
             d->log_wanted = true;
         }
-        s->synced_epoch = MAX(s->synced_epoch, epoch);
-        if (s->claim_epoch == epoch) {
-            s->claim_epoch = 0;
+        set->synced_epoch = MAX(set->synced_epoch, epoch);
+        if (set->claim_epoch == epoch) {
+            set->claim_epoch = 0;
         }
     }
     qemu_cond_broadcast(&d->synced_cond);
     qemu_mutex_unlock(&d->lock);
-    reims_vgpu_dirty_clear_written(written, slices, n);
+
     g_free(slices);
+
     qatomic_fetch_add(&profile_calls, 1);
     qatomic_fetch_add(&profile_total, g_get_monotonic_time() - started);
     qatomic_fetch_add(&profile_wait, waited - started);
-    qatomic_fetch_add(&profile_plan, planned - waited - query_us);
-    qatomic_fetch_add(&profile_query, query_us);
-    qatomic_fetch_add(&profile_finish, g_get_monotonic_time() - planned);
-    qatomic_fetch_add(&profile_pages, count);
-    qatomic_fetch_add(&profile_ranges, range_count);
+    qatomic_fetch_add(&profile_plan, planned - waited);
+    qatomic_fetch_add(&profile_finish, g_get_monotonic_time() - finished);
+    qatomic_fetch_add(&profile_pages, pages);
 }
 
 void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
@@ -1284,9 +1311,9 @@ void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
     }
     qemu_mutex_unlock(&d->lock);
     planned = g_get_monotonic_time();
-    /* The background worker alone owns sync_pages/sync_ranges. Query the
-     * union once, retaining the existing coalescing and dirty-bit deposit. */
+    qemu_mutex_lock(&d->sync_lock);
     reims_vgpu_dirty_sync_tracked(d, slices, n, tokens);
+    qemu_mutex_unlock(&d->sync_lock);
     finished = g_get_monotonic_time();
     written = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyWritten));
     hit = g_array_new(FALSE, FALSE, sizeof(size_t));
@@ -1325,4 +1352,8 @@ void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
     qatomic_fetch_add(&profile_plan, planned - started);
     qatomic_fetch_add(&profile_finish, g_get_monotonic_time() - finished);
     qatomic_fetch_add(&profile_pages, pages);
+    uint64_t elapsed = g_get_monotonic_time() - started;
+    qatomic_fetch_add(&profile_bg_calls, 1);
+    qatomic_fetch_add(&profile_bg_us, elapsed);
+    profile_max(&profile_bg_max, elapsed);
 }

@@ -1937,6 +1937,15 @@ int qemu_ram_get_fd(const RAMBlock *rb)
     return rb->fd;
 }
 
+void *qemu_ram_get_win32_section(const RAMBlock *rb)
+{
+#if defined(_WIN32)
+    return rb ? rb->win32_section : NULL;
+#else
+    return NULL;
+#endif
+}
+
 /* Called with the BQL held.  */
 void qemu_ram_set_idstr(RAMBlock *new_block, const char *name, DeviceState *dev)
 {
@@ -2177,6 +2186,41 @@ static void ram_block_add(RAMBlock *new_block, Error **errp)
                 return;
             }
         } else {
+#if defined(_WIN32)
+            DWORD hi = (DWORD)(new_block->max_length >> 32);
+            DWORD lo = (DWORD)(new_block->max_length & 0xFFFFFFFF);
+            new_block->win32_section = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL,
+                                                          PAGE_READWRITE, hi, lo, NULL);
+            if (new_block->win32_section) {
+                new_block->host = MapViewOfFile(new_block->win32_section,
+                                                FILE_MAP_ALL_ACCESS, 0, 0,
+                                                new_block->max_length);
+                if (!new_block->host) {
+                    CloseHandle((HANDLE)new_block->win32_section);
+                    new_block->win32_section = NULL;
+                } else {
+                    new_block->flags |= RAM_SHARED;
+                    if (new_block->mr) {
+                        new_block->mr->align = QEMU_VMALLOC_ALIGN;
+                    }
+                    free_on_error = true;
+                }
+            }
+            if (!new_block->host) {
+                new_block->host = qemu_anon_ram_alloc(new_block->max_length,
+                                                      &new_block->mr->align,
+                                                      shared, noreserve);
+                if (!new_block->host) {
+                    error_setg_errno(errp, errno,
+                                     "cannot set up guest memory '%s'",
+                                     memory_region_name(new_block->mr));
+                    qemu_mutex_unlock_ramlist();
+                    return;
+                }
+                memory_try_enable_merging(new_block->host, new_block->max_length);
+                free_on_error = true;
+            }
+#else
             new_block->host = qemu_anon_ram_alloc(new_block->max_length,
                                                   &new_block->mr->align,
                                                   shared, noreserve);
@@ -2189,6 +2233,7 @@ static void ram_block_add(RAMBlock *new_block, Error **errp)
             }
             memory_try_enable_merging(new_block->host, new_block->max_length);
             free_on_error = true;
+#endif
         }
     }
 
@@ -2298,7 +2343,17 @@ static void ram_block_add(RAMBlock *new_block, Error **errp)
 
 out_free:
     if (free_on_error) {
+#if defined(_WIN32)
+        if (new_block->win32_section) {
+            UnmapViewOfFile(new_block->host);
+            CloseHandle((HANDLE)new_block->win32_section);
+            new_block->win32_section = NULL;
+        } else {
+            qemu_anon_ram_free(new_block->host, new_block->max_length);
+        }
+#else
         qemu_anon_ram_free(new_block->host, new_block->max_length);
+#endif
         new_block->host = NULL;
     }
 }
@@ -2587,7 +2642,17 @@ static void reclaim_ramblock(RAMBlock *block)
         close(block->fd);
 #endif
     } else {
+#if defined(_WIN32)
+        if (block->win32_section) {
+            UnmapViewOfFile(block->host);
+            CloseHandle((HANDLE)block->win32_section);
+            block->win32_section = NULL;
+        } else {
+            qemu_anon_ram_free(block->host, block->max_length);
+        }
+#else
         qemu_anon_ram_free(block->host, block->max_length);
+#endif
     }
 
     if (block->guest_memfd >= 0) {

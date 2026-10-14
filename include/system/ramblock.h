@@ -40,6 +40,9 @@ struct RAMBlock {
     Error *cpr_blocker;
     int fd;
     uint64_t fd_offset;
+#if defined(_WIN32)
+    void *win32_section;
+#endif
     int guest_memfd;
     RamBlockAttributes *attributes;
     size_t page_size;
@@ -172,6 +175,7 @@ void qemu_ram_set_migratable(RAMBlock *rb);
 void qemu_ram_unset_migratable(RAMBlock *rb);
 bool qemu_ram_is_named_file(const RAMBlock *rb);
 int qemu_ram_get_fd(const RAMBlock *rb);
+void *qemu_ram_get_win32_section(const RAMBlock *rb);
 
 size_t qemu_ram_pagesize(const RAMBlock *block);
 size_t qemu_ram_pagesize_largest(void);
