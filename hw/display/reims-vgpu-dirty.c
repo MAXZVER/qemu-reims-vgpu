@@ -3051,6 +3051,11 @@ static void reims_vgpu_dirty_wp_bridged_prune(ReimsVgpuDirty *d)
         }
     }
     g_array_set_size(d->wp_bridged, keep);
+    if (keep >= 32768) {
+        /* Still long: the older half goes back writable (orphans), so the next prune is far off again. */
+        g_array_append_vals(d->wp_orphans, d->wp_bridged->data, keep / 2);
+        g_array_remove_range(d->wp_bridged, 0, keep / 2);
+    }
 }
 
 /* TEMP lab DIRTY_WP_MERGE: the runs of `s` from page index `p` on, into `wp_merge_runs`. */
