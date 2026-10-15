@@ -124,7 +124,8 @@ static bool qemu_win_wp_view_on(void)
     if (on < 0) {
         const char *e = getenv("QEMU_WHPX_WP_VIEW");
 
-        on = e && strcmp(e, "on") == 0;
+        /* On by default since b476 (canvas 5K 56.9 -> 66.4 fps, no 16 s warm-up); `=off` restores. */
+        on = !(e && strcmp(e, "off") == 0);
     }
     return on;
 }

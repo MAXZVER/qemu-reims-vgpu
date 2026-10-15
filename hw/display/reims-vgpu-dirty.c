@@ -8406,7 +8406,7 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
             /* 1 s plus 2 ms a run (its protect and give-back cost ~0.7 ms); the stress rows use 0. */
             d->wp_age_ms = 1000;
             d->wp_age_run_us = 2000;
-            if (getenv("QEMU_WHPX_WP_VIEW") && strcmp(getenv("QEMU_WHPX_WP_VIEW"), "on") == 0) {
+            if (!(getenv("QEMU_WHPX_WP_VIEW") && strcmp(getenv("QEMU_WHPX_WP_VIEW"), "off") == 0)) {
                 /*
                  * TEMP lab (QEMU_WHPX_WP_VIEW): the per-run part stood for a run's protect and give-back price
                  * (~0.7 ms through the GPA map); through the view's page protection it is microseconds.
