@@ -97,5 +97,22 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on);
 bool reims_vgpu_dirty_note_doorbell(ReimsVgpuDirty *d);
 /* The harvest thread's job: a full harvest, or the on-demand prefetch. */
 void reims_vgpu_dirty_background(ReimsVgpuDirty *d);
+/*
+ * Monotonic dirty sync / harvest epoch. Advances when a sync or harvest
+ * completes (foreground on-demand syncs, background prefetch, full harvests);
+ * doorbells do not advance it. Profiling only: never a cache key.
+ * Safe from any thread.
+ */
+uint64_t reims_vgpu_dirty_sync_epoch(ReimsVgpuDirty *d);
+/*
+ * Monotonic doorbell (observation) epoch: advances, with release semantics,
+ * whenever guest stores become visible to the device — at every
+ * reims_vgpu_dirty_note_doorbell in on-demand mode, and at every completed
+ * harvest fold in harvest mode. Read with acquire semantics. Starts at 1. A
+ * generation read bracketed by two equal values of this is complete for every
+ * store made visible up to it. 0 (null tracker only) must not be used as a
+ * cache key. Safe from any thread.
+ */
+uint64_t reims_vgpu_dirty_observation_epoch(ReimsVgpuDirty *d);
 
 #endif /* REIMS_VGPU_DIRTY_H */

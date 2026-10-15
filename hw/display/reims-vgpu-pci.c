@@ -1019,6 +1019,27 @@ static int reims_vgpu_pci_harvests_settled(void *ctx)
     return settled;
 }
 
+/*
+ * HostOps dirty_sync_epoch (ABI v22): monotonic count of dirty sync events.
+ */
+static uint64_t reims_vgpu_pci_dirty_sync_epoch(void *ctx)
+{
+    ReimsVGPUPCIState *s = ctx;
+
+    return reims_vgpu_dirty_sync_epoch(s->dirty);
+}
+
+/*
+ * HostOps dirty_observation_epoch (ABI v23): the doorbell epoch, the one key a
+ * cached currency verdict may be held under. 0 when no doorbell is noted.
+ */
+static uint64_t reims_vgpu_pci_dirty_observation_epoch(void *ctx)
+{
+    ReimsVGPUPCIState *s = ctx;
+
+    return reims_vgpu_dirty_observation_epoch(s->dirty);
+}
+
 /* Every harvest asked for before this call has completed, or we stop. */
 static void reims_vgpu_pci_wait_harvest(ReimsVGPUPCIState *s)
 {
@@ -1457,6 +1478,8 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         .guest_written_pages = reims_vgpu_pci_guest_written_pages,
         .page_alias_census = reims_vgpu_pci_page_alias_census,
         .harvests_settled = reims_vgpu_pci_harvests_settled,
+        .dirty_sync_epoch = reims_vgpu_pci_dirty_sync_epoch,
+        .dirty_observation_epoch = reims_vgpu_pci_dirty_observation_epoch,
     };
     s->dirty = reims_vgpu_dirty_new();
 

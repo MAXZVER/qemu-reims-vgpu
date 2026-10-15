@@ -129,7 +129,16 @@ struct ReimsVgpuDirty {
      */
     bool ondemand;
     bool log_wanted;
+    /*
+     * The doorbell (observation) epoch. Advanced only by note_doorbell, with a
+     * release store under `lock`; read lock-free with an acquire by
+     * reims_vgpu_dirty_observation_epoch. `sync_epoch` counts completed syncs
+     * and harvests and is for profiling only. Starts at 1. In harvest
+     * (non-on-demand) mode, reims_vgpu_dirty_harvest advances it instead,
+     * since no doorbell is noted there.
+     */
     uint64_t epoch;
+    uint64_t sync_epoch;
     /*
      * Prefetch (REIMS_VGPU_DIRTY_OD_PREFETCH=off turns it off): at each
      * doorbell the harvest thread syncs the sets read in the last two epochs,
@@ -161,6 +170,15 @@ ReimsVgpuDirty *reims_vgpu_dirty_new(void)
     d->sets = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free,
                                     reims_vgpu_dirty_set_free);
     d->logged = g_hash_table_new(NULL, NULL);
+    d->sync_epoch = 1;
+    /*
+     * The observation epoch starts at 1, like sync_epoch: 0 is the "no
+     * observation epoch" answer, which the device never caches under. A fresh
+     * set (synced_epoch 0) is therefore stale from the start, so in on-demand
+     * mode its first generation read syncs and arms it — what
+     * reims_vgpu_dirty_track already expects.
+     */
+    d->epoch = 1;
     return d;
 }
 
@@ -295,6 +313,9 @@ uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
      */
     s->arm_at = d->harvests + 1;
     s->seen_seq = d->global_seq;
+    /* Do not set s->synced_epoch = d->epoch or s->gen = 1 here.
+     * The first reims_vgpu_dirty_gen query will sync WHPX for this
+     * token and properly arm s->gen = 1 via reims_vgpu_dirty_eval_set. */
     d->next_token++;
     token = d->next_token;
     g_hash_table_insert(d->sets, g_memdup2(&token, sizeof(token)), s);
@@ -1028,6 +1049,21 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
         reims_vgpu_dirty_eval_set(d, set, slices, n, hit, true);
         set->synced_epoch = MAX(set->synced_epoch, epoch);
     }
+    if (!d->ondemand) {
+        /*
+         * Harvest (non-on-demand) mode notes no doorbells: the harvest is what
+         * makes guest stores visible, so it is what advances the observation
+         * epoch. Advanced here, in the same d->lock critical section that
+         * folds the new generations, and not at the start of the harvest: a
+         * reader bracketing a generation read with two epoch reads could
+         * otherwise see the bumped epoch on both sides of a pre-fold
+         * generation and hold that stale answer under the new epoch. Here a
+         * read that saw the pre-fold generation either saw the old epoch too,
+         * or sees the epoch move and retries. The on-demand epoch belongs to
+         * note_doorbell and is not touched (synced_epoch compares against it).
+         */
+        qatomic_store_release(&d->epoch, d->epoch + 1);
+    }
     qemu_mutex_unlock(&d->lock);
 
     /*
@@ -1090,6 +1126,8 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
     }
     qemu_mutex_lock(&d->lock);
     d->log_wanted = false;
+    qatomic_inc(&d->sync_epoch);
+    qemu_cond_broadcast(&d->synced_cond);
     qemu_mutex_unlock(&d->lock);
 }
 
@@ -1110,9 +1148,8 @@ static void reims_vgpu_dirty_sync_sets(ReimsVgpuDirty *d, uint64_t target_token)
     int cap = 0, n, i;
     ReimsVgpuDirtySet *target_set;
     g_autoptr(GArray) tokens = NULL;
+    g_autoptr(GArray) written = NULL;
     g_autoptr(GArray) hit = NULL;
-    GHashTableIter it;
-    gpointer key, val;
     uint64_t epoch, claim_started = 0;
     uint64_t started = g_get_monotonic_time(), waited, planned, finished, pages = 0;
     guint t;
@@ -1145,26 +1182,13 @@ static void reims_vgpu_dirty_sync_sets(ReimsVgpuDirty *d, uint64_t target_token)
     }
     waited = g_get_monotonic_time();
 
-    /* Target set is confirmed stale and unclaimed for this epoch. Claim it. */
+    /* Target set is confirmed stale and unclaimed for this epoch. Claim ONLY
+     * the target set on the foreground drain thread so we don't stall frame
+     * encoding with a 60k-page batch WHPX query; background prefetch handles batches. */
     target_set->claim_epoch = epoch;
     tokens = g_array_new(FALSE, FALSE, sizeof(uint64_t));
     g_array_append_val(tokens, target_token);
     pages += target_set->count;
-
-    /* Batch-claim all other active stale sets */
-    g_hash_table_iter_init(&it, d->sets);
-    while (g_hash_table_iter_next(&it, &key, &val)) {
-        uint64_t tok = *(const uint64_t *)key;
-        ReimsVgpuDirtySet *set = val;
-        if (tok != target_token &&
-            set->synced_epoch < epoch &&
-            set->last_query_epoch + 2 >= epoch &&
-            set->claim_epoch == 0) {
-            set->claim_epoch = epoch;
-            g_array_append_val(tokens, tok);
-            pages += set->count;
-        }
-    }
     qemu_mutex_unlock(&d->lock);
 
     n = reims_vgpu_dirty_ram_slices_into(&slices, &cap);
@@ -1180,6 +1204,7 @@ static void reims_vgpu_dirty_sync_sets(ReimsVgpuDirty *d, uint64_t target_token)
     qemu_mutex_unlock(&d->sync_lock);
     finished = g_get_monotonic_time();
 
+    written = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyWritten));
     hit = g_array_new(FALSE, FALSE, sizeof(size_t));
     qemu_mutex_lock(&d->lock);
     /* Consume before evaluating: overlapping sets share page_seq, so one
@@ -1188,7 +1213,7 @@ static void reims_vgpu_dirty_sync_sets(ReimsVgpuDirty *d, uint64_t target_token)
         uint64_t tok = g_array_index(tokens, uint64_t, t);
         ReimsVgpuDirtySet *set = g_hash_table_lookup(d->sets, &tok);
         if (set) {
-            reims_vgpu_dirty_consume_set(d, set, slices, n, NULL);
+            reims_vgpu_dirty_consume_set(d, set, slices, n, written);
         }
     }
     for (t = 0; t < tokens->len; t++) {
@@ -1205,9 +1230,11 @@ static void reims_vgpu_dirty_sync_sets(ReimsVgpuDirty *d, uint64_t target_token)
             set->claim_epoch = 0;
         }
     }
+    qatomic_inc(&d->sync_epoch);
     qemu_cond_broadcast(&d->synced_cond);
     qemu_mutex_unlock(&d->lock);
 
+    reims_vgpu_dirty_clear_written(written, slices, n);
     g_free(slices);
 
     qatomic_fetch_add(&profile_calls, 1);
@@ -1248,7 +1275,15 @@ bool reims_vgpu_dirty_note_doorbell(ReimsVgpuDirty *d)
         return false;
     }
     qemu_mutex_lock(&d->lock);
-    d->epoch++;
+    /*
+     * Release: pairs with the acquire in reims_vgpu_dirty_observation_epoch, so
+     * a reader that sees this epoch also sees every tracker write ordered
+     * before it. Written only here and only under d->lock, so the plain reads
+     * of d->epoch elsewhere under the lock stay exact. The doorbell does not
+     * touch sync_epoch: that counts completed syncs, for profiling only, and is
+     * not a cache key.
+     */
+    qatomic_store_release(&d->epoch, d->epoch + 1);
     want = d->log_wanted || g_hash_table_size(d->logged) == 0 || d->od_prefetch;
     qemu_mutex_unlock(&d->lock);
     return want;
@@ -1263,15 +1298,11 @@ bool reims_vgpu_dirty_note_doorbell(ReimsVgpuDirty *d)
 void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
 {
     g_autoptr(GArray) tokens = NULL;
-    g_autoptr(GArray) written = NULL;
-    g_autoptr(GArray) hit = NULL;
-    ReimsVgpuDirtySlice *slices = NULL;
     GHashTableIter it;
     gpointer key, val;
-    uint64_t epoch, started, planned, finished, pages = 0;
+    uint64_t epoch, started;
     bool full;
     guint t;
-    int cap = 0, n, i;
 
     if (!d) {
         return;
@@ -1293,10 +1324,6 @@ void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
         ReimsVgpuDirtySet *set = val;
         if (set->synced_epoch < epoch && set->last_query_epoch + 2 >= epoch &&
             set->claim_epoch == 0) {
-            /* Same ownership as sync_one: a drain querying these sets waits
-             * for the claim. Never take a claim another sync already owns. */
-            set->claim_epoch = epoch;
-            pages += set->count;
             g_array_append_val(tokens, *(uint64_t *)key);
         }
     }
@@ -1304,56 +1331,39 @@ void reims_vgpu_dirty_background(ReimsVgpuDirty *d)
     if (tokens->len == 0) {
         return;
     }
-    n = reims_vgpu_dirty_ram_slices_into(&slices, &cap);
-    qemu_mutex_lock(&d->lock);
-    for (i = 0; i < n; i++) {
-        slices[i].logged = g_hash_table_contains(d->logged, slices[i].mr);
-    }
-    qemu_mutex_unlock(&d->lock);
-    planned = g_get_monotonic_time();
-    qemu_mutex_lock(&d->sync_lock);
-    reims_vgpu_dirty_sync_tracked(d, slices, n, tokens);
-    qemu_mutex_unlock(&d->sync_lock);
-    finished = g_get_monotonic_time();
-    written = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyWritten));
-    hit = g_array_new(FALSE, FALSE, sizeof(size_t));
-    qemu_mutex_lock(&d->lock);
-    /* Consume before evaluating: overlapping sets share page_seq, so one
-     * consuming a bit must not make a peer's generation appear clean. */
+
+    /* Sync one token at a time so the foreground drain thread never blocks
+     * behind a multi-surface 35 ms WHPX batch query. */
     for (t = 0; t < tokens->len; t++) {
-        uint64_t token = g_array_index(tokens, uint64_t, t);
-        ReimsVgpuDirtySet *set = g_hash_table_lookup(d->sets, &token);
-        if (set) {
-            reims_vgpu_dirty_consume_set(d, set, slices, n, written);
-        }
+        uint64_t tok = g_array_index(tokens, uint64_t, t);
+        reims_vgpu_dirty_sync_sets(d, tok);
     }
-    for (t = 0; t < tokens->len; t++) {
-        uint64_t token = g_array_index(tokens, uint64_t, t);
-        ReimsVgpuDirtySet *set = g_hash_table_lookup(d->sets, &token);
-        if (!set) {
-            continue; /* Untracked during the query; never dereference it. */
-        }
-        if (reims_vgpu_dirty_eval_set(d, set, slices, n, hit, false)) {
-            d->log_wanted = true;
-        }
-        /* A doorbell during the query does not belong to this result. Its
-         * reader must still sync, even if this batch finishes afterwards. */
-        set->synced_epoch = MAX(set->synced_epoch, epoch);
-        if (set->claim_epoch == epoch) {
-            set->claim_epoch = 0;
-        }
-    }
-    qemu_cond_broadcast(&d->synced_cond);
-    qemu_mutex_unlock(&d->lock);
-    reims_vgpu_dirty_clear_written(written, slices, n);
-    g_free(slices);
-    qatomic_fetch_add(&profile_calls, 1);
-    qatomic_fetch_add(&profile_total, g_get_monotonic_time() - started);
-    qatomic_fetch_add(&profile_plan, planned - started);
-    qatomic_fetch_add(&profile_finish, g_get_monotonic_time() - finished);
-    qatomic_fetch_add(&profile_pages, pages);
+
     uint64_t elapsed = g_get_monotonic_time() - started;
     qatomic_fetch_add(&profile_bg_calls, 1);
     qatomic_fetch_add(&profile_bg_us, elapsed);
     profile_max(&profile_bg_max, elapsed);
+}
+
+uint64_t reims_vgpu_dirty_sync_epoch(ReimsVgpuDirty *d)
+{
+    if (!d) {
+        return 0;
+    }
+    return qatomic_read(&d->sync_epoch);
+}
+
+/*
+ * The doorbell epoch: what a cached currency verdict is keyed by. Lock-free;
+ * the acquire pairs with the release store in reims_vgpu_dirty_note_doorbell.
+ * Starts at 1; advanced by each doorbell (on-demand mode) or each completed
+ * harvest fold (harvest mode). Only a null tracker answers 0, which a caller
+ * must read as "no observation epoch": never a cache key.
+ */
+uint64_t reims_vgpu_dirty_observation_epoch(ReimsVgpuDirty *d)
+{
+    if (!d) {
+        return 0;
+    }
+    return qatomic_load_acquire(&d->epoch);
 }

@@ -433,6 +433,24 @@ static int64_t reims_vgpu_mmio_guest_written_pages(void *ctx, uint64_t token,
     return reims_vgpu_dirty_written_since(s->dirty, token, since_gen, out, max);
 }
 
+static uint64_t reims_vgpu_mmio_dirty_sync_epoch(void *ctx)
+{
+    ReimsVGPUMMIOState *s = ctx;
+
+    return reims_vgpu_dirty_sync_epoch(s->dirty);
+}
+
+/*
+ * HostOps dirty_observation_epoch (ABI v23): the doorbell epoch, the one key a
+ * cached currency verdict may be held under. 0 when no doorbell is noted.
+ */
+static uint64_t reims_vgpu_mmio_dirty_observation_epoch(void *ctx)
+{
+    ReimsVGPUMMIOState *s = ctx;
+
+    return reims_vgpu_dirty_observation_epoch(s->dirty);
+}
+
 static void reims_vgpu_mmio_bh(void *opaque);
 static void reims_vgpu_mmio_deliver_actions(ReimsVGPUMMIOState *s);
 static void reims_vgpu_mmio_apply_action(ReimsVGPUMMIOState *s, const ReimsVgpuHostAction *a);
@@ -1019,6 +1037,8 @@ static void reims_vgpu_mmio_realize(DeviceState *dev, Error **errp)
         .untrack_guest_writes = reims_vgpu_mmio_untrack_guest_writes,
         .guest_write_gen = reims_vgpu_mmio_guest_write_gen,
         .guest_written_pages = reims_vgpu_mmio_guest_written_pages,
+        .dirty_sync_epoch = reims_vgpu_mmio_dirty_sync_epoch,
+        .dirty_observation_epoch = reims_vgpu_mmio_dirty_observation_epoch,
     };
     s->dirty = reims_vgpu_dirty_new();
 
