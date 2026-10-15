@@ -2621,7 +2621,34 @@ static void whpx_vcpu_kick_out_of_hlt(CPUState *cpu)
 static struct {
     int in_run;
     uint64_t exits;
+    int64_t out_ns;   /* TEMP lab (b461 freeze watch): when it last came out, 0 while running */
+    int reason;
 } whpx_run_state[WHPX_RUN_STATE_MAX];
+
+/*
+ * TEMP lab (b461 freeze watch): every 500 ms, the vCPUs that have been out of WHvRunVirtualProcessor - in QEMU's own
+ * exit handling - for over a second, with the exit reason. b461-B2 froze a guest with ~3 vCPUs spinning and almost no
+ * exits: a vCPU parked in the host would hold every guest TLB shootdown, and this names it.
+ */
+static void *whpx_lab_vcpu_watch_fn(void *opaque)
+{
+    for (;;) {
+        int64_t now;
+        int i;
+
+        g_usleep(500 * 1000);
+        now = get_clock();
+        for (i = 0; i < WHPX_RUN_STATE_MAX; i++) {
+            int64_t out = qatomic_read(&whpx_run_state[i].out_ns);
+
+            if (out && now - out > NANOSECONDS_PER_SECOND && !qatomic_read(&whpx_run_state[i].in_run)) {
+                fprintf(stderr, "whpx-vcpu-stuck: cpu %d out of the hypervisor %" PRId64 " ms, exit reason %#x\n", i,
+                        (now - out) / SCALE_MS, qatomic_read(&whpx_run_state[i].reason));
+            }
+        }
+    }
+    return NULL;
+}
 
 /*
  * memory_dirty_log_flush_hook: make every vCPU that is running guest code exit
@@ -3024,6 +3051,15 @@ int whpx_vcpu_run(CPUState *cpu)
 
         int64_t stats_t_run = whpx_stats_on() ? get_clock() : 0;
         if (cpu->cpu_index < WHPX_RUN_STATE_MAX) {
+            static gsize watch_started;
+
+            if (g_once_init_enter(&watch_started)) {   /* TEMP lab (b461 freeze watch) */
+                QemuThread t;
+
+                qemu_thread_create(&t, "whpx-vcpu-watch", whpx_lab_vcpu_watch_fn, NULL, QEMU_THREAD_DETACHED);
+                g_once_init_leave(&watch_started, 1);
+            }
+            qatomic_set(&whpx_run_state[cpu->cpu_index].out_ns, 0);
             qatomic_set(&whpx_run_state[cpu->cpu_index].in_run, 1);
         }
         hr = whp_dispatch.WHvRunVirtualProcessor(
@@ -3032,6 +3068,8 @@ int whpx_vcpu_run(CPUState *cpu)
         if (cpu->cpu_index < WHPX_RUN_STATE_MAX) {
             qatomic_inc(&whpx_run_state[cpu->cpu_index].exits);
             qatomic_set(&whpx_run_state[cpu->cpu_index].in_run, 0);
+            qatomic_set(&whpx_run_state[cpu->cpu_index].reason, (int)vcpu->exit_ctx.ExitReason);
+            qatomic_set(&whpx_run_state[cpu->cpu_index].out_ns, get_clock());
         }
         int64_t stats_t_exit = stats_t_run ? get_clock() : 0;
         if (stats_t_run) {
