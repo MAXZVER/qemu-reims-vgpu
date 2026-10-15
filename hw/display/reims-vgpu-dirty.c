@@ -2181,6 +2181,43 @@ static void reims_vgpu_dirty_wp_count(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s, b
 }
 
 /* One remap of [gpa, gpa+size), with `wp_bits` kept equal to what is read-only. `wp_mutex` held. */
+/*
+ * TEMP lab (b461 freeze watch): `wp_mutex` with its holder recorded. b461-B2 froze a guest 3 s after the 5K mode
+ * switch - no vCPU exit, doorbell or WP line for 8 min while ~3 vCPUs spun in the guest - the shape of a TLB shootdown
+ * waiting for a vCPU parked in a store fault. A waiter past 1 s says where the holder took the lock, once a second.
+ */
+static int reims_wp_holder_line, reims_wp_holder_tid;
+static int64_t reims_wp_holder_ns;
+/* What the holder is doing now: 0 nothing marked, 1 query ticket, 2 hypervisor remap, 3 marks. */
+static int reims_wp_stage;
+
+static void reims_wp_lock(ReimsVgpuDirty *d, int line)
+{
+    if (qemu_mutex_trylock(&d->wp_mutex) != 0) {   /* 0: taken */
+        int64_t t0 = get_clock(), next = t0 + NANOSECONDS_PER_SECOND;
+
+        for (;;) {
+            int64_t now;
+
+            g_usleep(20);
+            if (qemu_mutex_trylock(&d->wp_mutex) == 0) {
+                break;
+            }
+            now = get_clock();
+            if (now >= next) {
+                fprintf(stderr, "reims-dirty-wp-stuck: line %d thread %d waited %" PRId64 " ms; held from line %d by "
+                        "thread %d for %" PRId64 " ms, waiters %d\n", line, qemu_get_thread_id(), (now - t0) / SCALE_MS,
+                        qatomic_read(&reims_wp_holder_line), qatomic_read(&reims_wp_holder_tid),
+                        (now - qatomic_read(&reims_wp_holder_ns)) / SCALE_MS, qatomic_read(&d->wp_waiters));
+                next = now + NANOSECONDS_PER_SECOND;
+            }
+        }
+    }
+    qatomic_set(&reims_wp_holder_line, line);
+    qatomic_set(&reims_wp_holder_tid, qemu_get_thread_id());
+    qatomic_set(&reims_wp_holder_ns, get_clock());
+}
+
 /* TEMP lab (b454): what the next remaps on this thread are for (lab_wp_cause_n). */
 enum { WP_CAUSE_PROTECT, WP_CAUSE_FAULT, WP_CAUSE_ORPHAN, WP_CAUSE_DROP, WP_CAUSE_OTHER };
 static __thread int reims_wp_cause = WP_CAUSE_OTHER;
@@ -2198,7 +2235,9 @@ static int reims_vgpu_dirty_wp_remap(ReimsVgpuDirty *d, uint64_t gpa, uint64_t s
             set_bit_atomic(a >> qemu_target_page_bits(), d->wp_bits);
         }
     }
+    qatomic_set(&reims_wp_stage, 2);   /* TEMP lab (b461 freeze watch) */
     rc = whpx_wp_remap(gpa, size, writable);
+    qatomic_set(&reims_wp_stage, 0);
     if (writable || rc) {
         for (a = gpa; a < gpa + size; a += step) {
             clear_bit_atomic(a >> qemu_target_page_bits(), d->wp_bits);
@@ -2456,7 +2495,7 @@ static void reims_vgpu_dirty_wp_yield(ReimsVgpuDirty *d)
     for (spins = 0; qatomic_read(&d->wp_waiters) && spins < 200; spins++) {
         g_usleep(10);
     }
-    qemu_mutex_lock(&d->wp_mutex);
+    reims_wp_lock(d, __LINE__);
 }
 
 static size_t reims_vgpu_dirty_wp_release_merged(ReimsVgpuDirty *d, const ReimsVgpuDirtyRun *runs,
@@ -2498,7 +2537,7 @@ static bool reims_vgpu_dirty_wp_fault(uint64_t gpa)
     t_wait = get_clock();
     reims_wp_cause = WP_CAUSE_FAULT;   /* TEMP lab (b454) */
     qatomic_inc(&d->wp_waiters);
-    qemu_mutex_lock(&d->wp_mutex);
+    reims_wp_lock(d, __LINE__);
     qatomic_dec(&d->wp_waiters);
     t_held = get_clock();
     if (reims_vgpu_dirty_wp_ro(d, gpa)) {
@@ -2644,7 +2683,7 @@ static void reims_vgpu_dirty_wp_invalidate(void)
     if (!d) {
         return;
     }
-    qemu_mutex_lock(&d->wp_mutex);
+    reims_wp_lock(d, __LINE__);
     for (i = 0; i < d->wp_list->len; i++) {
         uint64_t token = g_array_index(d->wp_list, uint64_t, i);
         ReimsVgpuDirtySet *s;
@@ -3218,7 +3257,7 @@ static int64_t reims_vgpu_dirty_wp_protect_chunk(ReimsVgpuDirty *d, uint64_t tok
     } else {
         pause_all_vcpus();
     }
-    qemu_mutex_lock(&d->wp_mutex);
+    reims_wp_lock(d, __LINE__);
   next_set:
     /* Every store before the pause, into the VGA bitmap; the set's next sync consumes it. */
     qemu_mutex_lock(&d->lock);
@@ -3314,7 +3353,7 @@ static int64_t reims_vgpu_dirty_wp_protect_chunk(ReimsVgpuDirty *d, uint64_t tok
                     reims_vgpu_dirty_wp_yield(d);
                 } else {
                     qemu_mutex_unlock(&d->wp_mutex);
-                    qemu_mutex_lock(&d->wp_mutex);
+                    reims_wp_lock(d, __LINE__);
                 }
                 qemu_mutex_lock(&d->lock);
                 s = g_hash_table_lookup(d->sets, &token);
@@ -3457,7 +3496,7 @@ static bool reims_vgpu_dirty_wp_step(ReimsVgpuDirty *d)
             d->wp_hole_bits = bitmap_new(d->wp_bits_n);   /* TEMP lab DIRTY_WP_HOLE */
         }
     }
-    qemu_mutex_lock(&d->wp_mutex);
+    reims_wp_lock(d, __LINE__);
     if (d->wp_calm) {
         reims_vgpu_dirty_wp_bury(d);   /* lab DIRTY_WP_CALM */
     }
@@ -3631,7 +3670,7 @@ static bool reims_vgpu_dirty_wp_step(ReimsVgpuDirty *d)
                 ((uint64_t)paused * (100 - d->wp_duty) / d->wp_duty + 999999) / 1000000;
             d->wp_next_ok_ns = get_clock() +
                 (paused <= 0 ? 0 : (int64_t)((uint64_t)paused * (100 - d->wp_duty) / d->wp_duty));
-            qemu_mutex_lock(&d->wp_mutex);
+            reims_wp_lock(d, __LINE__);
         } else if (s) {
             reims_vgpu_dirty_wp_finish(d, d->wp_cur, s);
         }
@@ -3643,6 +3682,40 @@ static bool reims_vgpu_dirty_wp_step(ReimsVgpuDirty *d)
     reims_wp_cause = WP_CAUSE_OTHER;
     qemu_mutex_unlock(&d->wp_mutex);
     return more;
+}
+
+/*
+ * TEMP lab (b461 freeze watch): every 500 ms, whether `wp_mutex` has been held more than a second - by which line and
+ * thread, doing what (reims_wp_stage) - and how many store faults wait. A frozen guest whose vCPU is parked in the
+ * store-fault hook then names the lock it is parked behind.
+ */
+static void *reims_vgpu_dirty_wp_watch_fn(void *opaque)
+{
+    ReimsVgpuDirty *d = opaque;
+    int64_t last_report = 0;
+
+    for (;;) {
+        int64_t now, held;
+
+        g_usleep(500 * 1000);
+        if (qemu_mutex_trylock(&d->wp_mutex) == 0) {
+            qemu_mutex_unlock(&d->wp_mutex);
+            continue;
+        }
+        now = get_clock();
+        held = now - qatomic_read(&reims_wp_holder_ns);
+        if (held >= NANOSECONDS_PER_SECOND && now - last_report >= NANOSECONDS_PER_SECOND) {
+            static const char *const stage[] = { "-", "query-ticket wait", "hypervisor remap", "marks" };
+            int st = qatomic_read(&reims_wp_stage);
+
+            fprintf(stderr, "reims-dirty-wp-watch: wp_mutex held %" PRId64 " ms from line %d by thread %d (%s), "
+                    "faults waiting %d, tickets in flight %d\n", held / SCALE_MS, qatomic_read(&reims_wp_holder_line),
+                    qatomic_read(&reims_wp_holder_tid), stage[st < 4 && st >= 0 ? st : 0],
+                    qatomic_read(&d->wp_waiters), qatomic_read(&d->q_ninflight));
+            last_report = now;
+        }
+    }
+    return NULL;
 }
 
 /* TEMP lab DIRTY_WP_THREAD: the thread that runs the protect step, woken by the BH. */
@@ -3852,7 +3925,7 @@ void reims_vgpu_dirty_untrack(ReimsVgpuDirty *d, uint64_t token)
         any = us && !us->wp_listed && us->wp_state == WP_NONE && reims_vgpu_dirty_wp_any_ro(d, us, 0, us->count);
         qemu_mutex_unlock(&d->lock);
         if (any) {
-            qemu_mutex_lock(&d->wp_mutex);
+            reims_wp_lock(d, __LINE__);
             qemu_mutex_lock(&d->lock);
             us = g_hash_table_lookup(d->sets, &token);
             any = us && !us->wp_listed && us->wp_state == WP_NONE;
@@ -3868,7 +3941,7 @@ void reims_vgpu_dirty_untrack(ReimsVgpuDirty *d, uint64_t token)
     if (d->wp_list && !d->wp_calm) {   /* lab DIRTY_WP: its read-only runs outlive it, the step makes them writable */
         guint i;
 
-        qemu_mutex_lock(&d->wp_mutex);
+        reims_wp_lock(d, __LINE__);
         for (i = 0; i < d->wp_list->len; i++) {
             if (g_array_index(d->wp_list, uint64_t, i) == token) {
                 ReimsVgpuDirtySet *ws;
@@ -5456,7 +5529,9 @@ static uint64_t reims_vgpu_dirty_query_begin(ReimsVgpuDirty *d)
 {
     d->epoch_queried = true;
     while (d->q_ninflight == (int)ARRAY_SIZE(d->q_inflight)) {
+        qatomic_set(&reims_wp_stage, 1);   /* TEMP lab (b461 freeze watch): seen only if `wp_mutex` is held too */
         qemu_cond_wait(&d->q_cond, &d->lock);
+        qatomic_set(&reims_wp_stage, 0);
     }
     d->q_fp[d->q_ninflight] = NULL;
     d->q_fpn[d->q_ninflight] = 0;
@@ -8308,6 +8383,12 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                     qemu_event_init(&d->wp_ev, false);
                     qemu_thread_create(&d->wp_thread, "reims-wp", reims_vgpu_dirty_wp_thread_fn, d,
                                        QEMU_THREAD_DETACHED);
+                    {   /* TEMP lab (b461 freeze watch) */
+                        QemuThread watch;
+
+                        qemu_thread_create(&watch, "reims-wp-watch", reims_vgpu_dirty_wp_watch_fn, d,
+                                           QEMU_THREAD_DETACHED);
+                    }
                     fprintf(stderr, "reims-dirty-wp thread on: chunk=%u duty=%u%%\n", d->wp_chunk,
                             d->wp_thread_duty);
                 }
