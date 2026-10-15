@@ -1531,6 +1531,153 @@ static bool whpx_mmio_fast_store(CPUState *cpu,
     return true;
 }
 
+/*
+ * SSE moves between an XMM register and memory that exits (MMIO, or a page the
+ * hypervisor would not let through). QEMU's x86 emulator has no SSE, so such an
+ * exit used to end the VM: "failed to decode instruction f d6" - a guest kernel
+ * `movq m64, xmm` (lab logs 2026-10-04 and 2026-10-15, both early in boot). The
+ * exit names the guest-physical address, so only the operand size, the register
+ * and the instruction length are decoded here; the access goes through the
+ * memory API (RAM or device) under the BQL the caller holds. Long mode only, no
+ * VEX, no address-size override, no access crossing a page; anything else falls
+ * through to the emulator as before.
+ */
+static bool whpx_mmio_sse(CPUState *cpu, const WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
+{
+    const WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
+    const WHV_VP_EXIT_CONTEXT *vp = &exit_ctx->VpContext;
+    const uint8_t *b = ctx->InstructionBytes;
+    unsigned n = ctx->InstructionByteCount, i = 0, rex = 0, op, modrm, mod, rm, reg, size = 0;
+    bool p66 = false, pf3 = false, pf2 = false, store = false, zero_upper = false;
+    WHV_REGISTER_NAME name;
+    WHV_REGISTER_VALUE value = {};
+    uint8_t buf[16] = {};
+    HRESULT hr;
+
+    if (cpu->vcpu_dirty || !vp->ExecutionState.EferLma || !vp->Cs.Long || (vp->Rflags & TF_MASK)) {
+        return false;
+    }
+    for (; i < n; i++) {
+        if (b[i] == 0x66) {
+            p66 = true;
+        } else if (b[i] == 0xf3) {
+            pf3 = true;
+        } else if (b[i] == 0xf2) {
+            pf2 = true;
+        } else if (b[i] == 0x2e || b[i] == 0x3e || b[i] == 0x26 || b[i] == 0x36 ||
+                   b[i] == 0x64 || b[i] == 0x65) {
+            continue;   /* the exit's GPA already went through the segment */
+        } else {
+            break;
+        }
+    }
+    if (i < n && (b[i] & 0xf0) == 0x40) {
+        rex = b[i++];
+    }
+    if (i + 3 > n || b[i] != 0x0f) {
+        return false;
+    }
+    op = b[i + 1];
+    modrm = b[i + 2];
+    i += 3;
+    mod = modrm >> 6;
+    rm = modrm & 7;
+    if (mod == 3) {
+        return false;
+    }
+    switch (op) {
+    case 0xd6: if (!p66) return false; store = true; size = 8; break;            /* movq m64, xmm */
+    case 0x7f: if (!p66 && !pf3) return false; store = true; size = 16; break;  /* movdqa / movdqu */
+    case 0xe7: if (!p66) return false; store = true; size = 16; break;          /* movntdq */
+    case 0x2b: store = true; size = 16; break;                                   /* movntps / movntpd */
+    case 0x29: store = true; size = 16; break;                                   /* movaps / movapd */
+    case 0x11: store = true; size = pf3 ? 4 : pf2 ? 8 : 16; break;               /* movups/movupd/movss/movsd */
+    case 0x6f: if (!p66 && !pf3) return false; size = 16; break;                /* movdqa / movdqu load */
+    case 0x28: size = 16; break;                                                 /* movaps / movapd load */
+    case 0x10: size = pf3 ? 4 : pf2 ? 8 : 16; zero_upper = pf3 || pf2; break;   /* movups/.../movss/movsd load */
+    case 0x7e:
+        if (pf3) {
+            size = 8; zero_upper = true;                                         /* movq xmm, m64 */
+        } else if (p66) {
+            store = true; size = (rex & 8) ? 8 : 4;                              /* movd/movq m, xmm */
+        } else {
+            return false;
+        }
+        break;
+    case 0x6e: if (!p66) return false; size = (rex & 8) ? 8 : 4; zero_upper = true; break; /* movd/movq xmm, m */
+    default:
+        return false;
+    }
+    if (pf3 && pf2) {
+        return false;
+    }
+    if (rm == 4) {
+        if (i >= n) {
+            return false;
+        }
+        if (mod == 0 && (b[i] & 7) == 5) {
+            i += 4;                     /* SIB, no base: disp32 */
+        }
+        i++;
+    } else if (mod == 0 && rm == 5) {
+        i += 4;                         /* RIP-relative */
+    }
+    i += mod == 1 ? 1 : mod == 2 ? 4 : 0;
+    if (i > n) {
+        return false;
+    }
+    if (store != (ctx->AccessInfo.AccessType == WHvMemoryAccessWrite) ||
+        !ctx->AccessInfo.GvaValid || (ctx->Gva & 0xfff) != (ctx->Gpa & 0xfff) ||
+        (ctx->Gpa & 0xfff) + size > 0x1000) {
+        return false;
+    }
+    reg = ((modrm >> 3) & 7) | ((rex & 4) << 1);
+    name = (WHV_REGISTER_NAME)(WHvX64RegisterXmm0 + reg);
+    hr = whp_dispatch.WHvGetVirtualProcessorRegisters(whpx_global.partition, cpu->cpu_index, &name, 1, &value);
+    if (FAILED(hr)) {
+        return false;
+    }
+    if (store) {
+        memcpy(buf, &value.Reg128.Low64, 8);
+        memcpy(buf + 8, &value.Reg128.High64, 8);
+        address_space_write(&address_space_memory, ctx->Gpa, MEMTXATTRS_UNSPECIFIED, buf, size);
+    } else {
+        address_space_read(&address_space_memory, ctx->Gpa, MEMTXATTRS_UNSPECIFIED, buf, size);
+        if (zero_upper) {
+            value.Reg128.Low64 = 0;
+            value.Reg128.High64 = 0;
+        }
+        if (size == 16) {
+            memcpy(&value.Reg128.Low64, buf, 8);
+            memcpy(&value.Reg128.High64, buf + 8, 8);
+        } else {
+            uint64_t lo = value.Reg128.Low64;
+
+            memcpy(&lo, buf, size);   /* movss/movsd/movd/movq: the low lanes; the rest per zero_upper */
+            value.Reg128.Low64 = lo;
+        }
+        hr = whp_dispatch.WHvSetVirtualProcessorRegisters(whpx_global.partition, cpu->cpu_index, &name, 1, &value);
+        if (FAILED(hr)) {
+            error_report("WHPX: SSE MMIO load: failed to set XMM%u, hr=%08lx", reg, hr);
+        }
+    }
+    name = WHvX64RegisterRip;
+    value.Reg64 = vp->Rip + i;
+    hr = whp_dispatch.WHvSetVirtualProcessorRegisters(whpx_global.partition, cpu->cpu_index, &name, 1, &value);
+    if (FAILED(hr)) {
+        error_report("WHPX: SSE MMIO access: failed to set RIP, hr=%08lx", hr);
+    }
+    {
+        static uint64_t seen;
+
+        if (!(qatomic_fetch_inc(&seen) & 0xfff)) {
+            fprintf(stderr, "whpx: SSE %s of %u bytes at 0x%" PRIx64 " served (op 0f %02x)\n",
+                    store ? "store" : "load", size, (uint64_t)ctx->Gpa, op);
+        }
+    }
+    return true;
+}
+
 static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
 {
     WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
@@ -1577,7 +1724,8 @@ static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
     {
         int64_t lab_t = qemu_lab_slow_begin();
 
-        ret = emulate_instruction(cpu, ctx->InstructionBytes, ctx->InstructionByteCount);
+        ret = whpx_mmio_sse(cpu, exit_ctx) ? 0 :
+              emulate_instruction(cpu, ctx->InstructionBytes, ctx->InstructionByteCount);
         if (lab_t) {
             char what[48];
 
