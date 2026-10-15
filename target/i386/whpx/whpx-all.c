@@ -1554,8 +1554,17 @@ static bool whpx_mmio_sse(CPUState *cpu, const WHV_RUN_VP_EXIT_CONTEXT *exit_ctx
     uint8_t buf[16] = {};
     HRESULT hr;
 
-    if (cpu->vcpu_dirty || !vp->ExecutionState.EferLma || !vp->Cs.Long || (vp->Rflags & TF_MASK)) {
+    if (!vp->ExecutionState.EferLma || !vp->Cs.Long || (vp->Rflags & TF_MASK)) {
         return false;
+    }
+    if (cpu->vcpu_dirty) {
+        /*
+         * QEMU holds newer registers than the hypervisor (b477-V: an early-boot `movq m64, xmm` hit this and the
+         * emulator, which has no SSE, ended the VM). Hand them over first, as the run loop would before the next
+         * run, so the XMM read and the RIP write below act on the current state.
+         */
+        whpx_set_registers(cpu, WHPX_LEVEL_RUNTIME_STATE);
+        cpu->vcpu_dirty = false;
     }
     for (; i < n; i++) {
         if (b[i] == 0x66) {
@@ -1627,8 +1636,15 @@ static bool whpx_mmio_sse(CPUState *cpu, const WHV_RUN_VP_EXIT_CONTEXT *exit_ctx
         return false;
     }
     if (store != (ctx->AccessInfo.AccessType == WHvMemoryAccessWrite) ||
-        !ctx->AccessInfo.GvaValid || (ctx->Gva & 0xfff) != (ctx->Gpa & 0xfff) ||
+        (ctx->AccessInfo.GvaValid && (ctx->Gva & 0xfff) != (ctx->Gpa & 0xfff)) ||
         (ctx->Gpa & 0xfff) + size > 0x1000) {
+        static int told;
+
+        if (told++ < 8) {   /* TEMP lab: what still reaches the emulator */
+            fprintf(stderr, "whpx: SSE access left to the emulator: op 0f %02x store=%d type=%d gva_valid=%d gva=0x%"
+                    PRIx64 " gpa=0x%" PRIx64 " size=%u\n", op, store, ctx->AccessInfo.AccessType,
+                    ctx->AccessInfo.GvaValid, (uint64_t)ctx->Gva, (uint64_t)ctx->Gpa, size);
+        }
         return false;
     }
     reg = ((modrm >> 3) & 7) | ((rex & 4) << 1);
