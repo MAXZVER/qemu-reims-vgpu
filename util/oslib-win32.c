@@ -180,6 +180,144 @@ void *qemu_win_ram_hv_view(void *host, size_t len)
     return host;
 }
 
+/*
+ * TEMP (lab, WP_VIEW): one linear window over scattered pages of guest RAM - the Windows form of the POSIX packed
+ * alias (MAP_SHARED | MAP_FIXED per page) a device builds when a task's virtually linear surface sits on
+ * guest-physical pages that are not. Guest RAM under WP_VIEW is one pagefile section, so each page can be mapped
+ * once more: reserve a placeholder for the whole window, split it per page and replace each piece with a view of
+ * the section at that page's offset. An alias, not a copy - guest CPU stores, the device's stores and the GPU's
+ * reads all address the same pages. Measured (lab/tools/session-2026-10-15/whp/placeholder4k.c): 1.8 us a page,
+ * page-aligned section offsets accepted, write-through exact.
+ *
+ * The three calls are looked up at run time: the build targets an older Windows API level than the one that
+ * declares them (Windows 10 1803).
+ */
+#ifndef MEM_RESERVE_PLACEHOLDER
+#define MEM_RESERVE_PLACEHOLDER 0x00040000
+#endif
+#ifndef MEM_REPLACE_PLACEHOLDER
+#define MEM_REPLACE_PLACEHOLDER 0x00004000
+#endif
+#ifndef MEM_PRESERVE_PLACEHOLDER
+#define MEM_PRESERVE_PLACEHOLDER 0x00000002
+#endif
+
+typedef PVOID (WINAPI *QemuVirtualAlloc2Fn)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void *, ULONG);
+typedef PVOID (WINAPI *QemuMapViewOfFile3Fn)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, void *, ULONG);
+typedef BOOL (WINAPI *QemuUnmapViewOfFile2Fn)(HANDLE, PVOID, ULONG);
+
+static QemuVirtualAlloc2Fn qemu_win_va2;
+static QemuMapViewOfFile3Fn qemu_win_mv3;
+static QemuUnmapViewOfFile2Fn qemu_win_uv2;
+
+static bool qemu_win_placeholder_api(void)
+{
+    static int state = -1;   /* benign race: every thread resolves the same three pointers */
+
+    if (qatomic_read(&state) < 0) {
+        HMODULE k = GetModuleHandleW(L"kernelbase.dll");
+
+        if (k) {
+            qemu_win_va2 = (QemuVirtualAlloc2Fn)(void *)GetProcAddress(k, "VirtualAlloc2");
+            qemu_win_mv3 = (QemuMapViewOfFile3Fn)(void *)GetProcAddress(k, "MapViewOfFile3");
+            qemu_win_uv2 = (QemuUnmapViewOfFile2Fn)(void *)GetProcAddress(k, "UnmapViewOfFile2");
+        }
+        qatomic_set(&state, qemu_win_va2 && qemu_win_mv3 && qemu_win_uv2);
+    }
+    return qatomic_read(&state) > 0;
+}
+
+/* The WP_VIEW section and byte offset behind `len` bytes of guest RAM at `host` (QEMU's view). */
+static bool qemu_win_ram_section_of(const void *host, size_t len, HANDLE *section, uint64_t *offset)
+{
+    int i, n = qatomic_load_acquire(&qemu_win_ram_nviews);
+
+    for (i = 0; i < n; i++) {
+        QemuWinRamView *v = &qemu_win_ram_views[i];
+
+        if (v->section && (const char *)host >= v->host && (const char *)host + len <= v->host + v->size) {
+            *section = v->section;
+            *offset = (uint64_t)((const char *)host - v->host);
+            return true;
+        }
+    }
+    return false;
+}
+
+void *qemu_win_ram_alias_pages(void *const *hosts, size_t count, size_t page, unsigned long *err,
+                               size_t *failed_index)
+{
+    HANDLE proc = GetCurrentProcess();
+    char *view;
+    size_t i = 0;
+    bool split = false;
+
+    *err = 0;
+    *failed_index = SIZE_MAX;
+    if (count == 0 || !qemu_win_placeholder_api()) {
+        *err = ERROR_NOT_SUPPORTED;
+        return NULL;
+    }
+    view = qemu_win_va2(proc, NULL, count * page, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, NULL, 0);
+    if (!view) {
+        *err = GetLastError();
+        return NULL;
+    }
+    for (i = 0; i < count; i++) {
+        HANDLE section;
+        uint64_t offset;
+
+        split = false;
+        if (!qemu_win_ram_section_of(hosts[i], page, &section, &offset) || (offset & (page - 1))) {
+            *err = ERROR_INVALID_ADDRESS;
+            goto fail;
+        }
+        /* Split this page off the placeholder that still spans [i, count); the last page is already alone. */
+        if (i + 1 < count) {
+            if (!VirtualFree(view + i * page, page, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+                *err = GetLastError();
+                goto fail;
+            }
+            split = true;
+        }
+        if (!qemu_win_mv3(section, proc, view + i * page, offset, page, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE,
+                          NULL, 0)) {
+            *err = GetLastError();
+            goto fail;
+        }
+    }
+    return view;
+
+fail:
+    *failed_index = i;
+    {
+        size_t j;
+
+        for (j = 0; j < i; j++) {
+            qemu_win_uv2(proc, view + j * page, 0);
+        }
+    }
+    /* Page i's own placeholder (or the unsplit rest from i), then the rest after a split. */
+    VirtualFree(view + i * page, 0, MEM_RELEASE);
+    if (split && i + 1 < count) {
+        VirtualFree(view + (i + 1) * page, 0, MEM_RELEASE);
+    }
+    return NULL;
+}
+
+void qemu_win_ram_alias_free(void *view, size_t count, size_t page)
+{
+    HANDLE proc = GetCurrentProcess();
+    size_t i;
+
+    if (!view || !qemu_win_placeholder_api()) {
+        return;
+    }
+    for (i = 0; i < count; i++) {
+        qemu_win_uv2(proc, (char *)view + i * page, 0);
+    }
+}
+
 void *qemu_anon_ram_alloc(size_t size, uint64_t *align, bool shared,
                           bool noreserve)
 {

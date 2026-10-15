@@ -297,10 +297,57 @@ fail:
 
 #if defined(_WIN32)
     /*
-     * No POSIX mmap on Windows: packed aliasing views are unavailable, so every
-     * scattered GVA mapping takes the product copying rails instead.
+     * The same packed alias as the mmap arm below, built from views of the
+     * WP_VIEW guest-RAM section (qemu_win_ram_alias_pages). Until 2026-10-15
+     * this returned -1 for every scattered list, so each one took the copying
+     * rails: 652 qemu_map_pages_failure_unspecified and 357 GPU-writeback
+     * declines in one Claude.app boot.
      */
-    return -1;
+    {
+        size_t total = count * page;
+        void **hosts = g_new(void *, count);
+        unsigned long err = 0;
+        size_t failed = SIZE_MAX;
+        ReimsVGPUPCIPageView held;
+        void *view;
+
+        rcu_read_lock();
+        for (i = 0; i < count; i++) {
+            hwaddr xlat, plen = page;
+            MemoryRegion *mr;
+
+            mr = address_space_translate(&address_space_memory, gpas[i],
+                                         &xlat, &plen, true,
+                                         MEMTXATTRS_UNSPECIFIED);
+            if (!mr || !memory_region_is_ram(mr) || plen < page) {
+                rcu_read_unlock();
+                g_free(hosts);
+                failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_INVALID_GUEST_PAGE;
+                failure->page_index = i;
+                return -1;
+            }
+            hosts[i] = (uint8_t *)memory_region_get_ram_ptr(mr) + xlat;
+        }
+        view = qemu_win_ram_alias_pages(hosts, count, page, &err, &failed);
+        rcu_read_unlock();
+        g_free(hosts);
+        if (!view) {
+            failure->stage = failed == SIZE_MAX
+                ? REIMS_VGPU_MAP_PAGES_FAILURE_RESERVATION
+                : REIMS_VGPU_MAP_PAGES_FAILURE_ALIAS;
+            failure->host_errno = (int)err;
+            failure->page_index = failed == SIZE_MAX ? 0 : failed;
+            return -1;
+        }
+        held.ptr = view;
+        held.len = total;
+        g_array_append_val(s->page_views, held);
+        s->page_view_live_bytes += total;
+        s->page_view_live_pages += count;
+        s->page_views_created++;
+        *out_ptr = view;
+        return 0;
+    }
 #else
     /*
      * A task GVA is linear even when its guest-physical pages are not. When
@@ -405,7 +452,11 @@ static void reims_vgpu_pci_unmap_pages(void *ctx, void *ptr, size_t len)
         if (view->ptr != ptr || view->len != len) {
             continue;
         }
-#ifndef _WIN32
+#ifdef _WIN32
+        qemu_win_ram_alias_free(view->ptr,
+                                view->len >> REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64,
+                                (size_t)1 << REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64);
+#else
         munmap(view->ptr, view->len);
 #endif
         s->page_view_live_bytes -= view->len;
@@ -1867,16 +1918,20 @@ static void reims_vgpu_pci_exit(PCIDevice *pdev)
     }
     reims_vgpu_pci_stop_backend(s);
     if (s->page_views) {
-#ifndef _WIN32
         size_t i;
 
         for (i = 0; i < s->page_views->len; i++) {
             ReimsVGPUPCIPageView *view =
                 &g_array_index(s->page_views, ReimsVGPUPCIPageView, i);
+#ifdef _WIN32
+            qemu_win_ram_alias_free(view->ptr,
+                                    view->len >> REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64,
+                                    (size_t)1 << REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64);
+#else
             munmap(view->ptr, view->len);
+#endif
             s->page_views_destroyed++;
         }
-#endif
         g_array_free(s->page_views, true);
         s->page_views = NULL;
     }

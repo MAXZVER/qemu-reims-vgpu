@@ -545,6 +545,15 @@ int qemu_shm_alloc(size_t size, Error **errp);
  * protection; `host` itself when the RAM has no such view.
  */
 void *qemu_win_ram_hv_view(void *host, size_t len);
+/*
+ * TEMP (lab, WP_VIEW): alias `count` guest-RAM pages (QEMU-view pointers, each `page` bytes and page aligned)
+ * into one linear read/write window, or NULL with the Windows error in `err` and the page that failed in
+ * `failed_index` (SIZE_MAX when the window itself could not be reserved). Every page must lie in a WP_VIEW
+ * RAM section. Free with qemu_win_ram_alias_free and the same count and page size.
+ */
+void *qemu_win_ram_alias_pages(void *const *hosts, size_t count, size_t page, unsigned long *err,
+                               size_t *failed_index);
+void qemu_win_ram_alias_free(void *view, size_t count, size_t page);
 #endif
 
 #ifdef _WIN32
