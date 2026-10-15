@@ -36,6 +36,7 @@
 #include "trace.h"
 #include "reims_vgpu_qemu_abi.h"
 #include "reims-vgpu-dirty.h"
+#include "reims-vgpu-doorbell-policy.h"
 #include "reims-vgpu-shim.h"
 
 #define TYPE_REIMS_VGPU_PCI "reims-vgpu-pci"
@@ -163,6 +164,13 @@ struct ReimsVGPUPCIState {
      * realize).
      */
     bool dirty_ondemand;
+    /*
+     * Whether a cursor-doorbell write (0x1220) advances the dirty observation
+     * epoch in on-demand mode: skip (default) or bump
+     * (REIMS_VGPU_DIRTY_CURSOR_EPOCH=bump; see realize). Why 0x1220 carries
+     * no work handoff is in reims-vgpu-doorbell-policy.h.
+     */
+    ReimsDirtyCursorEpoch dirty_cursor_epoch;
     Notifier shutdown_notifier;
     bool shutdown_notifier_registered;
 };
@@ -1254,7 +1262,19 @@ static void reims_vgpu_pci_gfx_write(void *opaque, hwaddr offset, uint64_t data,
          * background harvest is asked only while logging is still to be turned
          * on — its one BQL step — and nothing waits for it.
          */
-        if (reims_vgpu_dirty_note_doorbell(s->dirty) && s->harvest_started) {
+        ReimsDirtyDoorbellAction act =
+            reims_dirty_doorbell_action(offset, s->dirty_cursor_epoch);
+
+        /*
+         * One register is exempt: the cursor doorbell 0x1220 hands the device
+         * no work (reims-vgpu-doorbell-policy.h says why), so by default it
+         * neither bumps the epoch nor asks for a prefetch. Every other write
+         * is noted below exactly as before, and every cache hit stays backed
+         * by generation + epoch + dirty witness.
+         */
+        reims_vgpu_dirty_count_cursor_doorbell(act);
+        if (act != REIMS_DIRTY_DOORBELL_SKIP_CURSOR &&
+            reims_vgpu_dirty_note_doorbell(s->dirty) && s->harvest_started) {
             qemu_mutex_lock(&s->harvest_mutex);
             s->harvest_asked++;
             qemu_cond_signal(&s->harvest_cond);
@@ -1520,6 +1540,7 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
     {
         const char *hb = getenv("REIMS_VGPU_HARVEST_BQL");     /* lab A/B */
         const char *od = getenv("REIMS_VGPU_DIRTY_ONDEMAND");  /* lab A/B */
+        const char *ce = getenv("REIMS_VGPU_DIRTY_CURSOR_EPOCH"); /* lab A/B */
 
         /*
          * Off the BQL only where the dirty log allows it. WHPX's log_sync is
@@ -1544,6 +1565,18 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         s->dirty_ondemand = s->harvest_nobql && s->async_harvest &&
                             !(od && strcmp(od, "off") == 0);
         reims_vgpu_dirty_set_ondemand(s->dirty, s->dirty_ondemand);
+        /*
+         * Default skip: the cursor doorbell 0x1220 does not advance the epoch
+         * (reims-vgpu-doorbell-policy.h). `bump` restores the old behaviour
+         * and says so once, under its own slug, so a run with it is never
+         * mistaken for the default.
+         */
+        s->dirty_cursor_epoch = reims_dirty_cursor_epoch_mode(ce);
+        if (s->dirty_cursor_epoch == REIMS_DIRTY_CURSOR_EPOCH_BUMP) {
+            fprintf(stderr, "REIMS_DIRTY_CURSOR_EPOCH mode=bump "
+                    "slug=dirty_epoch_cursor_bump_forced ondemand=%d\n",
+                    s->dirty_ondemand ? 1 : 0);
+        }
     }
     /* Before the drain exists, so it never sees harvest_started change. */
     if (s->async_harvest) {

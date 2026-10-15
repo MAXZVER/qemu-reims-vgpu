@@ -23,6 +23,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include "reims-vgpu-doorbell-policy.h"
 
 typedef struct ReimsVgpuDirty ReimsVgpuDirty;
 
@@ -95,6 +96,13 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d);
  */
 void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on);
 bool reims_vgpu_dirty_note_doorbell(ReimsVgpuDirty *d);
+/*
+ * Count a gfx write's doorbell decision for REIMS_DIRTY_PROFILE: the cursor
+ * doorbell skipped (dirty_epoch_skip_cursor_doorbell) or forced to bump
+ * (dirty_epoch_cursor_bump_forced). Other actions are not counted. Safe from
+ * any thread. See reims-vgpu-doorbell-policy.h.
+ */
+void reims_vgpu_dirty_count_cursor_doorbell(ReimsDirtyDoorbellAction action);
 /* The harvest thread's job: a full harvest, or the on-demand prefetch. */
 void reims_vgpu_dirty_background(ReimsVgpuDirty *d);
 /*

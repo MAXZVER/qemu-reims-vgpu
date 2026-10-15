@@ -373,6 +373,21 @@ static uint64_t profile_rc_rebuild, profile_rc_refused, profile_rc_bitmap;
 /* FIX 1: hypervisor dirty queries those syncs issued (whpx_dirty_query_count
  * deltas on the syncing thread), so hypercalls per sync = hypercalls/syncs. */
 static uint64_t profile_hypercalls;
+/*
+ * Cursor doorbells (0x1220) in on-demand mode: skipped (no epoch bump, slug
+ * dirty_epoch_skip_cursor_doorbell) or noted because
+ * REIMS_VGPU_DIRTY_CURSOR_EPOCH=bump forced it (dirty_epoch_cursor_bump_forced).
+ * Appended to REIMS_DIRTY_PROFILE after the existing fields.
+ */
+static uint64_t profile_cursor_skip, profile_cursor_forced;
+void reims_vgpu_dirty_count_cursor_doorbell(ReimsDirtyDoorbellAction action)
+{
+    if (action == REIMS_DIRTY_DOORBELL_SKIP_CURSOR) {
+        qatomic_inc(&profile_cursor_skip);
+    } else if (action == REIMS_DIRTY_DOORBELL_NOTE_CURSOR_FORCED) {
+        qatomic_inc(&profile_cursor_forced);
+    }
+}
 static void profile_max(uint64_t *value, uint64_t sample)
 {
     uint64_t old = qatomic_read(value);
@@ -402,7 +417,9 @@ static void reims_vgpu_dirty_profile(void)
             " range_cache_hit=%" PRIu64 " range_cache_build=%" PRIu64
             " range_cache_rebuild=%" PRIu64 " range_cache_refused=%" PRIu64
             " range_bitmap=%" PRIu64 " hypercalls=%" PRIu64
-            " hypercalls_per_sync=%.1f\n",
+            " hypercalls_per_sync=%.1f"
+            " dirty_epoch_skip_cursor_doorbell=%" PRIu64
+            " dirty_epoch_cursor_bump_forced=%" PRIu64 "\n",
             qatomic_xchg(&profile_calls, 0), qatomic_xchg(&profile_total, 0),
             qatomic_xchg(&profile_wait, 0), qatomic_xchg(&profile_plan, 0),
             qatomic_xchg(&profile_query, 0), qatomic_xchg(&profile_finish, 0),
@@ -416,7 +433,9 @@ static void reims_vgpu_dirty_profile(void)
             qatomic_xchg(&profile_rc_rebuild, 0),
             qatomic_xchg(&profile_rc_refused, 0),
             qatomic_xchg(&profile_rc_bitmap, 0), hypercalls,
-            syncs ? (double)hypercalls / syncs : 0.0);
+            syncs ? (double)hypercalls / syncs : 0.0,
+            qatomic_xchg(&profile_cursor_skip, 0),
+            qatomic_xchg(&profile_cursor_forced, 0));
 }
 
 static void reims_vgpu_dirty_sync_sets(ReimsVgpuDirty *d, uint64_t target_token);

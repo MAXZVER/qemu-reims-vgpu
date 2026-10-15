@@ -208,3 +208,10 @@ test_reims_dirty_query = executable('test-reims-vgpu-dirty-query',
   include_directories: include_directories('../../hw/display'))
 test('test-reims-vgpu-dirty-query', test_reims_dirty_query,
      protocol: 'exitcode', timeout: 60, suite: ['unit'])
+
+# reims-vgpu cursor-doorbell epoch policy. Header-only, like the planner above.
+test_reims_doorbell_policy = executable('test-reims-vgpu-doorbell-policy',
+  'test-reims-vgpu-doorbell-policy.c',
+  include_directories: include_directories('../../hw/display'))
+test('test-reims-vgpu-doorbell-policy', test_reims_doorbell_policy,
+     protocol: 'exitcode', timeout: 60, suite: ['unit'])
