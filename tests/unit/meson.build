@@ -200,3 +200,11 @@ foreach test_name, extra: tests
        priority: slow_tests.get(test_name, 30),
        suite: ['unit'])
 endforeach
+
+# reims-vgpu dirty-range planner. Header-only and assert-based, so it builds
+# without the device and reports by exit code rather than TAP.
+test_reims_dirty_query = executable('test-reims-vgpu-dirty-query',
+  'test-reims-vgpu-dirty-query.c',
+  include_directories: include_directories('../../hw/display'))
+test('test-reims-vgpu-dirty-query', test_reims_dirty_query,
+     protocol: 'exitcode', timeout: 60, suite: ['unit'])

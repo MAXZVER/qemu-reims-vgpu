@@ -28,6 +28,12 @@ extern bool whpx_allowed;
 extern bool whpx_irqchip_in_kernel;
 #define whpx_enabled() (whpx_allowed)
 #define whpx_irqchip_in_kernel() (whpx_irqchip_in_kernel)
+/*
+ * Hypervisor dirty-bitmap queries (WHvQueryGpaRangeDirtyBitmap) issued so
+ * far by the calling thread; a per-thread count, so a caller can attribute
+ * the delta across its own sync exactly. 0 where WHPX is not built in.
+ */
+uint64_t whpx_dirty_query_count(void);
 #else /* !CONFIG_WHPX_IS_POSSIBLE */
 #define whpx_enabled() 0
 #define whpx_irqchip_in_kernel() (0)

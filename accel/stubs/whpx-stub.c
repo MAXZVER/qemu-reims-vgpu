@@ -11,3 +11,8 @@
 
 bool whpx_allowed;
 bool whpx_irqchip_in_kernel;
+
+uint64_t whpx_dirty_query_count(void)
+{
+    return 0;
+}

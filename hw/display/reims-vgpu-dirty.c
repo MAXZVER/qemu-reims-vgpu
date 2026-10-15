@@ -65,6 +65,14 @@ typedef struct ReimsVgpuDirtySet {
     uint64_t seen_seq;
     uint64_t last_query_epoch;  /* epoch of the last generation or page read */
     uint64_t claim_epoch;       /* epoch a sync is running for, or 0 */
+    /*
+     * FIX 1: this set's single-set sync plan, the merged ranges per region.
+     * Derived from `pages` (immutable once tracked) and checked against the
+     * slice table, page geometry and gap it was built from at every use, so a
+     * layout change rebuilds it rather than serving it; freed with the set
+     * when the mapping retires. Read and written under d->lock only.
+     */
+    ReimsDirtyQueryCache range_cache;
 } ReimsVgpuDirtySet;
 
 struct ReimsVgpuDirty {
@@ -112,6 +120,13 @@ struct ReimsVgpuDirty {
     uint64_t sync_pages_bits;
     GArray *sync_ranges;    /* MemoryRegionRange */
     /*
+     * FIX 1 scratch, sync_lock held like the above: the slice table in the
+     * planner's terms, and the per-region batches copied out of a set's
+     * cached plan so the queries run without d->lock and survive an untrack.
+     */
+    GArray *sync_qslices;   /* ReimsDirtyQuerySlice */
+    GArray *sync_groups;    /* ReimsDirtyQueryGroup */
+    /*
      * Where a consumed dirty bit goes: the global write sequence stamped on the
      * target page it was read for. Consuming (reading and clearing) a bit is
      * then safe whichever set asked — a set sharing the page reads the stamp —
@@ -155,6 +170,7 @@ static void reims_vgpu_dirty_set_free(gpointer p)
 {
     ReimsVgpuDirtySet *s = p;
 
+    reims_dirty_query_cache_free(&s->range_cache);
     g_free(s->pages);
     g_free(s->page_gen);
     g_free(s);
@@ -204,6 +220,12 @@ void reims_vgpu_dirty_free(ReimsVgpuDirty *d)
     g_free(d->sync_pages);
     if (d->sync_ranges) {
         g_array_free(d->sync_ranges, TRUE);
+    }
+    if (d->sync_qslices) {
+        g_array_free(d->sync_qslices, TRUE);
+    }
+    if (d->sync_groups) {
+        g_array_free(d->sync_groups, TRUE);
     }
     g_free(d->page_seq);
     qemu_cond_destroy(&d->synced_cond);
@@ -339,6 +361,18 @@ static uint64_t profile_fg_calls, profile_fg_us, profile_fg_max;
 static uint64_t profile_claim_waits, profile_claim_us, profile_claim_max;
 static uint64_t profile_bg_calls, profile_bg_us, profile_bg_max;
 static uint64_t profile_query, profile_finish, profile_pages, profile_ranges, profile_last;
+/*
+ * FIX 1. syncs: sync_tracked calls that reached a query (ranges/syncs is the
+ * ranges per sync). range_cache_*: how a single-set sync got its plan --
+ * hit, first build, rebuild on a changed key, or refused (allocation failed,
+ * so the bitmap scan planned it). range_bitmap: syncs planned by the bitmap
+ * scan, the harvest's all-sets and multi-set path plus any refusal.
+ */
+static uint64_t profile_syncs, profile_rc_hit, profile_rc_build;
+static uint64_t profile_rc_rebuild, profile_rc_refused, profile_rc_bitmap;
+/* FIX 1: hypervisor dirty queries those syncs issued (whpx_dirty_query_count
+ * deltas on the syncing thread), so hypercalls per sync = hypercalls/syncs. */
+static uint64_t profile_hypercalls;
 static void profile_max(uint64_t *value, uint64_t sample)
 {
     uint64_t old = qatomic_read(value);
@@ -352,16 +386,23 @@ static void reims_vgpu_dirty_profile(void)
 {
     uint64_t now = g_get_monotonic_time();
     uint64_t last = qatomic_read(&profile_last);
+    uint64_t syncs, hypercalls;
     if (now - last < 1000000 || qatomic_cmpxchg(&profile_last, last, now) != last) {
         return;
     }
+    syncs = qatomic_xchg(&profile_syncs, 0);
+    hypercalls = qatomic_xchg(&profile_hypercalls, 0);
     fprintf(stderr, "REIMS_DIRTY_PROFILE calls=%" PRIu64 " total_us=%" PRIu64
             " wait_us=%" PRIu64 " plan_us=%" PRIu64 " query_us=%" PRIu64
             " finish_us=%" PRIu64 " pages=%" PRIu64 " ranges=%" PRIu64
             " mono_us=%" PRIu64 " fg_calls=%" PRIu64 " fg_us=%" PRIu64
             " fg_max_us=%" PRIu64 " claim_waits=%" PRIu64 " claim_us=%" PRIu64
             " claim_max_us=%" PRIu64 " bg_calls=%" PRIu64 " bg_us=%" PRIu64
-            " bg_max_us=%" PRIu64 "\n",
+            " bg_max_us=%" PRIu64 " syncs=%" PRIu64
+            " range_cache_hit=%" PRIu64 " range_cache_build=%" PRIu64
+            " range_cache_rebuild=%" PRIu64 " range_cache_refused=%" PRIu64
+            " range_bitmap=%" PRIu64 " hypercalls=%" PRIu64
+            " hypercalls_per_sync=%.1f\n",
             qatomic_xchg(&profile_calls, 0), qatomic_xchg(&profile_total, 0),
             qatomic_xchg(&profile_wait, 0), qatomic_xchg(&profile_plan, 0),
             qatomic_xchg(&profile_query, 0), qatomic_xchg(&profile_finish, 0),
@@ -370,7 +411,12 @@ static void reims_vgpu_dirty_profile(void)
             qatomic_xchg(&profile_fg_max, 0), qatomic_xchg(&profile_claim_waits, 0),
             qatomic_xchg(&profile_claim_us, 0), qatomic_xchg(&profile_claim_max, 0),
             qatomic_xchg(&profile_bg_calls, 0), qatomic_xchg(&profile_bg_us, 0),
-            qatomic_xchg(&profile_bg_max, 0));
+            qatomic_xchg(&profile_bg_max, 0), syncs,
+            qatomic_xchg(&profile_rc_hit, 0), qatomic_xchg(&profile_rc_build, 0),
+            qatomic_xchg(&profile_rc_rebuild, 0),
+            qatomic_xchg(&profile_rc_refused, 0),
+            qatomic_xchg(&profile_rc_bitmap, 0), hypercalls,
+            syncs ? (double)hypercalls / syncs : 0.0);
 }
 
 static void reims_vgpu_dirty_sync_sets(ReimsVgpuDirty *d, uint64_t target_token);
@@ -875,6 +921,109 @@ static void reims_vgpu_dirty_mark_set(ReimsVgpuDirty *d,
     }
 }
 
+/*
+ * FIX 1: sync one set from its cached plan instead of marking it into the
+ * whole-RAM bitmap, scanning it and zeroing it again. The plan is the same
+ * ranges in the same batches (reims_dirty_query_plan, held against the scan
+ * by tests/unit/test-reims-vgpu-dirty-query.c), so exactly the same pages
+ * are queried and every dirty semantic is unchanged.
+ *
+ * sync_lock held; d->lock is taken inside it, the documented order, and only
+ * around the plan lookup and copy, never across a hypervisor query. A
+ * rebuild is bounded by the set's page count, the same walk mark_set made
+ * under the same lock. Returns false only when the cache refused (an
+ * allocation failed): the caller then plans with the bitmap scan, which
+ * gives the same answer.
+ */
+static bool reims_vgpu_dirty_sync_cached(ReimsVgpuDirty *d,
+                                         const ReimsVgpuDirtySlice *slices,
+                                         int n, uint64_t token, int shift)
+{
+    ReimsDirtyQuerySlice *q;
+    ReimsVgpuDirtySet *set;
+    ReimsDirtyQueryCache *c;
+    size_t k;
+    int i, how;
+
+    if (!d->sync_qslices) {
+        d->sync_qslices = g_array_new(FALSE, FALSE,
+                                      sizeof(ReimsDirtyQuerySlice));
+    }
+    if (!d->sync_groups) {
+        d->sync_groups = g_array_new(FALSE, FALSE,
+                                     sizeof(ReimsDirtyQueryGroup));
+    }
+    g_array_set_size(d->sync_qslices, n);
+    q = &g_array_index(d->sync_qslices, ReimsDirtyQuerySlice, 0);
+    for (i = 0; i < n; i++) {
+        q[i].mr = slices[i].mr;
+        q[i].gpa = slices[i].gpa;
+        q[i].len = slices[i].len;
+        q[i].offset = slices[i].offset;
+        q[i].logged = slices[i].logged;
+    }
+
+    qemu_mutex_lock(&d->lock);
+    set = g_hash_table_lookup(d->sets, &token);
+    if (!set) {
+        /* Untracked since the claim: the scan marked nothing and queried
+         * nothing for it either. */
+        qemu_mutex_unlock(&d->lock);
+        return true;
+    }
+    c = &set->range_cache;
+    how = reims_dirty_query_cache_get(c, set->pages, set->count,
+                                      set->page_size, shift, q, n,
+                                      reims_vgpu_dirty_sync_gap_pages());
+    switch (how) {
+    case REIMS_DIRTY_QUERY_CACHE_HIT:
+        qatomic_inc(&profile_rc_hit);
+        break;
+    case REIMS_DIRTY_QUERY_CACHE_BUILT:
+        qatomic_inc(&profile_rc_build);
+        break;
+    case REIMS_DIRTY_QUERY_CACHE_REBUILT:
+        qatomic_inc(&profile_rc_rebuild);
+        break;
+    default:
+        qemu_mutex_unlock(&d->lock);
+        qatomic_inc(&profile_rc_refused);
+        return false;
+    }
+    g_array_set_size(d->sync_ranges, c->nranges);
+    for (k = 0; k < c->nranges; k++) {
+        MemoryRegionRange *r = &g_array_index(d->sync_ranges,
+                                              MemoryRegionRange, k);
+        r->start = c->ranges[k].start;
+        r->len = c->ranges[k].len;
+    }
+    g_array_set_size(d->sync_groups, c->ngroups);
+    for (i = 0; i < c->ngroups; i++) {
+        g_array_index(d->sync_groups, ReimsDirtyQueryGroup, i) = c->groups[i];
+    }
+    qemu_mutex_unlock(&d->lock);
+
+    /* One batch per MemoryRegion, as the scan issued them. */
+    for (i = 0; i < (int)d->sync_groups->len; i++) {
+        const ReimsDirtyQueryGroup *g = &g_array_index(d->sync_groups,
+                                                       ReimsDirtyQueryGroup, i);
+        uint64_t query_started = g_get_monotonic_time();
+        uint64_t queries = whpx_dirty_query_count();
+
+        memory_region_sync_dirty_ranges(slices[g->slice].mr,
+                                        &g_array_index(d->sync_ranges,
+                                                       MemoryRegionRange,
+                                                       g->first),
+                                        g->count);
+        qatomic_fetch_add(&profile_query, g_get_monotonic_time() - query_started);
+        qatomic_fetch_add(&profile_hypercalls,
+                          whpx_dirty_query_count() - queries);
+        qatomic_fetch_add(&profile_ranges, g->count);
+    }
+    qatomic_inc(&profile_syncs);
+    return true;
+}
+
 static void reims_vgpu_dirty_sync_tracked(ReimsVgpuDirty *d,
                                           const ReimsVgpuDirtySlice *slices,
                                           int n, const GArray *tokens)
@@ -901,6 +1050,15 @@ static void reims_vgpu_dirty_sync_tracked(ReimsVgpuDirty *d,
     if (!d->sync_ranges) {
         d->sync_ranges = g_array_new(FALSE, FALSE, sizeof(MemoryRegionRange));
     }
+    /* FIX 1: one set (every on-demand sync) plans from its cached ranges.
+     * The harvest's all-sets and multi-set unions keep the bitmap scan. */
+    if (tokens && tokens->len == 1 &&
+        reims_vgpu_dirty_sync_cached(d, slices, n,
+                                     g_array_index(tokens, uint64_t, 0),
+                                     shift)) {
+        return;
+    }
+    qatomic_inc(&profile_rc_bitmap);
 
     qemu_mutex_lock(&d->lock);
     if (tokens) {
@@ -964,13 +1122,17 @@ static void reims_vgpu_dirty_sync_tracked(ReimsVgpuDirty *d,
             }
         }
         uint64_t query_started = g_get_monotonic_time();
+        uint64_t queries = whpx_dirty_query_count();
         memory_region_sync_dirty_ranges(slices[i].mr,
                                         &g_array_index(d->sync_ranges,
                                                        MemoryRegionRange, 0),
                                         d->sync_ranges->len);
         qatomic_fetch_add(&profile_query, g_get_monotonic_time() - query_started);
+        qatomic_fetch_add(&profile_hypercalls,
+                          whpx_dirty_query_count() - queries);
         qatomic_fetch_add(&profile_ranges, d->sync_ranges->len);
     }
+    qatomic_inc(&profile_syncs);
     bitmap_zero(d->sync_pages, bits);
 }
 

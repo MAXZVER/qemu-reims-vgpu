@@ -398,6 +398,88 @@ static void whpx_transaction_commit(MemoryListener *listener)
  */
 #define WHPX_DIRTY_QUERY_UNLOCKED_PAGES 16384
 
+/*
+ * Bitmaps for whpx_log_sync, reused rather than allocated and zeroed afresh
+ * for every query: a caller that syncs many small ranges (reims-vgpu's
+ * per-surface sync issues one query per range, ~150 per doorbell) paid an
+ * allocation and a free for each.
+ *
+ * log_sync runs on whichever thread asks -- the main loop, migration, device
+ * threads that are not QEMU threads -- and the query runs with no lock held,
+ * so a static buffer would be shared mid-query. A per-thread buffer would
+ * need a thread-exit hook, which a thread QEMU did not create never runs.
+ * So buffers live in this small pool: taken under the lock, used outside it,
+ * given back. The lock is a leaf held for a few loads and stores; nothing is
+ * ever taken under it. At most WHPX_DIRTY_BUF_POOL buffers are kept (one per
+ * concurrent caller is all that is ever reused); each is as large as the
+ * largest range it served, at most guest RAM / 32768 bytes.
+ */
+#define WHPX_DIRTY_BUF_POOL 4
+
+typedef struct WhpxDirtyBuf {
+    uint64_t *words;
+    size_t cap;
+} WhpxDirtyBuf;
+
+static QemuMutex whpx_dirty_buf_lock;
+static WhpxDirtyBuf whpx_dirty_buf_pool[WHPX_DIRTY_BUF_POOL];
+static int whpx_dirty_buf_n;
+
+/* Hypervisor bitmap queries issued by the calling thread; see whpx.h. */
+static __thread uint64_t whpx_dirty_queries;
+
+uint64_t whpx_dirty_query_count(void)
+{
+    return whpx_dirty_queries;
+}
+
+/* A zeroed buffer of at least `words` words, as g_new0 gave. */
+static WhpxDirtyBuf whpx_dirty_buf_take(size_t words)
+{
+    WhpxDirtyBuf b = { NULL, 0 };
+    int i, best = -1;
+
+    qemu_mutex_lock(&whpx_dirty_buf_lock);
+    /* The smallest that fits, else the largest: one caller's whole-region
+     * sync does not get traded away for another's small ranges. */
+    for (i = 0; i < whpx_dirty_buf_n; i++) {
+        const WhpxDirtyBuf *c = &whpx_dirty_buf_pool[i];
+
+        if (best < 0 ||
+            (c->cap >= words &&
+             (whpx_dirty_buf_pool[best].cap < words ||
+              c->cap < whpx_dirty_buf_pool[best].cap)) ||
+            (c->cap < words && whpx_dirty_buf_pool[best].cap < words &&
+             c->cap > whpx_dirty_buf_pool[best].cap)) {
+            best = i;
+        }
+    }
+    if (best >= 0) {
+        b = whpx_dirty_buf_pool[best];
+        whpx_dirty_buf_pool[best] = whpx_dirty_buf_pool[--whpx_dirty_buf_n];
+    }
+    qemu_mutex_unlock(&whpx_dirty_buf_lock);
+
+    if (b.cap < words) {
+        g_free(b.words);
+        b.words = g_new(uint64_t, words);
+        b.cap = words;
+    }
+    memset(b.words, 0, words * sizeof(uint64_t));
+    return b;
+}
+
+static void whpx_dirty_buf_give(WhpxDirtyBuf b)
+{
+    qemu_mutex_lock(&whpx_dirty_buf_lock);
+    if (whpx_dirty_buf_n < WHPX_DIRTY_BUF_POOL) {
+        whpx_dirty_buf_pool[whpx_dirty_buf_n++] = b;
+        b.words = NULL;
+    }
+    qemu_mutex_unlock(&whpx_dirty_buf_lock);
+    g_free(b.words);
+}
+
 static void whpx_log_sync(MemoryListener *listener,
                          MemoryRegionSection *section)
 {
@@ -407,7 +489,7 @@ static void whpx_log_sync(MemoryListener *listener,
     uint64_t size = int128_get64(section->size);
     uint64_t page = qemu_real_host_page_size();
     uint64_t pages, words;
-    g_autofree uint64_t *bitmap = NULL;
+    WhpxDirtyBuf buf;
     ram_addr_t ram_addr;
     bool relock;
     HRESULT hr;
@@ -426,7 +508,7 @@ static void whpx_log_sync(MemoryListener *listener,
         QEMU_IS_ALIGNED(size, page) && size / page <= UINT32_MAX * 8ULL) {
         pages = size / page;
         words = DIV_ROUND_UP(pages, 64);
-        bitmap = g_new0(uint64_t, words);
+        buf = whpx_dirty_buf_take(words);
         ram_addr = memory_region_get_ram_addr(mr) +
                    section->offset_within_region;
         /*
@@ -447,8 +529,9 @@ static void whpx_log_sync(MemoryListener *listener,
             bql_unlock();
         }
         hr = whp_dispatch.WHvQueryGpaRangeDirtyBitmap(whpx->partition, gpa,
-                                                      size, bitmap,
+                                                      size, buf.words,
                                                       words * sizeof(uint64_t));
+        whpx_dirty_queries++;
         if (relock) {
             bql_lock();
         }
@@ -458,10 +541,12 @@ static void whpx_log_sync(MemoryListener *listener,
              * little-endian) host that is bit-for-bit the little-endian
              * unsigned-long bitmap QEMU consumes, whatever the long's width.
              */
-            physical_memory_set_dirty_lebitmap((unsigned long *)bitmap,
+            physical_memory_set_dirty_lebitmap((unsigned long *)buf.words,
                                                ram_addr, pages);
+            whpx_dirty_buf_give(buf);
             return;
         }
+        whpx_dirty_buf_give(buf);
         whpx_dirty_tracking_disable("bitmap query failed", hr);
     }
 
@@ -482,6 +567,8 @@ static MemoryListener whpx_memory_listener = {
 
 void whpx_memory_init(void)
 {
+    /* Before the listener exists, so before any whpx_log_sync. */
+    qemu_mutex_init(&whpx_dirty_buf_lock);
     memory_listener_register(&whpx_memory_listener, &address_space_memory);
 }
 
