@@ -1542,6 +1542,34 @@ static bool whpx_mmio_fast_store(CPUState *cpu,
  * VEX, no address-size override, no access crossing a page; anything else falls
  * through to the emulator as before.
  */
+/*
+ * TEMP (lab): the instruction at `rip`, read through the guest's own translation, for an exit that carried no
+ * instruction bytes (b480: the early-boot `movq m64, xmm` exit arrived with none, so the SSE path below had
+ * nothing to decode and the emulator ended the VM). Returns the bytes read; 0 when the first page does not
+ * translate.
+ */
+static unsigned whpx_fetch_insn(CPUState *cpu, uint64_t rip, uint8_t *buf, unsigned len)
+{
+    unsigned got = 0;
+
+    while (got < len) {
+        WHV_TRANSLATE_GVA_RESULT res;
+        WHV_GUEST_PHYSICAL_ADDRESS gpa;
+        uint64_t gva = rip + got;
+        unsigned chunk = MIN(len - got, 0x1000 - (unsigned)(gva & 0xfff));
+        HRESULT hr = whp_dispatch.WHvTranslateGva(whpx_global.partition, cpu->cpu_index, gva,
+                                                  WHvTranslateGvaFlagValidateRead, &res, &gpa);
+
+        if (FAILED(hr) || res.ResultCode != WHvTranslateGvaResultSuccess ||
+            address_space_read(&address_space_memory, gpa, MEMTXATTRS_UNSPECIFIED, buf + got, chunk) !=
+                MEMTX_OK) {
+            break;
+        }
+        got += chunk;
+    }
+    return got;
+}
+
 static bool whpx_mmio_sse(CPUState *cpu, const WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
 {
     const WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
@@ -1552,10 +1580,15 @@ static bool whpx_mmio_sse(CPUState *cpu, const WHV_RUN_VP_EXIT_CONTEXT *exit_ctx
     WHV_REGISTER_NAME name;
     WHV_REGISTER_VALUE value = {};
     uint8_t buf[16] = {};
+    uint8_t fetched[16];
     HRESULT hr;
 
     if (!vp->ExecutionState.EferLma || !vp->Cs.Long || (vp->Rflags & TF_MASK)) {
         return false;
+    }
+    if (n < 3) {
+        n = whpx_fetch_insn(cpu, vp->Rip, fetched, sizeof(fetched));
+        b = fetched;
     }
     if (cpu->vcpu_dirty) {
         /*
