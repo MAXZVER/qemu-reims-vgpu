@@ -97,6 +97,88 @@ static void *qemu_lab_large_ram_alloc(size_t size)
     return ptr;
 }
 
+/*
+ * TEMP (lab, QEMU_WHPX_WP_VIEW=on): guest RAM of 1 GiB and more as one pagefile-backed section mapped twice. QEMU and
+ * the device use the first view (the pointer returned); the hypervisor maps the second (qemu_win_ram_hv_view), and
+ * write protection is that view's page protection (VirtualProtect), not the hypervisor's GPA map. A store from the
+ * guest to a page read-only there exits like one to a GPA mapped read-only; the host's own stores go through the
+ * first view and never fault. Why: a WHvMapGpaRange remap costs ~22 ns for every read-only range already in the
+ * partition (whpfrag2.c, 2026-10-15: 5.5 us with none, 327 us with 16k, 740 us with 32k; mappings split in chunks do
+ * not help), the WP thread remaps at 0.5-1 ms in the VM, and a canvas scene's ~10k protects take 16 s at its duty.
+ * VirtualProtect on the view: 1.4 us on a guest-written page, flat to 100k protected regions (whpwp.c, whpsem.c).
+ * Not with large pages (4K protection inside a large page is impossible).
+ */
+typedef struct QemuWinRamView {
+    char *host, *hv;
+    size_t size;
+    HANDLE section;
+} QemuWinRamView;
+
+static QemuWinRamView qemu_win_ram_views[8];
+static int qemu_win_ram_nviews;
+
+static bool qemu_win_wp_view_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("QEMU_WHPX_WP_VIEW");
+
+        on = e && strcmp(e, "on") == 0;
+    }
+    return on;
+}
+
+static void *qemu_win_ram_view_alloc(size_t size)
+{
+    QemuWinRamView *v;
+    HANDLE h;
+    void *a, *b;
+
+    if (!qemu_win_wp_view_on() || size < (1ULL << 30) ||
+        qemu_win_ram_nviews == ARRAY_SIZE(qemu_win_ram_views)) {
+        return NULL;
+    }
+    h = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE | SEC_COMMIT,
+                           (DWORD)((uint64_t)size >> 32), (DWORD)size, NULL);
+    if (!h) {
+        fprintf(stderr, "reims-lab: wp-view section of %zu MB refused (%lu)\n", size >> 20, GetLastError());
+        return NULL;
+    }
+    a = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, size);
+    b = a ? MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, size) : NULL;
+    if (!b) {
+        fprintf(stderr, "reims-lab: wp-view views of %zu MB refused (%lu)\n", size >> 20, GetLastError());
+        if (a) {
+            UnmapViewOfFile(a);
+        }
+        CloseHandle(h);
+        return NULL;
+    }
+    v = &qemu_win_ram_views[qemu_win_ram_nviews];
+    v->host = a;
+    v->hv = b;
+    v->size = size;
+    v->section = h;
+    qatomic_store_release(&qemu_win_ram_nviews, qemu_win_ram_nviews + 1);
+    fprintf(stderr, "reims-lab: wp-view RAM size_mb=%zu host=%p hv=%p\n", size >> 20, a, b);
+    return a;
+}
+
+void *qemu_win_ram_hv_view(void *host, size_t len)
+{
+    int i, n = qatomic_load_acquire(&qemu_win_ram_nviews);
+
+    for (i = 0; i < n; i++) {
+        QemuWinRamView *v = &qemu_win_ram_views[i];
+
+        if ((char *)host >= v->host && (char *)host + len <= v->host + v->size) {
+            return v->hv + ((char *)host - v->host);
+        }
+    }
+    return host;
+}
+
 void *qemu_anon_ram_alloc(size_t size, uint64_t *align, bool shared,
                           bool noreserve)
 {
@@ -111,7 +193,10 @@ void *qemu_anon_ram_alloc(size_t size, uint64_t *align, bool shared,
         return NULL;
     }
 
-    ptr = qemu_lab_large_ram_alloc(size);
+    ptr = qemu_win_ram_view_alloc(size);
+    if (!ptr) {
+        ptr = qemu_lab_large_ram_alloc(size);
+    }
     if (!ptr) {
         ptr = VirtualAlloc(NULL, size, MEM_COMMIT, PAGE_READWRITE);
     }
@@ -125,7 +210,21 @@ void *qemu_anon_ram_alloc(size_t size, uint64_t *align, bool shared,
 
 void qemu_anon_ram_free(void *ptr, size_t size)
 {
+    int i;
+
     trace_qemu_anon_ram_free(ptr, size);
+    for (i = 0; ptr && i < qemu_win_ram_nviews; i++) {
+        QemuWinRamView *v = &qemu_win_ram_views[i];
+
+        if (v->host == ptr && v->section) {   /* TEMP (lab, QEMU_WHPX_WP_VIEW) */
+            UnmapViewOfFile(v->hv);
+            UnmapViewOfFile(v->host);
+            CloseHandle(v->section);
+            v->section = NULL;
+            v->size = 0;
+            return;
+        }
+    }
     if (ptr) {
         VirtualFree(ptr, 0, MEM_RELEASE);
     }

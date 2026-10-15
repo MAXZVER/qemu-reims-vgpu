@@ -609,6 +609,31 @@ int whpx_wp_remap(uint64_t gpa, uint64_t size, bool writable)
     memory_region_unref(sec.mr);
     t_rm = get_clock();
     qatomic_inc(&whpx_wp_busy);
+    {
+        /*
+         * TEMP (lab, QEMU_WHPX_WP_VIEW): the protection is the hypervisor view's page protection - a price that does
+         * not grow with the read-only ranges already there. RW->RO then drops the range's dirty bits through a query
+         * (it resets what it returns), as the remap below does.
+         */
+        void *hv = qemu_win_ram_hv_view(mem, size);
+
+        if (hv != mem) {
+            DWORD old;
+
+            if (!VirtualProtect(hv, size, writable ? PAGE_READWRITE : PAGE_READONLY, &old)) {
+                rc = -2;
+            } else if (!writable && whpx_dirty_tracking && whp_dispatch.WHvQueryGpaRangeDirtyBitmap) {
+                uint64_t words = DIV_ROUND_UP(size >> 12, 64), small[64];
+                uint64_t *bm = words <= ARRAY_SIZE(small) ? small : g_new(uint64_t, words);
+
+                whp_dispatch.WHvQueryGpaRangeDirtyBitmap(whpx->partition, gpa, size, bm, words * 8);
+                if (bm != small) {
+                    g_free(bm);
+                }
+            }
+            goto done;
+        }
+    }
     /*
      * Mapped over the live mapping: one call, and no moment where the range is
      * unmapped (a dirty query meeting it then fails). The hypervisor takes it
@@ -642,6 +667,7 @@ int whpx_wp_remap(uint64_t gpa, uint64_t size, bool writable)
             rc = -3;
         }
     }
+done:
     if (rc == 0) {
         whpx_lab_wp_populate(gpa, size, writable);
     }
@@ -778,6 +804,20 @@ static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
     flags = WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagExecute
      | (writable ? WHvMapGpaRangeFlagWrite : 0);
     mem = memory_region_get_ram_ptr(area) + section->offset_within_region;
+    {
+        /* TEMP (lab, QEMU_WHPX_WP_VIEW): the hypervisor maps the RAM's protection view, all of it writable again */
+        void *hv = qemu_win_ram_hv_view(mem, size);
+
+        if (hv != mem) {
+            DWORD old;
+
+            if (writable && !VirtualProtect(hv, size, PAGE_READWRITE, &old)) {
+                error_report("WHPX: wp-view could not make 0x%" PRIx64 "+0x%" PRIx64 " writable", gva, size);
+                abort();
+            }
+            mem = hv;
+        }
+    }
 
     if (!whpx_dirty_tracking_decided) {
         const char *ut = getenv("REIMS_VGPU_LAB_RAM_UNTRACKED");

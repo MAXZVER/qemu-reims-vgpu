@@ -538,6 +538,14 @@ void *qemu_anon_ram_alloc(size_t size, uint64_t *align, bool shared,
                           bool noreserve);
 void qemu_anon_ram_free(void *ptr, size_t size);
 int qemu_shm_alloc(size_t size, Error **errp);
+#ifdef _WIN32
+/*
+ * TEMP (lab, QEMU_WHPX_WP_VIEW): the hypervisor's view of guest RAM at `host` (a pointer the RAM allocator
+ * returned, or into it): the same pages through a second view whose protection is the guest's write
+ * protection; `host` itself when the RAM has no such view.
+ */
+void *qemu_win_ram_hv_view(void *host, size_t len);
+#endif
 
 #ifdef _WIN32
 #define HAVE_CHARDEV_SERIAL 1
