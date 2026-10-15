@@ -863,6 +863,7 @@ struct ReimsVgpuDirty {
      * cost 250-300 us and the audio stopped. b447's 3 ms rest between give-back steps never lowered that rate.
      */
     bool wp_orphan_calm;
+    uint64_t wp_orphan_near, lab_wp_near_runs;   /* TEMP lab DIRTY_WP_ORPHAN_NEAR_KB (bytes; 0 = off) */
     int64_t wp_orphaned_ns, wp_orphan_hold_since;
     uint32_t wp_orphan_quiet_ms, wp_orphan_hold_ms;
     /* TEMP lab (b454): remaps by cause - protect, fault, orphan give-back, dropping give-back, other - per second. */
@@ -2218,6 +2219,8 @@ static void reims_wp_lock(ReimsVgpuDirty *d, int line)
     qatomic_set(&reims_wp_holder_ns, get_clock());
 }
 
+static int reims_vgpu_dirty_cmp_run(gconstpointer a, gconstpointer b);
+
 /* TEMP lab (b454): what the next remaps on this thread are for (lab_wp_cause_n). */
 enum { WP_CAUSE_PROTECT, WP_CAUSE_FAULT, WP_CAUSE_ORPHAN, WP_CAUSE_DROP, WP_CAUSE_OTHER };
 static __thread int reims_wp_cause = WP_CAUSE_OTHER;
@@ -2645,7 +2648,38 @@ static bool reims_vgpu_dirty_wp_fault(uint64_t gpa)
 
                         if (gpa >= r.gpa && gpa < r.gpa + r.size) {
                             g_array_remove_index_fast(d->wp_orphans, k);
-                            reims_vgpu_dirty_wp_release_merged(d, &r, 1, &budget);
+                            if (d->wp_orphan_near) {
+                                /*
+                                 * TEMP lab DIRTY_WP_ORPHAN_NEAR_KB: the orphan runs within that distance go with
+                                 * it, merged - a freed surface's pages are scattered runs of ~4 pages, and the
+                                 * guest filling it again faulted once a run (b457 C1: 585-922 faults a report).
+                                 */
+                                uint64_t lo = r.gpa > d->wp_orphan_near ? r.gpa - d->wp_orphan_near : 0;
+                                uint64_t hi = r.gpa + r.size + d->wp_orphan_near;
+                                GArray *nearby = g_array_new(FALSE, FALSE, sizeof(ReimsVgpuDirtyRun));
+                                size_t used;
+
+                                g_array_append_val(nearby, r);
+                                for (guint j = d->wp_orphans->len; j-- > 0;) {
+                                    ReimsVgpuDirtyRun o = g_array_index(d->wp_orphans, ReimsVgpuDirtyRun, j);
+
+                                    if (o.gpa < hi && o.gpa + o.size > lo) {
+                                        g_array_append_val(nearby, o);
+                                        g_array_remove_index_fast(d->wp_orphans, j);
+                                    }
+                                }
+                                g_array_sort(nearby, reims_vgpu_dirty_cmp_run);
+                                used = reims_vgpu_dirty_wp_release_merged(d, &g_array_index(nearby, ReimsVgpuDirtyRun, 0),
+                                                                          nearby->len, &budget);
+                                if (used < nearby->len) {   /* the budget ran out: the rest stay orphans */
+                                    g_array_append_vals(d->wp_orphans, &g_array_index(nearby, ReimsVgpuDirtyRun, used),
+                                                        nearby->len - used);
+                                }
+                                d->lab_wp_near_runs += nearby->len;
+                                g_array_free(nearby, TRUE);
+                            } else {
+                                reims_vgpu_dirty_wp_release_merged(d, &r, 1, &budget);
+                            }
                             break;
                         }
                     }
@@ -8359,6 +8393,8 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
              */
             d->wp_orphan_calm = !(getenv("REIMS_VGPU_LAB_DIRTY_WP_ORPHAN_CALM") &&
                                   strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_ORPHAN_CALM"), "off") == 0);
+            d->wp_orphan_near = getenv("REIMS_VGPU_LAB_DIRTY_WP_ORPHAN_NEAR_KB") ?
+                                (uint64_t)MAX(0, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_ORPHAN_NEAR_KB"))) << 10 : 0;
             d->wp_orphan_quiet_ms = getenv("REIMS_VGPU_LAB_DIRTY_WP_ORPHAN_QUIET_MS") ?
                                     MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_ORPHAN_QUIET_MS"))) : 300;
             d->wp_orphan_hold_ms = getenv("REIMS_VGPU_LAB_DIRTY_WP_ORPHAN_HOLD_MS") ?
