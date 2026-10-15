@@ -856,7 +856,7 @@ struct ReimsVgpuDirty {
      */
     unsigned wp_fair;   /* bits: 1 give-back stops, 2 step yields, 4 fault budget, 8 protect yields */
     /*
-     * TEMP lab DIRTY_WP_ORPHAN_CALM (=on, A/B): orphans (read-only runs of sets the guest freed) are not given back
+     * TEMP lab DIRTY_WP_ORPHAN_CALM (on, =off restores; b457): orphans (read-only runs of sets the guest freed) are not given back
      * while sets keep being freed (a UI transition) - at most `wp_orphan_hold_ms` - and protects wait with them; a
      * guest store into one still faults it back. b454 F0: at Safari's full-screen exit the WP thread remapped
      * 2000-2400 runs (50-106k pages, ~950 ms) a second, outside any duty, in exactly the seconds every guest exit
@@ -8277,8 +8277,13 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
             if (getenv("REIMS_VGPU_LAB_DIRTY_WP_FAIR_MASK")) {   /* TEMP lab: which parts (stress bisect) */
                 d->wp_fair &= atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_FAIR_MASK"));
             }
-            d->wp_orphan_calm = getenv("REIMS_VGPU_LAB_DIRTY_WP_ORPHAN_CALM") &&   /* TEMP lab */
-                                strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_ORPHAN_CALM"), "on") == 0;
+            /*
+             * TEMP lab, on by default since b457 (ABAB x3, Safari canvas 5K + leaving full screen): worst second of
+             * guest exit time 1.8/2.0/2.4 -> 1.6/0.56/1.5 s, mean exit there 207/222/343 -> 96/39/80 us, a store
+             * fault's time inside 15-17 -> 2.5 ms, fps equal (35.3/39.6/36.0 vs 35.9/39.2/37.8). `=off` restores.
+             */
+            d->wp_orphan_calm = !(getenv("REIMS_VGPU_LAB_DIRTY_WP_ORPHAN_CALM") &&
+                                  strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_ORPHAN_CALM"), "off") == 0);
             d->wp_orphan_quiet_ms = getenv("REIMS_VGPU_LAB_DIRTY_WP_ORPHAN_QUIET_MS") ?
                                     MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_ORPHAN_QUIET_MS"))) : 300;
             d->wp_orphan_hold_ms = getenv("REIMS_VGPU_LAB_DIRTY_WP_ORPHAN_HOLD_MS") ?
