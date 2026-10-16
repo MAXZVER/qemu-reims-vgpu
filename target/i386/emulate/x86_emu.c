@@ -812,12 +812,18 @@ static bool exec_wrmsr(CPUX86State *env, struct x86_decode *decode)
  */
 static bool do_bt(CPUX86State *env, struct x86_decode *decode, int flag)
 {
-    int32_t displacement;
+    int64_t displacement;
     uint8_t index;
     bool cf;
-    int mask = (4 == decode->operand_size) ? 0x1f : 0xf;
-
-    VM_PANIC_ON(decode->rex.rex);
+    /*
+     * TEMP lab (2026-10-16): the 64-bit forms (REX.W) too. A guest bts/btr on
+     * memory this emulator handles (an MMIO or write-protected page) with a 64-bit
+     * operand panicked the whole VM here ("decode->rex.rex", exit 0xc0000409 under
+     * the 5K Safari canvas, b608). REX without W only extends registers, which
+     * the operand fetch already resolves.
+     */
+    int mask = (8 == decode->operand_size) ? 0x3f :
+               (4 == decode->operand_size) ? 0x1f : 0xf;
 
     if (fetch_operands(env, decode, 2, false, true, false)) {
         return 1;
@@ -825,14 +831,17 @@ static bool do_bt(CPUX86State *env, struct x86_decode *decode, int flag)
     index = decode->op[1].val & mask;
 
     if (decode->op[0].type != X86_VAR_REG) {
-        if (4 == decode->operand_size) {
+        if (8 == decode->operand_size) {
+            displacement = ((int64_t) (decode->op[1].val & ~(uint64_t)0x3f)) / 64;
+            decode->op[0].addr += 8 * displacement;
+        } else if (4 == decode->operand_size) {
             displacement = ((int32_t) (decode->op[1].val & 0xffffffe0)) / 32;
             decode->op[0].addr += 4 * displacement;
         } else if (2 == decode->operand_size) {
             displacement = ((int16_t) (decode->op[1].val & 0xfff0)) / 16;
             decode->op[0].addr += 2 * displacement;
         } else {
-            VM_PANIC("bt 64bit\n");
+            VM_PANIC("bt operand size\n");
         }
     }
     if (read_val_ext(env, &decode->op[0],
@@ -846,13 +855,13 @@ static bool do_bt(CPUX86State *env, struct x86_decode *decode, int flag)
         set_CF(env, cf);
         return 0;
     case 1:
-        decode->op[0].val ^= (1u << index);
+        decode->op[0].val ^= (1ULL << index);
         break;
     case 2:
-        decode->op[0].val |= (1u << index);
+        decode->op[0].val |= (1ULL << index);
         break;
     case 3:
-        decode->op[0].val &= ~(1u << index);
+        decode->op[0].val &= ~(1ULL << index);
         break;
     }
     if (write_val_ext(env, &decode->op[0], decode->op[0].val,
