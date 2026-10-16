@@ -1428,6 +1428,112 @@ static bool whpx_mmio_fast_load(CPUState *cpu,
 }
 
 /*
+ * TEMP lab (2026-10-16): the compare twin of whpx_mmio_fast_load, for the one
+ * slow MMIO left on a busy guest. The display driver's interrupt handler tests
+ * the fault word with `cmp dword [reg+0x2c], 0` (83 /7 ib): the load path
+ * cannot take it and the generic path emulates it under the BQL, ~6.6 us on
+ * each of the ~3500 interrupts a second of the 5K canvas (b632 whpx-stats
+ * mmio_slow 0x8100102c:r:83782c00740c) - on the wake path of every guest
+ * thread sleeping on a completion stamp. Shape: 83 /7 ib with a memory
+ * operand, 64-bit code, at most a REX prefix. The result is only RFLAGS (CF,
+ * PF, AF, ZF, SF, OF), so one hypercall stores the flags and the advanced RIP.
+ */
+static bool whpx_mmio_fast_cmp(CPUState *cpu,
+                               const WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
+{
+    const WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
+    const WHV_VP_EXIT_CONTEXT *vp = &exit_ctx->VpContext;
+    const uint8_t *b = ctx->InstructionBytes;
+    unsigned n = ctx->InstructionByteCount, i = 0, rex = 0, disp;
+    unsigned modrm, mod, rm, size, msb;
+    MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+    WHV_REGISTER_NAME names[2];
+    WHV_REGISTER_VALUE values[2] = {};
+    MemoryRegion *mr;
+    hwaddr xlat, len;
+    uint64_t val = 0, a, imm, r, flags;
+    HRESULT hr;
+
+    if (ctx->AccessInfo.AccessType != WHvMemoryAccessRead ||
+        !vp->ExecutionState.EferLma || !vp->Cs.Long ||
+        vp->ExecutionState.InterruptionPending || (vp->Rflags & TF_MASK)) {
+        return false;
+    }
+    if (i < n && (b[i] & 0xf0) == 0x40) {
+        rex = b[i++];
+    }
+    if (i + 2 > n || b[i] != 0x83) {
+        return false;
+    }
+    modrm = b[i + 1];
+    i += 2;
+    mod = modrm >> 6;
+    rm = modrm & 7;
+    if (mod == 3 || ((modrm >> 3) & 7) != 7) {
+        return false;
+    }
+    disp = mod == 1 ? 1 : mod == 2 ? 4 : 0;
+    if (rm == 4) {
+        if (i >= n) {
+            return false;
+        }
+        if (mod == 0 && (b[i] & 7) == 5) {
+            disp = 4;                   /* SIB, no base: disp32 */
+        }
+        i++;
+    } else if (mod == 0 && rm == 5) {
+        disp = 4;                       /* RIP-relative */
+    }
+    i += disp;
+    if (i + 1 > n) {
+        return false;
+    }
+    size = (rex & 8) ? 8 : 4;
+    msb = size * 8 - 1;
+    imm = (uint64_t)(int64_t)(int8_t)b[i];
+    i++;
+    if (size == 4) {
+        imm = (uint32_t)imm;
+    }
+
+    RCU_READ_LOCK_GUARD();
+    len = size;
+    mr = address_space_translate(&address_space_memory, ctx->Gpa, &xlat, &len,
+                                 false, attrs);
+    if (!mr->lockless_io || len < size ||
+        memory_access_is_direct(mr, false, attrs)) {
+        return false;
+    }
+    /* Past here the device has seen the read; the access must complete. */
+    memory_region_dispatch_read(mr, xlat, &val, size_memop(size), attrs);
+
+    a = size == 4 ? (uint32_t)val : val;
+    r = a - imm;
+    if (size == 4) {
+        r = (uint32_t)r;
+    }
+    flags = vp->Rflags & ~(uint64_t)(CC_C | CC_P | CC_A | CC_Z | CC_S | CC_O);
+    flags |= a < imm ? CC_C : 0;
+    flags |= __builtin_parity(r & 0xff) ? 0 : CC_P;
+    flags |= ((a ^ imm ^ r) & 0x10) ? CC_A : 0;
+    flags |= r == 0 ? CC_Z : 0;
+    flags |= ((r >> msb) & 1) ? CC_S : 0;
+    flags |= ((((a ^ imm) & (a ^ r)) >> msb) & 1) ? CC_O : 0;
+
+    names[0] = WHvX64RegisterRflags;
+    values[0].Reg64 = flags;
+    names[1] = WHvX64RegisterRip;
+    values[1].Reg64 = vp->Rip + i;
+    hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
+        whpx_global.partition, cpu->cpu_index, names, 2, values);
+    if (FAILED(hr)) {
+        error_report("WHPX: fast MMIO cmp: failed to set registers, "
+                     "hr=%08lx", hr);
+    }
+    return true;
+}
+
+/*
  * TEMP lab (QEMU_WHPX_MMIO_FAST_STORE=1): the store twin of
  * whpx_mmio_fast_load, for the register writes a busy guest makes to a region
  * that declared lockless I/O (the display device's doorbells and acks; its
@@ -1744,6 +1850,7 @@ static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
 
     cpu->accel->mmio_fast = whpx_mmio_fast_path() &&
                             (whpx_mmio_fast_load(cpu, exit_ctx) ||
+                             whpx_mmio_fast_cmp(cpu, exit_ctx) ||
                              whpx_mmio_fast_store(cpu, exit_ctx));   /* gated per region inside */
     if (cpu->accel->mmio_fast) {
         if (whpx_stats_on()) {
