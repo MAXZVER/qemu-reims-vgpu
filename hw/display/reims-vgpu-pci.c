@@ -48,7 +48,20 @@ OBJECT_DECLARE_SIMPLE_TYPE(ReimsVGPUPCIState, REIMS_VGPU_PCI)
 typedef struct ReimsVGPUPCIPageView {
     void *ptr;
     size_t len;
+#ifdef _WIN32
+    /* TEMP (lab, WP_VIEW): the alias's run table, owned with the view. */
+    QemuWinRamAliasRun *runs;
+    size_t runs_n;
+#endif
 } ReimsVGPUPCIPageView;
+
+/* TEMP lab (b610): alias traffic counters behind page_views_lock, one line a second. */
+static struct {
+    uint64_t builds, build_ns, build_max_ns, fails;
+    uint64_t frees, free_ns;
+    uint64_t runs, run_pages;
+    int64_t last;
+} reims_pagealias;
 
 /*
  * BAR0 = full gfx window; control block at +0x1000. The size is the shared
@@ -112,6 +125,7 @@ struct ReimsVGPUPCIState {
      * unmap_pages when the Rust mapping lifetime ends, with device exit as the
      * final safety net. */
     GArray *page_views;
+    QemuMutex page_views_lock;
     uint64_t page_view_live_bytes;
     uint64_t page_view_live_pages;
     uint64_t page_views_created;
@@ -310,8 +324,10 @@ fail:
         /*
          * TEMP lab: off unless QEMU_WIN_PAGE_ALIAS=on. b608-b610 (5K Safari canvas): with the aliases the
          * whole VM stalled - vCPUs >1 s outside the hypervisor in memory-access exits, canvas 0.4 fps, Maps
-         * 0 - against 61 fps on the copying rails. Each alias is a placeholder reservation plus one
-         * MapViewOfFile3 per 4 KiB page, and WebKit churns 5K surfaces.
+         * 0 - against 61 fps on the copying rails. Each alias was a placeholder reservation plus one
+         * MapViewOfFile3 per 4 KiB page (3+ address-space calls per page, a 5K surface is 14400 pages) on
+         * the one section the WP dirty machinery reprotects; since the run-coalescing rebuild (one view per
+         * maximal section-consecutive run) `=on` is the arm this switch A/Bs against.
          */
         static int alias_off = -1;
         if (alias_off < 0) {
@@ -326,6 +342,9 @@ fail:
         unsigned long err = 0;
         size_t failed = SIZE_MAX;
         ReimsVGPUPCIPageView held;
+        QemuWinRamAliasRun *runs = NULL;
+        size_t runs_n = 0;
+        int64_t t_build = get_clock();
         void *view;
 
         rcu_read_lock();
@@ -345,8 +364,16 @@ fail:
             }
             hosts[i] = (uint8_t *)memory_region_get_ram_ptr(mr) + xlat;
         }
-        view = qemu_win_ram_alias_pages(hosts, count, page, &err, &failed);
         rcu_read_unlock();
+        /*
+         * The kernel calls run for the whole window (runs of pages, since the
+         * rebuild): under the RCU read lock they made every grace period wait
+         * out a surface build (b610 had tens of milliseconds per list), and
+         * nothing below reads the memory topology - the host pointers are
+         * stable for the RAM block's lifetime.
+         */
+        view = qemu_win_ram_alias_pages(hosts, count, page, &err, &failed,
+                                        &runs, &runs_n);
         g_free(hosts);
         if (!view) {
             failure->stage = failed == SIZE_MAX
@@ -354,14 +381,46 @@ fail:
                 : REIMS_VGPU_MAP_PAGES_FAILURE_ALIAS;
             failure->host_errno = (int)err;
             failure->page_index = failed == SIZE_MAX ? 0 : failed;
+            qemu_mutex_lock(&s->page_views_lock);
+            reims_pagealias.fails++;
+            qemu_mutex_unlock(&s->page_views_lock);
             return -1;
         }
         held.ptr = view;
         held.len = total;
+        held.runs = runs;
+        held.runs_n = runs_n;
+        qemu_mutex_lock(&s->page_views_lock);
         g_array_append_val(s->page_views, held);
         s->page_view_live_bytes += total;
         s->page_view_live_pages += count;
         s->page_views_created++;
+        {   /* TEMP lab (b610): one line a second while aliases are being built. */
+            int64_t now = get_clock(), build_ns = now - t_build;
+
+            reims_pagealias.builds++;
+            reims_pagealias.build_ns += build_ns;
+            if (build_ns > reims_pagealias.build_max_ns) {
+                reims_pagealias.build_max_ns = build_ns;
+            }
+            reims_pagealias.runs += runs_n;
+            reims_pagealias.run_pages += count;
+            if (!reims_pagealias.last || now - reims_pagealias.last >= NANOSECONDS_PER_SECOND) {
+                fprintf(stderr, "reims-pagealias epoch_ms=%" PRId64 " builds=%" PRIu64
+                        " build_us=%" PRIu64 " build_max_us=%" PRIu64 " frees=%" PRIu64
+                        " free_us=%" PRIu64 " runs=%" PRIu64 " run_pages=%" PRIu64
+                        " live=%u fails=%" PRIu64 "\n",
+                        g_get_real_time() / 1000,
+                        reims_pagealias.builds, reims_pagealias.build_ns / 1000,
+                        reims_pagealias.build_max_ns / 1000,
+                        reims_pagealias.frees, reims_pagealias.free_ns / 1000,
+                        reims_pagealias.runs, reims_pagealias.run_pages,
+                        s->page_views->len, reims_pagealias.fails);
+                memset(&reims_pagealias, 0, sizeof(reims_pagealias));
+                reims_pagealias.last = now;
+            }
+        }
+        qemu_mutex_unlock(&s->page_views_lock);
         *out_ptr = view;
         return 0;
     }
@@ -438,10 +497,12 @@ fail:
 
         held.ptr = view;
         held.len = total;
+        qemu_mutex_lock(&s->page_views_lock);
         g_array_append_val(s->page_views, held);
         s->page_view_live_bytes += total;
         s->page_view_live_pages += count;
         s->page_views_created++;
+        qemu_mutex_unlock(&s->page_views_lock);
         *out_ptr = view;
         return 0;
 
@@ -462,6 +523,7 @@ static void reims_vgpu_pci_unmap_pages(void *ctx, void *ptr, size_t len)
         return;
     }
 
+    qemu_mutex_lock(&s->page_views_lock);
     for (i = 0; i < s->page_views->len; i++) {
         ReimsVGPUPCIPageView *view =
             &g_array_index(s->page_views, ReimsVGPUPCIPageView, i);
@@ -469,19 +531,29 @@ static void reims_vgpu_pci_unmap_pages(void *ctx, void *ptr, size_t len)
         if (view->ptr != ptr || view->len != len) {
             continue;
         }
+        {
 #ifdef _WIN32
-        qemu_win_ram_alias_free(view->ptr,
-                                view->len >> REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64,
-                                (size_t)1 << REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64);
+            int64_t t_free = get_clock();
+
+            qemu_win_ram_alias_free(view->ptr,
+                                    view->len >> REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64,
+                                    (size_t)1 << REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64,
+                                    view->runs, view->runs_n);
+            g_free(view->runs);
+            reims_pagealias.frees++;   /* TEMP lab (b610) */
+            reims_pagealias.free_ns += get_clock() - t_free;
 #else
-        munmap(view->ptr, view->len);
+            munmap(view->ptr, view->len);
 #endif
+        }
         s->page_view_live_bytes -= view->len;
         s->page_view_live_pages -= view->len >> REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64;
         s->page_views_destroyed++;
         g_array_remove_index_fast(s->page_views, i);
+        qemu_mutex_unlock(&s->page_views_lock);
         return;
     }
+    qemu_mutex_unlock(&s->page_views_lock);
     /* A direct RAMBlock pointer is borrowed from QEMU and has no entry. */
 }
 
@@ -493,6 +565,7 @@ static int reims_vgpu_pci_page_alias_census(
     if (!s || !s->page_views || !out) {
         return -1;
     }
+    qemu_mutex_lock(&s->page_views_lock);
     *out = (ReimsVgpuPageAliasCensus) {
         .live = s->page_views->len,
         .live_bytes = s->page_view_live_bytes,
@@ -500,6 +573,7 @@ static int reims_vgpu_pci_page_alias_census(
         .created = s->page_views_created,
         .destroyed = s->page_views_destroyed,
     };
+    qemu_mutex_unlock(&s->page_views_lock);
     return 0;
 }
 
@@ -1937,13 +2011,16 @@ static void reims_vgpu_pci_exit(PCIDevice *pdev)
     if (s->page_views) {
         size_t i;
 
+        qemu_mutex_lock(&s->page_views_lock);
         for (i = 0; i < s->page_views->len; i++) {
             ReimsVGPUPCIPageView *view =
                 &g_array_index(s->page_views, ReimsVGPUPCIPageView, i);
 #ifdef _WIN32
             qemu_win_ram_alias_free(view->ptr,
                                     view->len >> REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64,
-                                    (size_t)1 << REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64);
+                                    (size_t)1 << REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64,
+                                    view->runs, view->runs_n);
+            g_free(view->runs);
 #else
             munmap(view->ptr, view->len);
 #endif
@@ -1951,6 +2028,7 @@ static void reims_vgpu_pci_exit(PCIDevice *pdev)
         }
         g_array_free(s->page_views, true);
         s->page_views = NULL;
+        qemu_mutex_unlock(&s->page_views_lock);
     }
     /* After the drain thread is joined: reims_vgpu_dirty_free turns region
      * logging back off, and no tracked set may outlive the Rust device that
@@ -1961,6 +2039,7 @@ static void reims_vgpu_pci_exit(PCIDevice *pdev)
     qemu_mutex_destroy(&s->heartbeat_mutex);
     qemu_cond_destroy(&s->drain_cond);
     qemu_mutex_destroy(&s->drain_mutex);
+    qemu_mutex_destroy(&s->page_views_lock);
     msi_uninit(pdev);
     if (s->con) {
         qemu_graphic_console_close(s->con);
@@ -2000,6 +2079,13 @@ static void reims_vgpu_pci_instance_init(Object *obj)
     /* Required before realize so config space is PCIe-sized (4 KiB). */
     pdev->cap_present |= QEMU_PCI_CAP_EXPRESS;
     s->page_views = g_array_new(false, false, sizeof(ReimsVGPUPCIPageView));
+    /*
+     * map_pages/unmap_pages run on the drain and pool threads at once; the
+     * per-device GArray they append to and scan was unsynchronized (a pool
+     * job's unmap racing a drain append reallocs the element array under the
+     * reader - both Windows and POSIX arms).
+     */
+    qemu_mutex_init(&s->page_views_lock);
 }
 
 static void reims_vgpu_pci_class_init(ObjectClass *klass, const void *data)
