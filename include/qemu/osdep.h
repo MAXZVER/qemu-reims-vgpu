@@ -549,11 +549,23 @@ void *qemu_win_ram_hv_view(void *host, size_t len);
  * TEMP (lab, WP_VIEW): alias `count` guest-RAM pages (QEMU-view pointers, each `page` bytes and page aligned)
  * into one linear read/write window, or NULL with the Windows error in `err` and the page that failed in
  * `failed_index` (SIZE_MAX when the window itself could not be reserved). Every page must lie in a WP_VIEW
- * RAM section. Free with qemu_win_ram_alias_free and the same count and page size.
+ * RAM section. Maximal runs of pages that are consecutive in their section become one view each - one
+ * MapViewOfFile3 per run, not per 4 KiB page (b610: the per-page form collapsed the whole VM: every page
+ * cost a VirtualFree split plus a MapViewOfFile3 against the one pagefile section the WP dirty machinery
+ * reprotects ~10k times a scene, and a 5K surface is 14400 pages; the drain ground out zero draws a second
+ * and the vCPUs queued 1-13 s outside the hypervisor behind the BQL). `*runs_out`/`*runs_n_out` (either may
+ * be NULL to decline the table) receive that run table, g_free'd by the caller after
+ * qemu_win_ram_alias_free, which unmaps one view per run.
  */
+typedef struct QemuWinRamAliasRun {
+    size_t first_page;   /* window page index of the run's first page */
+    size_t pages;        /* run length in pages */
+} QemuWinRamAliasRun;
+
 void *qemu_win_ram_alias_pages(void *const *hosts, size_t count, size_t page, unsigned long *err,
-                               size_t *failed_index);
-void qemu_win_ram_alias_free(void *view, size_t count, size_t page);
+                               size_t *failed_index, QemuWinRamAliasRun **runs_out, size_t *runs_n_out);
+void qemu_win_ram_alias_free(void *view, size_t count, size_t page,
+                             const QemuWinRamAliasRun *runs, size_t runs_n);
 #endif
 
 #ifdef _WIN32

@@ -184,10 +184,18 @@ void *qemu_win_ram_hv_view(void *host, size_t len)
  * TEMP (lab, WP_VIEW): one linear window over scattered pages of guest RAM - the Windows form of the POSIX packed
  * alias (MAP_SHARED | MAP_FIXED per page) a device builds when a task's virtually linear surface sits on
  * guest-physical pages that are not. Guest RAM under WP_VIEW is one pagefile section, so each page can be mapped
- * once more: reserve a placeholder for the whole window, split it per page and replace each piece with a view of
- * the section at that page's offset. An alias, not a copy - guest CPU stores, the device's stores and the GPU's
+ * once more: reserve a placeholder for the whole window, split it per RUN and replace each piece with a view of
+ * the section at the run's offset. An alias, not a copy - guest CPU stores, the device's stores and the GPU's
  * reads all address the same pages. Measured (lab/tools/session-2026-10-15/whp/placeholder4k.c): 1.8 us a page,
  * page-aligned section offsets accepted, write-through exact.
+ *
+ * Runs, not pages (b610, 2026-10-16): the per-page form split and replaced one placeholder piece per 4 KiB page,
+ * so a 5K surface cost 2 x 14400 kernel address-space calls at build and as many unmappings at teardown - all
+ * against the one pagefile section whose protection the WP dirty machinery flips ~10k times a scene. The device
+ * drain ground to zero draws a second, the guest span polling device registers, and every vCPU exit that needed
+ * the BQL queued behind it for 1-13 s (canvas 0.4 fps; aliases off: 61). A guest surface off a contiguous
+ * physical allocation is one run, so maximal consecutive pages are mapped as one view: 3 calls per run. The
+ * run table out-param hands the layout to qemu_win_ram_alias_free, which unmaps one view per run.
  *
  * The three calls are looked up at run time: the build targets an older Windows API level than the one that
  * declares them (Windows 10 1803).
@@ -245,15 +253,23 @@ static bool qemu_win_ram_section_of(const void *host, size_t len, HANDLE *sectio
 }
 
 void *qemu_win_ram_alias_pages(void *const *hosts, size_t count, size_t page, unsigned long *err,
-                               size_t *failed_index)
+                               size_t *failed_index, QemuWinRamAliasRun **runs_out, size_t *runs_n_out)
 {
     HANDLE proc = GetCurrentProcess();
+    QemuWinRamAliasRun *runs = NULL;
+    size_t runs_n = 0, runs_alloc = 0;
     char *view;
-    size_t i = 0;
+    size_t i = 0, j = 0;
     bool split = false;
 
     *err = 0;
     *failed_index = SIZE_MAX;
+    if (runs_out) {
+        *runs_out = NULL;
+    }
+    if (runs_n_out) {
+        *runs_n_out = 0;
+    }
     if (count == 0 || !qemu_win_placeholder_api()) {
         *err = ERROR_NOT_SUPPORTED;
         return NULL;
@@ -263,58 +279,100 @@ void *qemu_win_ram_alias_pages(void *const *hosts, size_t count, size_t page, un
         *err = GetLastError();
         return NULL;
     }
-    for (i = 0; i < count; i++) {
+    while (i < count) {
         HANDLE section;
         uint64_t offset;
 
+        j = i;
         split = false;
         if (!qemu_win_ram_section_of(hosts[i], page, &section, &offset) || (offset & (page - 1))) {
             *err = ERROR_INVALID_ADDRESS;
             goto fail;
         }
-        /* Split this page off the placeholder that still spans [i, count); the last page is already alone. */
-        if (i + 1 < count) {
-            if (!VirtualFree(view + i * page, page, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+        /*
+         * Extend the run while the next page is this section's next page: one view for the whole run.
+         * Window page k sits at view + k * page, so a run of section-consecutive pages maps exactly onto
+         * the packed layout the caller requires - the layout a per-page build produced, minus the calls.
+         */
+        while (j + 1 < count) {
+            HANDLE next_section;
+            uint64_t next_offset;
+
+            if (!qemu_win_ram_section_of(hosts[j + 1], page, &next_section, &next_offset) ||
+                next_section != section || next_offset != offset + (j + 1 - i) * page) {
+                break;
+            }
+            j++;
+        }
+        /* Split [i, j+1) off the placeholder that still spans [i, count); the last run is already alone. */
+        if (j + 1 < count) {
+            if (!VirtualFree(view + i * page, (j + 1 - i) * page,
+                             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
                 *err = GetLastError();
                 goto fail;
             }
             split = true;
         }
-        if (!qemu_win_mv3(section, proc, view + i * page, offset, page, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE,
-                          NULL, 0)) {
+        if (!qemu_win_mv3(section, proc, view + i * page, offset, (j + 1 - i) * page,
+                          MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0)) {
             *err = GetLastError();
             goto fail;
         }
+        if (runs_n == runs_alloc) {
+            runs_alloc = runs_alloc ? runs_alloc * 2 : 16;
+            runs = g_realloc(runs, runs_alloc * sizeof(*runs));
+        }
+        runs[runs_n].first_page = i;
+        runs[runs_n].pages = j + 1 - i;
+        runs_n++;
+        i = j + 1;
+    }
+    if (!runs_out || !runs) {
+        /* The caller declined the table (or built none): drop it, free() falls back to per page. */
+        g_free(runs);
+    } else {
+        *runs_out = runs;
+    }
+    if (runs_n_out) {
+        *runs_n_out = runs_n;
     }
     return view;
 
 fail:
     *failed_index = i;
     {
-        size_t j;
+        size_t k;
 
-        for (j = 0; j < i; j++) {
-            qemu_win_uv2(proc, view + j * page, 0);
+        for (k = 0; k < runs_n; k++) {
+            qemu_win_uv2(proc, view + runs[k].first_page * page, 0);
         }
     }
-    /* Page i's own placeholder (or the unsplit rest from i), then the rest after a split. */
+    /* Run i's own placeholder (or the unsplit rest from i), then the rest after a split. */
     VirtualFree(view + i * page, 0, MEM_RELEASE);
-    if (split && i + 1 < count) {
-        VirtualFree(view + (i + 1) * page, 0, MEM_RELEASE);
+    if (split && j + 1 < count) {
+        VirtualFree(view + (j + 1) * page, 0, MEM_RELEASE);
     }
+    g_free(runs);
     return NULL;
 }
 
-void qemu_win_ram_alias_free(void *view, size_t count, size_t page)
+void qemu_win_ram_alias_free(void *view, size_t count, size_t page,
+                             const QemuWinRamAliasRun *runs, size_t runs_n)
 {
     HANDLE proc = GetCurrentProcess();
-    size_t i;
+    size_t k;
 
     if (!view || !qemu_win_placeholder_api()) {
         return;
     }
-    for (i = 0; i < count; i++) {
-        qemu_win_uv2(proc, (char *)view + i * page, 0);
+    if (runs && runs_n) {
+        for (k = 0; k < runs_n; k++) {
+            qemu_win_uv2(proc, (char *)view + runs[k].first_page * page, 0);
+        }
+        return;
+    }
+    for (k = 0; k < count; k++) {
+        qemu_win_uv2(proc, (char *)view + k * page, 0);
     }
 }
 
