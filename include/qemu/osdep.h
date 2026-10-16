@@ -81,6 +81,16 @@ QEMU_EXTERN_C int daemon(int, int);
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0602 /* Windows 8 API (should be >= the one from glib) */
 #endif
+/*
+ * TEMP lab (2026-10-16): the main loop polls every socket through select()
+ * (util/main-loop.c os_host_main_loop_wait), and winsock's FD_SET silently
+ * drops a socket past FD_SETSIZE, 64 by default. Each guest TCP connection of
+ * -netdev user is one host socket: a browser past 64 open connections had its
+ * newest ones never polled, and new sites stopped loading in the work VM.
+ */
+#ifndef FD_SETSIZE
+#define FD_SETSIZE 1024
+#endif
 /* reduces the number of implicitly included headers */
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
