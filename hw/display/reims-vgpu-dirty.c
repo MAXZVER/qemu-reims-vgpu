@@ -1300,6 +1300,16 @@ static uint64_t reims_vgpu_dirty_wp_hashed_min_live;
 static int reims_vgpu_dirty_wp_hashed_default;
 static uint64_t reims_vgpu_dirty_wp_hashed_min_default;
 /*
+ * TEMP lab live DIRTY_WP_HASHED_FRESH=on (env REIMS_VGPU_LAB_DIRTY_WP_HASHED_FRESH=on): WP_HASHED protects only a
+ * hashed set the guest has never written (gen <= 1). b636-b638 (AMD, 5K): with WP_HASHED off the drain re-hashed
+ * never-written 4220-page sampled sources at every epoch (61 % of the canvas drain; canvas 37-40 fps, 51-54 with it
+ * on), but WP_HASHED on also protected WindowServer's surfaces that Safari's transitions write again, and the remaps
+ * held Safari at 110-119 frames a burst against 114-215 without. A set written once is no longer fresh and stays
+ * hashed.
+ */
+static int reims_vgpu_dirty_wp_hashed_fresh_live;
+static int reims_vgpu_dirty_wp_hashed_fresh_default;
+/*
  * TEMP lab live DIRTY_VERIFY=on|off (see `ReimsVgpuDirtySet::vhash`): -1 while the live file does not name it, and
  * then REIMS_VGPU_LAB_DIRTY_VERIFY=off at boot is the only way to turn it off.
  */
@@ -1350,6 +1360,9 @@ static void reims_vgpu_dirty_gap_refresh(void)
         int on = reims_vgpu_lab_live("DIRTY_WP_HASHED");
 
         qatomic_set(&reims_vgpu_dirty_wp_hashed_live, on < 0 ? reims_vgpu_dirty_wp_hashed_default : on == 1);
+        on = reims_vgpu_lab_live("DIRTY_WP_HASHED_FRESH");
+        qatomic_set(&reims_vgpu_dirty_wp_hashed_fresh_live,
+                    on < 0 ? reims_vgpu_dirty_wp_hashed_fresh_default : on == 1);
     }
     v = reims_vgpu_lab_live_num("DIRTY_WP_HASHED_STREAK");
     qatomic_set(&reims_vgpu_dirty_wp_hashed_streak_live, v > 0 ? (uint64_t)v : 0);
@@ -6973,6 +6986,7 @@ static void reims_vgpu_dirty_hash_sync(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s,
         s->hash_busy = false;
         qatomic_store_release(&s->synced_epoch, MAX(s->synced_epoch, epoch));
         if (qatomic_read(&reims_vgpu_dirty_wp_hashed_live) && d->wp_mode && d->wp_active &&
+            (!qatomic_read(&reims_vgpu_dirty_wp_hashed_fresh_live) || s->gen <= 1) &&
             s->wp_state == WP_NONE && s->count * (s->page_size >> shift) >=
                 (qatomic_read(&reims_vgpu_dirty_wp_hashed_min_live) ?: d->wp_min_pages)) {
             /* TEMP lab live DIRTY_WP_HASHED: the clean streak and the queueing of the query path. */
@@ -8174,6 +8188,9 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
         if (getenv("REIMS_VGPU_LAB_DIRTY_WP_HASHED")) {
             reims_vgpu_dirty_wp_hashed_default = strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_HASHED"), "on") == 0;
         }
+        reims_vgpu_dirty_wp_hashed_fresh_default = getenv("REIMS_VGPU_LAB_DIRTY_WP_HASHED_FRESH") &&
+            strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_HASHED_FRESH"), "on") == 0;
+        qatomic_set(&reims_vgpu_dirty_wp_hashed_fresh_live, reims_vgpu_dirty_wp_hashed_fresh_default);
         if (getenv("REIMS_VGPU_LAB_DIRTY_WP_HASHED_MIN")) {
             reims_vgpu_dirty_wp_hashed_min_default =
                 (uint64_t)MAX(0, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_HASHED_MIN")));
