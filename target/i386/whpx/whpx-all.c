@@ -1169,6 +1169,24 @@ static bool whpx_mmio_fast_store_path(void)
 }
 
 /*
+ * TEMP lab: whpx_mmio_fast_cmp is on by default on AMD hosts only (b644: fps
+ * equal, BQL wait -10 ms/s); an Intel host's canvas lost 4-45 % with a twin of
+ * it (ZCode n351), so there it waits for its own A/B.
+ * QEMU_WHPX_MMIO_FAST_CMP=1|0 overrides.
+ */
+static bool whpx_mmio_fast_cmp_path(void)
+{
+    static int on = -1;
+
+    if (qatomic_read(&on) < 0) {
+        const char *v = g_getenv("QEMU_WHPX_MMIO_FAST_CMP");
+        qatomic_set(&on, v && *v ? strcmp(v, "0") != 0
+                                 : !__builtin_cpu_is("intel"));
+    }
+    return qatomic_read(&on) > 0;
+}
+
+/*
  * QEMU_WHPX_PRERUN_FAST=1 lets a pre-run with nothing pending skip the BQL.
  * Opt-in: no frame-rate gain has been measured through the guest's bimodal
  * 60/120 Hz latch yet, and one of four boots with it on hung in OpenCore
@@ -1850,7 +1868,8 @@ static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
 
     cpu->accel->mmio_fast = whpx_mmio_fast_path() &&
                             (whpx_mmio_fast_load(cpu, exit_ctx) ||
-                             whpx_mmio_fast_cmp(cpu, exit_ctx) ||
+                             (whpx_mmio_fast_cmp_path() &&
+                              whpx_mmio_fast_cmp(cpu, exit_ctx)) ||
                              whpx_mmio_fast_store(cpu, exit_ctx));   /* gated per region inside */
     if (cpu->accel->mmio_fast) {
         if (whpx_stats_on()) {

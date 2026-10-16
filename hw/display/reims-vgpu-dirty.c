@@ -8183,7 +8183,12 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
             reims_vgpu_dirty_hash_bg_max_default = (uint64_t)MAX(0, atoi(getenv("REIMS_VGPU_LAB_DIRTY_HASH_BG_MAX")));
         }
         qatomic_set(&reims_vgpu_dirty_hash_bg_max_live, reims_vgpu_dirty_hash_bg_max_default);
-        reims_vgpu_dirty_wp_hashed_default = d->host_intel;
+        /*
+         * WP_HASHED on both hosts since 2026-10-16: on the AMD host the drain re-hashed never-written 16 MB sampled
+         * sources every doorbell (61 % of the 5K canvas drain, b636); protected, canvas 37-40 -> 51-54 fps and Maps
+         * 34-36 -> 42-47 (b636-b647, 9 boots), Safari full-screen transitions ~160-180 frames a burst against 215.
+         */
+        reims_vgpu_dirty_wp_hashed_default = true;
         reims_vgpu_dirty_wp_hashed_min_default = d->host_intel ? 64 : 0;
         if (getenv("REIMS_VGPU_LAB_DIRTY_WP_HASHED")) {
             reims_vgpu_dirty_wp_hashed_default = strcmp(getenv("REIMS_VGPU_LAB_DIRTY_WP_HASHED"), "on") == 0;
