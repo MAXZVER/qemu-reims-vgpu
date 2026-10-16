@@ -305,7 +305,24 @@ fail:
      */
     {
         size_t total = count * page;
-        void **hosts = g_new(void *, count);
+        void **hosts;
+
+        /*
+         * TEMP lab: off unless QEMU_WIN_PAGE_ALIAS=on. b608-b610 (5K Safari canvas): with the aliases the
+         * whole VM stalled - vCPUs >1 s outside the hypervisor in memory-access exits, canvas 0.4 fps, Maps
+         * 0 - against 61 fps on the copying rails. Each alias is a placeholder reservation plus one
+         * MapViewOfFile3 per 4 KiB page, and WebKit churns 5K surfaces.
+         */
+        static int alias_off = -1;
+        if (alias_off < 0) {
+            const char *e = getenv("QEMU_WIN_PAGE_ALIAS");
+            alias_off = !(e && strcmp(e, "on") == 0);
+        }
+        if (alias_off) {
+            failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_ALIAS;
+            return -1;
+        }
+        hosts = g_new(void *, count);
         unsigned long err = 0;
         size_t failed = SIZE_MAX;
         ReimsVGPUPCIPageView held;
