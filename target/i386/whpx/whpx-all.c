@@ -4370,6 +4370,58 @@ static void lab_vpw_start(unsigned vps)
     }
 }
 
+/*
+ * TEMP lab (Opus 2026-10-17): the hypervisor's own resource controls for the guest partition, which only the classic
+ * and core schedulers honour (bcdedit hypervisorschedulertype). Under classic the guest's VPs are scheduled by the
+ * hypervisor on any logical processor and the root's threads (the drain, the renderer) lose those LPs without the
+ * Windows scheduler knowing: AMD b697 woke guest threads 4x faster (ping-pong 36 -> 8.6 us) but canvas fell 54 -> 46
+ * with drain duty 0.50 -> 0.74. QEMU_WHPX_CPU_WEIGHT (1..10000; the hypervisor's default is 100),
+ * QEMU_WHPX_CPU_RESERVE and QEMU_WHPX_CPU_CAP (raw values in WHP's units) set the matching partition properties;
+ * tried before WHvSetupPartition and again after it if refused, each logged once with its HRESULT.
+ */
+static void whpx_lab_sched_props(WHV_PARTITION_HANDLE part, bool after_setup)
+{
+    static const struct {
+        const char *env;
+        WHV_PARTITION_PROPERTY_CODE code;
+    } props[] = {
+        { "QEMU_WHPX_CPU_WEIGHT", WHvPartitionPropertyCodeCpuWeight },
+        { "QEMU_WHPX_CPU_RESERVE", WHvPartitionPropertyCodeCpuReserve },
+        { "QEMU_WHPX_CPU_CAP", WHvPartitionPropertyCodeCpuCap },
+    };
+    static bool done[ARRAY_SIZE(props)];
+    size_t i;
+
+    for (i = 0; i < ARRAY_SIZE(props); i++) {
+        const char *e = getenv(props[i].env);
+        WHV_PARTITION_PROPERTY prop;
+        HRESULT hr;
+
+        if (done[i] || !e || !*e) {
+            continue;
+        }
+        memset(&prop, 0, sizeof(prop));
+        switch (props[i].code) {
+        case WHvPartitionPropertyCodeCpuWeight:
+            prop.CpuWeight = (UINT32)strtoul(e, NULL, 0);
+            break;
+        case WHvPartitionPropertyCodeCpuReserve:
+            prop.CpuReserve = (UINT32)strtoul(e, NULL, 0);
+            break;
+        default:
+            prop.CpuCap = (UINT32)strtoul(e, NULL, 0);
+            break;
+        }
+        hr = whp_dispatch.WHvSetPartitionProperty(part, props[i].code, &prop,
+                                                  sizeof(WHV_PARTITION_PROPERTY));
+        if (SUCCEEDED(hr) || after_setup) {
+            done[i] = true;
+            fprintf(stderr, "reims-lab: whpx %s=%s %s hr=%08lx\n", props[i].env, e,
+                    after_setup ? "after-setup" : "before-setup", hr);
+        }
+    }
+}
+
 int whpx_accel_init(AccelState *as, MachineState *ms)
 {
     struct whpx_state *whpx;
@@ -4690,12 +4742,14 @@ int whpx_accel_init(AccelState *as, MachineState *ms)
     }
 
     memory_dirty_log_flush_hook = whpx_flush_dirty_log;
+    whpx_lab_sched_props(whpx->partition, false);
     hr = whp_dispatch.WHvSetupPartition(whpx->partition);
     if (FAILED(hr)) {
         error_report("WHPX: Failed to setup partition, hr=%08lx", hr);
         ret = -EINVAL;
         goto error;
     }
+    whpx_lab_sched_props(whpx->partition, true);
 
     whpx_memory_init();
     whpx_init_emu();
