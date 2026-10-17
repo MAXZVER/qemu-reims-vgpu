@@ -371,10 +371,51 @@ fail:
          * out a surface build (b610 had tens of milliseconds per list), and
          * nothing below reads the memory topology - the host pointers are
          * stable for the RAM block's lifetime.
+         *
+         * TEMP lab (storm fix (a), 2026-10-17 forensics): drop the BQL around
+         * the build itself. The build is pure Win32 address-space work over
+         * hosts[] and the section; page_views is under its own mutex below.
+         * In storm boots the same calls stall 0.17-2.4 s each - with the BQL
+         * held that froze every vCPU behind the builder (mmio_bql_us up to
+         * 1.4 s/s, hundreds of whpx-vcpu-stuck, 4 fps boots). Without the BQL
+         * a stalled build no longer stops the machine; the tripwire below
+         * retires the rail entirely once a storm is proven.
          */
-        view = qemu_win_ram_alias_pages(hosts, count, page, &err, &failed,
-                                        &runs, &runs_n);
+        {
+            bool bql_held = bql_locked();
+            if (bql_held) {
+                bql_unlock();
+            }
+            view = qemu_win_ram_alias_pages(hosts, count, page, &err, &failed,
+                                            &runs, &runs_n);
+            if (bql_held) {
+                bql_lock();
+            }
+        }
         g_free(hosts);
+        /*
+         * TEMP lab (storm fix (b)): a build this slow is the bistable
+         * AS-lock/WsLock storm, not work - clean builds are linear at 2-3 us
+         * per page (20 ms for a 6k+ page surface), storm builds pay a fixed
+         * 0.17-2.4 s regardless of size. Trip once and the rest of the boot
+         * takes the copying rails (the default arm: canvas 61 fps against
+         * 0.4 in b610) instead of gambling on the next stall.
+         * QEMU_WIN_PAGE_ALIAS_TRIPWIRE_NS overrides the threshold; 0 disables.
+         */
+        {
+            int64_t build_ns_now = get_clock() - t_build;
+            static int64_t tripwire_ns = -1;
+            if (tripwire_ns < 0) {
+                const char *twe = getenv("QEMU_WIN_PAGE_ALIAS_TRIPWIRE_NS");
+                tripwire_ns = twe ? strtoll(twe, NULL, 10) : 100000000LL;
+            }
+            if (tripwire_ns > 0 && build_ns_now > tripwire_ns && !alias_off) {
+                alias_off = 1;
+                fprintf(stderr, "reims-pagealias storm tripped: build_us=%"
+                        PRId64 " pages=%zu -> copying rails for this boot\n",
+                        build_ns_now / 1000, count);
+            }
+        }
         if (!view) {
             failure->stage = failed == SIZE_MAX
                 ? REIMS_VGPU_MAP_PAGES_FAILURE_RESERVATION
