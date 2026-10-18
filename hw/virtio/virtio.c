@@ -34,6 +34,10 @@
 #include "hw/virtio/virtio-access.h"
 #include "system/dma.h"
 #include "system/iothread.h"
+#include "system/whpx.h"         /* TEMP lab QEMU_VIRTIO_DIRECT_MSI */
+#include "hw/pci/pci_device.h"
+#include "hw/pci/msi.h"
+#include "hw/pci/msix.h"
 #include "system/memory.h"
 #include "system/runstate.h"
 #include "virtio-qmp.h"
@@ -2697,6 +2701,40 @@ static void virtio_notify_irqfd_deferred_fn(void *opaque)
     event_notifier_set(notifier);
 }
 
+/*
+ * TEMP lab (Opus 2026-10-18, QEMU_VIRTIO_DIRECT_MSI, default on; =off restores): WHPX has no irqfd, so a device
+ * in an IOThread raised its MSI-X through the guest notifier, which the MAIN LOOP reads and injects under the BQL -
+ * an iothread's completions still waited behind every main-loop stall (Mish: "only graphics on the main thread,
+ * everything else out"). With WHPX's in-kernel irqchip the APIC's MSI region is lockless and injects with
+ * WHvRequestInterrupt (reims-vgpu's IRQ_DIRECT relies on the same), so an unmasked vector is sent from here. A
+ * masked or unused vector keeps the old path, which sets the pending bit under the BQL.
+ */
+static bool virtio_lab_direct_msi(VirtIODevice *vdev, uint16_t vector)
+{
+    static int on = -1;
+    BusState *bus;
+    PCIDevice *pci;
+
+    if (on < 0) {
+        const char *e = getenv("QEMU_VIRTIO_DIRECT_MSI");
+        on = !(e && strcmp(e, "off") == 0);
+    }
+    if (!on || !whpx_enabled() || !whpx_irqchip_in_kernel() || vector == VIRTIO_NO_VECTOR) {
+        return false;
+    }
+    bus = qdev_get_parent_bus(DEVICE(vdev));
+    if (!bus || !bus->parent) {
+        return false;
+    }
+    pci = (PCIDevice *)object_dynamic_cast(OBJECT(bus->parent), TYPE_PCI_DEVICE);
+    if (!pci || !msix_enabled(pci) || vector >= pci->msix_entries_nr ||
+        !pci->msix_entry_used[vector] || msix_is_masked(pci, vector)) {
+        return false;
+    }
+    msi_send_message(pci, msix_get_message(pci, vector));
+    return true;
+}
+
 static void virtio_irq(VirtQueue *vq)
 {
     /*
@@ -2723,6 +2761,9 @@ static void virtio_irq(VirtQueue *vq)
      * function.
      */
     if (qemu_in_iothread()) {
+        if (virtio_lab_direct_msi(vq->vdev, vq->vector)) {
+            return;
+        }
         defer_call(virtio_notify_irqfd_deferred_fn, &vq->guest_notifier);
     } else {
         virtio_notify_vector(vq->vdev, vq->vector);

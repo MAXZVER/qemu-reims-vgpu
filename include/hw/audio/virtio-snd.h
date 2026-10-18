@@ -158,6 +158,15 @@ struct VirtIOSoundPCMStream {
     QSIMPLEQ_HEAD(, VirtIOSoundPCMBuffer) queue;
     /* TEMP lab (QEMU_VSND_JITTER_MS): playback waits until this much is buffered, again after an underrun. */
     bool lab_primed;
+    /*
+     * TEMP lab (QEMU_VSND_DIRECT): an output stream played from its own SDL device, whose audio thread takes the
+     * copies straight from `queue` (no QEMU audio timer, no main loop); `lab_bh` runs in the device's own IOThread and
+     * gives the consumed periods back to the guest.
+     */
+    bool lab_direct;
+    uint32_t lab_sdl_dev;
+    uint8_t lab_silence;
+    QEMUBH *lab_bh;
 };
 
 /*
@@ -244,6 +253,16 @@ struct VirtIOSound {
      * callbacks.
      */
     QSIMPLEQ_HEAD(, VirtIOSoundPCMBuffer) invalid;
+    /*
+     * TEMP lab (QEMU_VSND_DIRECT, Mish 2026-10-18: "only graphics on QEMU's main thread"): the TX queue's kicks and
+     * the returns of its periods run in this IOThread; `lab_tx_mutex` serializes every TX virtqueue access (the
+     * IOThread, and the main loop's flush on stop/release) and the shared `invalid` list.
+     */
+    struct IOThread *lab_io;
+    AioContext *lab_ctx;
+    QemuMutex lab_tx_mutex;
+    bool lab_direct;
+    bool lab_ioeventfd_started;
 };
 
 struct virtio_snd_ctrl_command {
