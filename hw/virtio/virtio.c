@@ -12,6 +12,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/timer.h"
+#include "qemu/lab-slow.h"   /* TEMP lab */
 #include "qapi/error.h"
 #include "qapi/qapi-commands-virtio.h"
 #include "trace.h"
@@ -4156,7 +4158,15 @@ void virtio_queue_host_notifier_read(EventNotifier *n)
 {
     VirtQueue *vq = container_of(n, VirtQueue, host_notifier);
     if (event_notifier_test_and_clear(n)) {
+        /*
+         * TEMP lab (Opus 2026-10-18, QEMU_LAB_SLOW_MS): which device's queue kick holds the main loop. The AMD work
+         * VM logged 529 "aio-notify" holds of 16-65 ms in this function in one session (the SDL audio timer late by
+         * the same amount; Mish: sound drops while swiping Spaces with a video playing). The name is the device, the
+         * offset its queue handler.
+         */
+        int64_t lab_t = qemu_lab_slow_begin();
         virtio_queue_notify_vq(vq);
+        qemu_lab_slow_end("vq-notify", vq->vdev ? vq->vdev->name : NULL, (const void *)vq->handle_output, lab_t);
     }
 }
 
