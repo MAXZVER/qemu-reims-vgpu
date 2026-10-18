@@ -152,7 +152,9 @@ static ssize_t net_slirp_send_packet(const void *pkt, size_t pkt_len,
         qemu_mutex_lock(&s->lab_mutex);
         g_queue_push_tail(&s->lab_out, f);
         qemu_mutex_unlock(&s->lab_mutex);
-        qemu_bh_schedule(s->lab_out_bh);
+        if (!qemu_thread_is_self(&s->lab_th)) {
+            qemu_bh_schedule(s->lab_out_bh);   /* not from the slirp thread: nobody else will kick */
+        }
         return pkt_len;
     }
 #endif
@@ -432,6 +434,12 @@ static void lab_slirp_out_bh(void *opaque)
 {
     SlirpState *s = opaque;
 
+    GQueue batch = G_QUEUE_INIT;
+
+    qemu_mutex_lock(&s->lab_mutex);   /* the whole batch at once: one lock, one pass into the NIC */
+    batch = s->lab_out;
+    g_queue_init(&s->lab_out);
+    qemu_mutex_unlock(&s->lab_mutex);
     for (;;) {
         GByteArray *f;
         const uint8_t *pkt;
@@ -439,9 +447,7 @@ static void lab_slirp_out_bh(void *opaque)
         uint8_t min_pkt[ETH_ZLEN];
         size_t min_pktsz = sizeof(min_pkt);
 
-        qemu_mutex_lock(&s->lab_mutex);
-        f = g_queue_pop_head(&s->lab_out);
-        qemu_mutex_unlock(&s->lab_mutex);
+        f = g_queue_pop_head(&batch);
         if (!f) {
             break;
         }
@@ -490,6 +496,7 @@ static void *lab_slirp_thread(void *opaque)
     GArray *fds = g_array_new(FALSE, FALSE, sizeof(WSAPOLLFD));
 
     rcu_register_thread();
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);   /* wakes on the guest's ACKs first */
     while (!qatomic_read(&s->lab_quit)) {
         uint32_t timeout;
         int n;
@@ -506,6 +513,9 @@ static void *lab_slirp_thread(void *opaque)
             slirp_input(s->slirp, f->data, f->len);
             g_byte_array_unref(f);
         }
+        if (!g_queue_is_empty(&s->lab_out)) {
+            qemu_bh_schedule(s->lab_out_bh);
+        }
         timeout = lab_slirp_run_timers(s, 1000);
         g_array_set_size(fds, 0);
         slirp_pollfds_fill_socket(s->slirp, &timeout, lab_slirp_add_poll, fds);
@@ -515,6 +525,9 @@ static void *lab_slirp_thread(void *opaque)
             n = fds->len ? WSAPoll((WSAPOLLFD *)fds->data, fds->len, 0) : 0;
         }
         slirp_pollfds_poll(s->slirp, n < 0, lab_slirp_get_revents, fds);
+        if (!g_queue_is_empty(&s->lab_out)) {
+            qemu_bh_schedule(s->lab_out_bh);   /* one main-loop wake for the pass's whole batch */
+        }
     }
     rcu_unregister_thread();
     g_array_free(fds, TRUE);
