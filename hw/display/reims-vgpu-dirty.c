@@ -651,6 +651,9 @@ struct ReimsVgpuDirty {
     int64_t lab_pb_build, lab_pb_query, lab_pb_settle, lab_pb_mark, lab_pb_consume,
             lab_pb_eval, lab_pb_last, lab_pb_lag;
     uint64_t lab_ph_wait, lab_ph_prep, lab_ph_query, lab_ph_settle, lab_ph_consume;  /* TEMP lab */
+    /* TEMP lab (Opus 2026-10-18): the consume phase split - qep stamps, consume_set, eval_set - and the share
+     * spent on a set's first sync (gen 0 before it), printed as reims-dirty-consume once a second. */
+    uint64_t lab_c_qep, lab_c_cset, lab_c_eval, lab_c_n, lab_c_first_n, lab_c_first_ns, lab_c_pages, lab_c_last;
     int64_t lab_od_last;
     /* TEMP lab (FGTRACE): the trace buffer and the cost counters beside it. */
     ReimsVgpuLabRec *lab_tr;
@@ -1314,6 +1317,7 @@ static int reims_vgpu_dirty_wp_hashed_fresh_default;
  * then REIMS_VGPU_LAB_DIRTY_VERIFY=off at boot is the only way to turn it off.
  */
 static int reims_vgpu_dirty_verify_live = -1;
+static int reims_vgpu_dirty_vhash_par_live = -1;   /* TEMP lab live DIRTY_VHASH_PAR (see reims_vh_hash) */
 
 static bool reims_vgpu_dirty_verify_on(void)
 {
@@ -1369,6 +1373,7 @@ static void reims_vgpu_dirty_gap_refresh(void)
     v = reims_vgpu_lab_live_num("DIRTY_WP_HASHED_MIN");
     qatomic_set(&reims_vgpu_dirty_wp_hashed_min_live, v > 0 ? (uint64_t)v : reims_vgpu_dirty_wp_hashed_min_default);
     qatomic_set(&reims_vgpu_dirty_verify_live, reims_vgpu_lab_live("DIRTY_VERIFY"));
+    qatomic_set(&reims_vgpu_dirty_vhash_par_live, reims_vgpu_lab_live("DIRTY_VHASH_PAR"));
 }
 
 /* TEMP lab DIRTY_TIGHT: whether a sync bridges only gaps of tracked pages (one look a sync). */
@@ -1902,6 +1907,110 @@ static bool reims_vgpu_dirty_page_hash(const ReimsVgpuDirtySlice *slices, int n,
 }
 
 /*
+ * TEMP lab DIRTY_VHASH_PAR (Opus 2026-10-18; live DIRTY_VHASH_PAR=off for A/B, default on): the DIRTY_VERIFY page
+ * hashes of a large set on persistent helper threads. A heavy WebGL page tracks ~40 fresh 5K WebKit targets a second;
+ * each pays a baseline of 9.6k page hashes at track and again in the arming evaluation (b728: eval ~2.2 ms a set,
+ * ~85 ms/s, all on the drain through the first gen read). Sets from REIMS_VH_MIN pages are cut into equal index
+ * ranges: REIMS_VH_WORKERS helpers and the caller each hash one, the caller waits for the helpers. Same hashes, same
+ * slots; the caller's RCU read section keeps every slice's region alive for the helpers' own read sections.
+ */
+#define REIMS_VH_WORKERS 3
+#define REIMS_VH_MIN 2048
+
+typedef struct ReimsVhJob {
+    const ReimsVgpuDirtySlice *slices;
+    int n;
+    const uint64_t *pages;
+    const size_t *idx;          /* page indices to hash, or NULL for pages [from, to) themselves */
+    size_t from, to;
+    uint64_t page_size;
+    uint64_t *out;
+} ReimsVhJob;
+
+static struct {
+    QemuThread th[REIMS_VH_WORKERS];
+    QemuSemaphore go[REIMS_VH_WORKERS];
+    QemuSemaphore done;
+    ReimsVhJob job[REIMS_VH_WORKERS];
+    QemuMutex lock;             /* one parallel hash at a time */
+    int state;                  /* 0 not started, 1 running, -1 refused */
+} reims_vh;
+
+static void reims_vh_run(const ReimsVhJob *j)
+{
+    size_t k;
+
+    rcu_read_lock();
+    for (k = j->from; k < j->to; k++) {
+        size_t p = j->idx ? j->idx[k] : k;
+
+        reims_vgpu_dirty_page_hash(j->slices, j->n, j->pages[p], j->page_size, &j->out[p]);
+    }
+    rcu_read_unlock();
+}
+
+static void *reims_vh_thread(void *opaque)
+{
+    int i = (int)(intptr_t)opaque;
+
+    rcu_register_thread();
+    for (;;) {
+        qemu_sem_wait(&reims_vh.go[i]);
+        reims_vh_run(&reims_vh.job[i]);
+        qemu_sem_post(&reims_vh.done);
+    }
+    return NULL;
+}
+
+static bool reims_vh_start(void)
+{
+    static GMutex once;
+    int i;
+
+    g_mutex_lock(&once);
+    if (reims_vh.state == 0) {
+        qemu_mutex_init(&reims_vh.lock);
+        qemu_sem_init(&reims_vh.done, 0);
+        for (i = 0; i < REIMS_VH_WORKERS; i++) {
+            qemu_sem_init(&reims_vh.go[i], 0);
+            qemu_thread_create(&reims_vh.th[i], "reims-vhash", reims_vh_thread, (void *)(intptr_t)i,
+                               QEMU_THREAD_DETACHED);
+        }
+        reims_vh.state = 1;
+    }
+    g_mutex_unlock(&once);
+    return reims_vh.state == 1;
+}
+
+/* Hash `count` pages of `pages` (through `idx` when given) into `out`. RCU read lock held by the caller. */
+static void reims_vh_hash(const ReimsVgpuDirtySlice *slices, int n, const uint64_t *pages, const size_t *idx,
+                          size_t count, uint64_t page_size, uint64_t *out)
+{
+    ReimsVhJob mine = { slices, n, pages, idx, 0, count, page_size, out };
+    size_t per;
+    int i;
+
+    if (count < REIMS_VH_MIN || qatomic_read(&reims_vgpu_dirty_vhash_par_live) == 0 || !reims_vh_start()) {
+        reims_vh_run(&mine);
+        return;
+    }
+    per = (count + REIMS_VH_WORKERS) / (REIMS_VH_WORKERS + 1);
+    qemu_mutex_lock(&reims_vh.lock);
+    for (i = 0; i < REIMS_VH_WORKERS; i++) {
+        reims_vh.job[i] = mine;
+        reims_vh.job[i].from = MIN(count, (size_t)i * per);
+        reims_vh.job[i].to = MIN(count, (size_t)(i + 1) * per);
+        qemu_sem_post(&reims_vh.go[i]);
+    }
+    mine.from = MIN(count, (size_t)REIMS_VH_WORKERS * per);
+    reims_vh_run(&mine);
+    for (i = 0; i < REIMS_VH_WORKERS; i++) {
+        qemu_sem_wait(&reims_vh.done);
+    }
+    qemu_mutex_unlock(&reims_vh.lock);
+}
+
+/*
  * TEMP lab DIRTY_VERIFY: hash every page of a set not yet published (no lock needed for it) into its baseline. The
  * evaluation that arms the set takes the hashes again for the pages it names, so a store between here and the
  * arming is baseline too, as it is for a hashed set's first sync.
@@ -1916,10 +2025,9 @@ static void reims_vgpu_dirty_verify_base(ReimsVgpuDirty *d, ReimsVgpuDirtySet *s
     s->vhash = g_new0(uint64_t, MAX(s->count, 1));
     n = reims_vgpu_dirty_ram_slices_into(&slices, &cap);
     rcu_read_lock();
-    for (p = 0; p < s->count; p++) {
-        reims_vgpu_dirty_page_hash(slices, n, s->pages[p], s->page_size, &s->vhash[p]);
-    }
+    reims_vh_hash(slices, n, s->pages, NULL, s->count, s->page_size, s->vhash);   /* TEMP lab DIRTY_VHASH_PAR */
     rcu_read_unlock();
+    (void)p;
     g_free(slices);
     s->vhash_base = true;
     qatomic_inc(&d->lab_vhash_sets);
@@ -1962,14 +2070,9 @@ static bool reims_vgpu_dirty_verify_filter(ReimsVgpuDirty *d, ReimsVgpuDirtySet 
 static void reims_vgpu_dirty_verify_refresh(ReimsVgpuDirtySet *s, const ReimsVgpuDirtySlice *slices, int n,
                                             const GArray *hit)
 {
-    guint h;
-
     rcu_read_lock();
-    for (h = 0; h < hit->len; h++) {
-        size_t p = g_array_index(hit, size_t, h);
-
-        reims_vgpu_dirty_page_hash(slices, n, s->pages[p], s->page_size, &s->vhash[p]);
-    }
+    reims_vh_hash(slices, n, s->pages, (const size_t *)hit->data, hit->len, s->page_size,
+                  s->vhash);   /* TEMP lab DIRTY_VHASH_PAR */
     rcu_read_unlock();
 }
 
@@ -7471,11 +7574,35 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
 
         reims_vgpu_dirty_qep_stamp(d, w->start >> shift, (w->start + w->len) >> shift, epoch);
     }
+    int64_t lc0 = get_clock();   /* TEMP lab consume split */
+    d->lab_c_qep += lc0 - ph_settle_end;
     s = g_hash_table_lookup(d->sets, &token);
     if (s) {
+        bool lab_first = s->gen == 0;
+        int64_t lc1, lc2;
+
         reims_vgpu_dirty_consume_set(d, s, slices, n, d->global_seq, written);
+        lc1 = get_clock();
         if (reims_vgpu_dirty_eval_set(d, s, slices, n, hit, false)) {
             d->log_wanted = true;
+        }
+        lc2 = get_clock();
+        d->lab_c_cset += lc1 - lc0;
+        d->lab_c_eval += lc2 - lc1;
+        d->lab_c_n++;
+        d->lab_c_pages += s->count;
+        if (lab_first) {
+            d->lab_c_first_n++;
+            d->lab_c_first_ns += lc2 - ph_settle_end;
+        }
+        if (lc2 - d->lab_c_last >= NANOSECONDS_PER_SECOND) {
+            fprintf(stderr, "reims-dirty-consume n=%" PRIu64 " pages=%" PRIu64 " qep_us=%" PRIu64
+                    " cset_us=%" PRIu64 " eval_us=%" PRIu64 " first_n=%" PRIu64 " first_us=%" PRIu64 "\n",
+                    d->lab_c_n, d->lab_c_pages, d->lab_c_qep / 1000, d->lab_c_cset / 1000,
+                    d->lab_c_eval / 1000, d->lab_c_first_n, d->lab_c_first_ns / 1000);
+            d->lab_c_n = d->lab_c_pages = d->lab_c_qep = d->lab_c_cset = d->lab_c_eval = 0;
+            d->lab_c_first_n = d->lab_c_first_ns = 0;
+            d->lab_c_last = lc2;
         }
         qatomic_store_release(&s->synced_epoch, MAX(s->synced_epoch, epoch));
         if (s->claim_epoch == epoch) {
