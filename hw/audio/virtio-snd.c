@@ -592,6 +592,9 @@ static void virtio_snd_handle_pcm_start_stop(VirtIOSound *s,
     trace_virtio_snd_handle_pcm_start_stop(start ? "VIRTIO_SND_R_PCM_START" :
             "VIRTIO_SND_R_PCM_STOP", stream_id);
 
+    /* TEMP lab (Opus 2026-10-19): when the guest starts and stops its streams, against virtio-snd-gap. */
+    fprintf(stderr, "virtio-snd: stream %u %s epoch_ms=%" PRId64 "\n", stream_id, start ? "START" : "STOP",
+            g_get_real_time() / 1000);
     stream = virtio_snd_pcm_get_stream(s, stream_id);
     if (stream) {
         WITH_QEMU_LOCK_GUARD(&stream->queue_mutex) {
@@ -1735,16 +1738,80 @@ static void vsnd_lab_admit_bh(void *opaque)
 }
 
 #ifdef CONFIG_SDL
+/*
+ * TEMP lab (Opus 2026-10-19, Mish: Safari's sound breaks 0.5-1 s at every desktop switch): every silent stretch of
+ * the played output >= 80 ms, logged when sound resumes with its length, the wall clock at its end and why each
+ * callback in it was silent - 1 stream inactive (the guest stopped it), 2 priming the cushion, 4 starved (the queue
+ * ran dry), 8 the guest's own samples were silent. Tells a guest that stopped or sent silence from a host that fell
+ * behind.
+ */
+#define VSND_GAP_INACTIVE 1
+#define VSND_GAP_PRIMING  2
+#define VSND_GAP_STARVED  4
+#define VSND_GAP_ZEROS    8
+static int64_t vsnd_gap_start_ns;
+static unsigned vsnd_gap_kinds;
+
+static bool vsnd_gap_audible(VirtIOSoundPCMStream *stream, const Uint8 *p, int len)
+{
+    int i;
+
+    if (stream->as.fmt == AUDIO_FORMAT_F32) {
+        const float *f = (const float *)p;
+        for (i = 0; i < len / 4; i++) {
+            if (f[i] > 1e-4f || f[i] < -1e-4f) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (stream->as.fmt == AUDIO_FORMAT_S16) {
+        const int16_t *s = (const int16_t *)p;
+        for (i = 0; i < len / 2; i++) {
+            if (s[i] > 3 || s[i] < -3) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return true;   /* other formats: not judged */
+}
+
+static void vsnd_gap_note(unsigned kind)
+{
+    int64_t now = get_clock();
+
+    if (kind) {
+        if (!vsnd_gap_start_ns) {
+            vsnd_gap_start_ns = now;
+            vsnd_gap_kinds = 0;
+        }
+        vsnd_gap_kinds |= kind;
+        return;
+    }
+    if (vsnd_gap_start_ns) {
+        int64_t ms = (now - vsnd_gap_start_ns) / SCALE_MS;
+        if (ms >= 80) {
+            fprintf(stderr, "virtio-snd-gap ms=%" PRId64 " kinds=%#x end_epoch_ms=%" PRId64 "\n", ms, vsnd_gap_kinds,
+                    g_get_real_time() / 1000);
+        }
+        vsnd_gap_start_ns = 0;
+    }
+}
+
 /* SDL's audio thread: the copies straight from the queue; silence while priming the cushion or starved. */
 static void vsnd_lab_sdl_cb(void *opaque, Uint8 *out, int len)
 {
     VirtIOSoundPCMStream *stream = opaque;
     VirtIOSoundPCMBuffer *buffer, *next;
+    Uint8 *const out0 = out;
+    const int len0 = len;
 
     qemu_mutex_lock(&stream->queue_mutex);
     if (!stream->active) {
         memset(out, stream->lab_silence, len);
         qemu_mutex_unlock(&stream->queue_mutex);
+        vsnd_gap_note(VSND_GAP_INACTIVE);
         return;
     }
     if (!stream->lab_primed) {
@@ -1756,6 +1823,7 @@ static void vsnd_lab_sdl_cb(void *opaque, Uint8 *out, int len)
         if (queued < vsnd_lab_ms_bytes(stream, MAX(vsnd_lab_jitter_ms(), 20))) {
             memset(out, stream->lab_silence, len);
             qemu_mutex_unlock(&stream->queue_mutex);
+            vsnd_gap_note(VSND_GAP_PRIMING);
             return;
         }
         stream->lab_primed = true;
@@ -1786,6 +1854,7 @@ static void vsnd_lab_sdl_cb(void *opaque, Uint8 *out, int len)
         }
         buffer = next;
     }
+    bool starved = len > 0;
     if (len > 0) {
         memset(out, stream->lab_silence, len);
         stream->lab_primed = false;   /* build the cushion again */
@@ -1793,6 +1862,11 @@ static void vsnd_lab_sdl_cb(void *opaque, Uint8 *out, int len)
     }
     qemu_mutex_unlock(&stream->queue_mutex);
     qemu_bh_schedule(stream->lab_bh);   /* thread-safe; coalesces */
+    if (starved) {
+        vsnd_gap_note(VSND_GAP_STARVED);
+    } else {
+        vsnd_gap_note(vsnd_gap_audible(stream, out0, len0) ? 0 : VSND_GAP_ZEROS);
+    }
 }
 
 static void vsnd_lab_sdl_open(VirtIOSoundPCMStream *stream)
