@@ -148,6 +148,7 @@ struct USBHostDevice {
     bool                             suppress_remote_wake;
     bool                             grab;
     bool                             switch_pending; /* Ctrl+Alt+M seen */
+    bool                             switch_armed;   /* M seen up since open */
 
     /* state */
     QTAILQ_ENTRY(USBHostDevice)      next;
@@ -756,6 +757,14 @@ static void usb_host_check_release_combo(USBHostDevice *s, int ep,
             }
         }
     }
+    /*
+     * The chord that sent the keyboard here (Ctrl+Alt+M on the host) is
+     * often still held when the guest gets it: armed only once a report
+     * shows M up, so that press does not bounce the keyboard straight back.
+     */
+    if (!em) {
+        s->switch_armed = true;
+    }
     if (keys || !(mods & 0x11) || !(mods & 0x44) || (mods & 0x88)) {
         return;
     }
@@ -764,7 +773,7 @@ static void usb_host_check_release_combo(USBHostDevice *s, int ep,
                     "%d bytes, modifiers %02x)", s->ddesc.idVendor,
                     s->ddesc.idProduct, ep, rid, len, mods);
         release_all_pending = true;
-    } else if (em == 1 && !esc && !(mods & 0x22)) {
+    } else if (em == 1 && !esc && !(mods & 0x22) && s->switch_armed) {
         /*
          * The guest gets this report with every key up instead: it saw
          * Ctrl and Alt go down, and the keyboard is about to vanish, so a
@@ -776,6 +785,7 @@ static void usb_host_check_release_combo(USBHostDevice *s, int ep,
                     "report id %u, %d bytes): keyboard back to the host",
                     s->ddesc.idVendor, s->ddesc.idProduct, ep, rid, len);
         s->switch_pending = true;
+        s->switch_armed = false;
     } else {
         return;
     }
@@ -1894,6 +1904,7 @@ static int usb_host_open(USBHostDevice *s, libusb_device *dev, int hostfd)
     usb_ep_init(udev);
     usb_host_ep_update(s);
     usb_host_kbd_learn(s);
+    s->switch_armed = false;
 
     libusb_speed = libusb_get_device_speed(dev);
 #if LIBUSB_API_VERSION >= 0x01000107 && defined(CONFIG_LINUX) && \
