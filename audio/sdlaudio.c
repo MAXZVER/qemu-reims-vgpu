@@ -200,10 +200,33 @@ static SDL_AudioDeviceID sdl_open(SDL_AudioSpec *req, SDL_AudioSpec *obt,
     }
 #endif
 
-    devid = SDL_OpenAudioDevice(NULL, rec, req, obt, 0);
-    if (!devid) {
-        error_report("SDL_OpenAudioDevice for %s failed: %s",
-                   rec ? "recording" : "playback", SDL_GetError());
+    /*
+     * TEMP lab (Opus 2026-10-19): on a host without a microphone, WASAPI took
+     * ~8 s to refuse each recording open, and the guest opens its capture
+     * stream from a vCPU under the BQL - the whole VM froze ~16 s (two tries)
+     * whenever a macOS app touched audio input (work VM, every session).
+     * No capture device: refuse at once; a failed recording open is not
+     * retried for a minute.
+     */
+    static int64_t rec_failed_ms;
+    if (rec && (SDL_GetNumAudioDevices(1) <= 0 ||
+                (rec_failed_ms &&
+                 qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - rec_failed_ms < 60000))) {
+        static bool told;
+        if (!told) {
+            told = true;
+            error_report("sdl: no recording device - guest capture streams get silence");
+        }
+        devid = 0;
+    } else {
+        devid = SDL_OpenAudioDevice(NULL, rec, req, obt, 0);
+        if (!devid) {
+            error_report("SDL_OpenAudioDevice for %s failed: %s",
+                       rec ? "recording" : "playback", SDL_GetError());
+            if (rec) {
+                rec_failed_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+            }
+        }
     }
 
 #ifndef _WIN32
