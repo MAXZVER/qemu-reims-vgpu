@@ -1022,6 +1022,20 @@ static void LIBUSB_CALL usb_host_req_complete_data(struct libusb_transfer *xfer)
     }
 
     r->p->status = status_map[xfer->status];
+    /*
+     * TEMP lab (Opus 2026-10-19, Mish: the Bluetooth trackpad keeps dropping): every failed data transfer of a
+     * passed-through device, with its endpoint and libusb status (2 timeout, 4 stall, 5 no device, 6 overflow,
+     * 1 error); the first 50, then every 1000th.
+     */
+    if (xfer->status != LIBUSB_TRANSFER_COMPLETED && xfer->status != LIBUSB_TRANSFER_CANCELLED) {
+        static uint64_t errs;
+        uint64_t n = ++errs;
+        if (n <= 50 || n % 1000 == 0) {
+            fprintf(stderr, "usb-host-err #%" PRIu64 " %04x:%04x ep %#x status %d len %d/%d epoch_ms=%" PRId64 "\n",
+                    n, s->ddesc.idVendor, s->ddesc.idProduct, xfer->endpoint, xfer->status, xfer->actual_length,
+                    xfer->length, g_get_real_time() / 1000);
+        }
+    }
     if (r->in && xfer->actual_length) {
         /* Before the copy: the switch combo rewrites what the guest gets. */
         if (s->kbd_in_eps & (1 << r->p->ep->nr)) {
@@ -2877,6 +2891,9 @@ static void usb_host_handle_reset(USBDevice *udev)
     }
 
     trace_usb_host_reset(s->bus_num, s->addr);
+    /* TEMP lab (Opus 2026-10-19): guest resets of passed-through devices (a Bluetooth controller reset drops links). */
+    fprintf(stderr, "usb-host-reset %04x:%04x addr %d epoch_ms=%" PRId64 "\n", s->ddesc.idVendor,
+            s->ddesc.idProduct, udev->addr, g_get_real_time() / 1000);
 
     usb_host_ahead_stop_all(s, USB_RET_NODEV);
     if (s->slow_busy) {
