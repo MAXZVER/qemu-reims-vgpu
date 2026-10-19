@@ -2955,8 +2955,16 @@ static struct {
  */
 static void *whpx_lab_vcpu_watch_fn(void *opaque)
 {
+    /*
+     * TEMP lab (Opus 2026-10-19, work VM freezes): a vCPU out for over 2 s gets every thread's stack dumped once per
+     * episode (whoever holds the BQL or a device lock is in there); at most once a minute.
+     */
+    bool dumped = false;
+    int64_t last_dump = 0;
+
     for (;;) {
         int64_t now;
+        int64_t worst = 0;
         int i;
 
         g_usleep(500 * 1000);
@@ -2967,7 +2975,15 @@ static void *whpx_lab_vcpu_watch_fn(void *opaque)
             if (out && now - out > NANOSECONDS_PER_SECOND && !qatomic_read(&whpx_run_state[i].in_run)) {
                 fprintf(stderr, "whpx-vcpu-stuck: cpu %d out of the hypervisor %" PRId64 " ms, exit reason %#x\n", i,
                         (now - out) / SCALE_MS, qatomic_read(&whpx_run_state[i].reason));
+                worst = MAX(worst, now - out);
             }
+        }
+        if (!worst) {
+            dumped = false;
+        } else if (worst > 2 * NANOSECONDS_PER_SECOND && !dumped && now - last_dump > 60 * NANOSECONDS_PER_SECOND) {
+            dumped = true;
+            last_dump = now;
+            qemu_lab_dump_thread_stacks("vcpu-stuck");
         }
     }
     return NULL;

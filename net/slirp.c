@@ -218,6 +218,10 @@ static void net_slirp_cleanup(NetClientState *nc)
     }
 #endif
     g_slist_free_full(s->fwd, slirp_free_fwd);
+#ifdef _WIN32
+    /* The slirp thread never registered it: removing it wrote through NULL at exit. */
+    if (!s->lab_thread)
+#endif
     main_loop_poll_remove_notifier(&s->poll_notifier);
     unregister_savevm(NULL, "slirp", s->slirp);
     slirp_cleanup(s->slirp);
