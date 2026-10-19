@@ -147,6 +147,7 @@ struct USBHostDevice {
     bool                             allow_all_guest_resets;
     bool                             suppress_remote_wake;
     bool                             grab;
+    bool                             switch_pending; /* Ctrl+Alt+M seen */
 
     /* state */
     QTAILQ_ENTRY(USBHostDevice)      next;
@@ -574,12 +575,32 @@ static USBHostRequest *usb_host_req_find(USBHostDevice *s, USBPacket *p)
  * still reaches the guest. QMP qom-set ... grab=true takes them back.
  */
 #define USB_HOST_COMBO_KEY  0x29                 /* Escape */
+/*
+ * The switch combo (Mish, 2026-10-19): Ctrl+Alt+M on a passed-through
+ * keyboard hands that keyboard alone back to the host - the same keys the
+ * host's VM switcher (vmswitch.py) takes to go to Windows and back, so one
+ * chord moves both the screen and the keyboard. Every other passed-through
+ * device (Bluetooth, disks, the trackpad) stays with the guest.
+ */
+#define USB_HOST_SWITCH_KEY 0x10                 /* M */
 
 static QEMUBH *release_bh;
+static bool release_all_pending;
 
 static void usb_host_release_bh(void *opaque)
 {
-    usb_host_release_all();
+    USBHostDevice *s;
+
+    if (release_all_pending) {
+        release_all_pending = false;
+        usb_host_release_all();
+    }
+    QTAILQ_FOREACH(s, &hostdevs, next) {
+        if (s->switch_pending) {
+            s->switch_pending = false;
+            object_property_set_bool(OBJECT(s), "grab", false, NULL);
+        }
+    }
 }
 
 /* The boot keyboard report: modifier bitmap, reserved byte, six key codes. */
@@ -682,12 +703,12 @@ static bool usb_host_kbd_parse(const uint8_t *d, int len, USBHostKbdLayout *l)
  * missed the real combo on the same keyboard.
  */
 static void usb_host_check_release_combo(USBHostDevice *s, int ep,
-                                         const uint8_t *rep, int len)
+                                         uint8_t *rep, int len)
 {
     const USBHostKbdLayout *l = &s->kbd[ep];
     uint8_t mods = 0, rid = 0;
-    int keys = 0, esc = 0, i, j;
-    const uint8_t *p = rep;
+    int keys = 0, esc = 0, em = 0, i, j;
+    uint8_t *p = rep;
 
     if (l->ids) {
         if (len < 1) {
@@ -728,18 +749,36 @@ static void usb_host_check_release_combo(USBHostDevice *s, int ep,
                 mods |= 1 << (usage - 0xe0);
             } else if (usage == USB_HOST_COMBO_KEY) {
                 esc++;
+            } else if (usage == USB_HOST_SWITCH_KEY) {
+                em++;
             } else if (usage > 3) {              /* 1-3: rollover/errors */
                 keys++;
             }
         }
     }
-    if (!(mods & 0x11) || !(mods & 0x44) || !(mods & 0x22) || (mods & 0x88) ||
-        esc != 1 || keys) {
+    if (keys || !(mods & 0x11) || !(mods & 0x44) || (mods & 0x88)) {
         return;
     }
-    info_report("usb-host %04x:%04x: release combo (ep %d, report id %u, "
-                "%d bytes, modifiers %02x)", s->ddesc.idVendor,
-                s->ddesc.idProduct, ep, rid, len, mods);
+    if (esc == 1 && !em && (mods & 0x22)) {
+        info_report("usb-host %04x:%04x: release combo (ep %d, report id %u, "
+                    "%d bytes, modifiers %02x)", s->ddesc.idVendor,
+                    s->ddesc.idProduct, ep, rid, len, mods);
+        release_all_pending = true;
+    } else if (em == 1 && !esc && !(mods & 0x22)) {
+        /*
+         * The guest gets this report with every key up instead: it saw
+         * Ctrl and Alt go down, and the keyboard is about to vanish, so a
+         * report with them (and M) held would be the last it ever got -
+         * stuck modifiers and an M repeating until the keyboard returns.
+         */
+        memset(p, 0, len);
+        info_report("usb-host %04x:%04x: switch combo Ctrl+Alt+M (ep %d, "
+                    "report id %u, %d bytes): keyboard back to the host",
+                    s->ddesc.idVendor, s->ddesc.idProduct, ep, rid, len);
+        s->switch_pending = true;
+    } else {
+        return;
+    }
     if (!release_bh) {
         release_bh = qemu_bh_new(usb_host_release_bh, NULL);
     }
@@ -974,6 +1013,11 @@ static void LIBUSB_CALL usb_host_req_complete_data(struct libusb_transfer *xfer)
 
     r->p->status = status_map[xfer->status];
     if (r->in && xfer->actual_length) {
+        /* Before the copy: the switch combo rewrites what the guest gets. */
+        if (s->kbd_in_eps & (1 << r->p->ep->nr)) {
+            usb_host_check_release_combo(s, r->p->ep->nr, r->buffer,
+                                         xfer->actual_length);
+        }
         usb_packet_copy(r->p, r->buffer, xfer->actual_length);
         if (usb_host_stats_on() && xfer->type == LIBUSB_TRANSFER_TYPE_INTERRUPT) {
             int64_t now = get_clock();
@@ -987,10 +1031,6 @@ static void LIBUSB_CALL usb_host_req_complete_data(struct libusb_transfer *xfer)
             usb_host_stats_add(&ist.bh_sum, &ist.bh_max, now - cb);
             s->int_done[r->p->ep->nr & 15] = now;
             usb_host_stats_flush(now);
-        }
-        if (s->kbd_in_eps & (1 << r->p->ep->nr)) {
-            usb_host_check_release_combo(s, r->p->ep->nr, r->buffer,
-                                         xfer->actual_length);
         }
     }
     trace_usb_host_req_complete(s->bus_num, s->addr, r->p,
