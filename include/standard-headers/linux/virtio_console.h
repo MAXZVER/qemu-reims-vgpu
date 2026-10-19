@@ -44,7 +44,7 @@
 #define VIRTIO_CONSOLE_BAD_ID		(~(uint32_t)0)
 
 struct virtio_console_config {
-	/* columns of the screens */
+	/* colums of the screens */
 	__virtio16 cols;
 	/* rows of the screens */
 	__virtio16 rows;

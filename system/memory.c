@@ -1771,7 +1771,6 @@ static void memory_region_finalize(Object *obj)
     memory_region_clear_coalescing(mr);
     g_free((char *)mr->name);
     g_free(mr->ioeventfds);
-    object_unref(mr->rdm);
 }
 
 Object *memory_region_owner(const MemoryRegion *mr)
@@ -2070,33 +2069,75 @@ RamDiscardManager *memory_region_get_ram_discard_manager(MemoryRegion *mr)
     return mr->rdm;
 }
 
-int memory_region_add_ram_discard_source(MemoryRegion *mr,
-                                         RamDiscardSource *source)
+int memory_region_set_ram_discard_manager(MemoryRegion *mr,
+                                          RamDiscardManager *rdm)
 {
     g_assert(memory_region_is_ram(mr));
-
-    if (!mr->rdm) {
-        mr->rdm = ram_discard_manager_new(mr);
+    if (mr->rdm && rdm) {
+        return -EBUSY;
     }
 
-    return ram_discard_manager_add_source(mr->rdm, source);
+    mr->rdm = rdm;
+    return 0;
 }
 
-int memory_region_del_ram_discard_source(MemoryRegion *mr,
-                                          RamDiscardSource *source)
+uint64_t ram_discard_manager_get_min_granularity(const RamDiscardManager *rdm,
+                                                 const MemoryRegion *mr)
 {
-    int ret;
-    g_assert(mr->rdm);
+    RamDiscardManagerClass *rdmc = RAM_DISCARD_MANAGER_GET_CLASS(rdm);
 
-    ret = ram_discard_manager_del_source(mr->rdm, source);
-    if (ret != 0) {
-        return ret;
-    }
-    if (QLIST_EMPTY(&mr->rdm->source_list) && QLIST_EMPTY(&mr->rdm->rdl_list)) {
-        object_unref(mr->rdm);
-        mr->rdm = NULL;
-    }
-    return 0;
+    g_assert(rdmc->get_min_granularity);
+    return rdmc->get_min_granularity(rdm, mr);
+}
+
+bool ram_discard_manager_is_populated(const RamDiscardManager *rdm,
+                                      const MemoryRegionSection *section)
+{
+    RamDiscardManagerClass *rdmc = RAM_DISCARD_MANAGER_GET_CLASS(rdm);
+
+    g_assert(rdmc->is_populated);
+    return rdmc->is_populated(rdm, section);
+}
+
+int ram_discard_manager_replay_populated(const RamDiscardManager *rdm,
+                                         MemoryRegionSection *section,
+                                         ReplayRamDiscardState replay_fn,
+                                         void *opaque)
+{
+    RamDiscardManagerClass *rdmc = RAM_DISCARD_MANAGER_GET_CLASS(rdm);
+
+    g_assert(rdmc->replay_populated);
+    return rdmc->replay_populated(rdm, section, replay_fn, opaque);
+}
+
+int ram_discard_manager_replay_discarded(const RamDiscardManager *rdm,
+                                         MemoryRegionSection *section,
+                                         ReplayRamDiscardState replay_fn,
+                                         void *opaque)
+{
+    RamDiscardManagerClass *rdmc = RAM_DISCARD_MANAGER_GET_CLASS(rdm);
+
+    g_assert(rdmc->replay_discarded);
+    return rdmc->replay_discarded(rdm, section, replay_fn, opaque);
+}
+
+void ram_discard_manager_register_listener(RamDiscardManager *rdm,
+                                           RamDiscardListener *rdl,
+                                           MemoryRegionSection *section)
+{
+    RamDiscardManagerClass *rdmc = RAM_DISCARD_MANAGER_GET_CLASS(rdm);
+
+    g_assert(rdmc->register_listener);
+    rdmc->register_listener(rdm, rdl, section);
+}
+
+void ram_discard_manager_unregister_listener(RamDiscardManager *rdm,
+                                             RamDiscardListener *rdl)
+{
+    RamDiscardManagerClass *rdmc = RAM_DISCARD_MANAGER_GET_CLASS(rdm);
+
+    g_assert(rdmc->unregister_listener);
+    rdmc->unregister_listener(rdm, rdl);
 }
 
 /* Called with rcu_read_lock held.  */
@@ -2216,6 +2257,64 @@ static void memory_region_sync_dirty_bitmap(MemoryRegion *mr, bool last_stage)
             listener->log_sync_global(listener, last_stage);
             trace_memory_region_sync_dirty(mr ? mr->name : "(all)", listener->name, 1);
         }
+    }
+}
+
+void (*memory_dirty_log_flush_hook)(void);
+
+void memory_region_sync_dirty_ranges(MemoryRegion *mr,
+                                     const MemoryRegionRange *ranges,
+                                     size_t n)
+{
+    MemoryRegionSection mrs, sub;
+    MemoryListener *listener;
+    FlatView *view;
+    FlatRange *fr;
+    hwaddr sec_start, sec_end;
+    size_t i;
+
+    if (n == 0) {
+        return;
+    }
+    QTAILQ_FOREACH(listener, &memory_listeners, link) {
+        if (listener->log_sync_global) {
+            /* Cannot sync in a finer granularity than everything. */
+            listener->log_sync_global(listener, false);
+            continue;
+        }
+        if (!listener->log_sync) {
+            continue;
+        }
+        view = address_space_get_flatview(listener->address_space);
+        FOR_EACH_FLAT_RANGE(fr, view) {
+            if (!fr->dirty_log_mask || fr->mr != mr) {
+                continue;
+            }
+            mrs = section_from_flat_range(fr, view);
+            if (!listener->log_sync_ranged) {
+                listener->log_sync(listener, &mrs);
+                continue;
+            }
+            {
+                for (i = 0; i < n; i++) {
+                    sec_start = MAX(mrs.offset_within_region, ranges[i].start);
+                    sec_end = MIN(mrs.offset_within_region +
+                                  int128_get64(mrs.size),
+                                  ranges[i].start + ranges[i].len);
+                    if (sec_start >= sec_end) {
+                        continue;
+                    }
+                    sub = mrs;
+                    sub.offset_within_address_space +=
+                        sec_start - mrs.offset_within_region;
+                    sub.offset_within_region = sec_start;
+                    sub.size = int128_make64(sec_end - sec_start);
+                    listener->log_sync(listener, &sub);
+                }
+            }
+        }
+        flatview_unref(view);
+        trace_memory_region_sync_dirty(mr->name, listener->name, 0);
     }
 }
 
@@ -2479,6 +2578,12 @@ void memory_region_enable_lockless_io(MemoryRegion *mr)
      * TODO: remove this when reentrancy_guard becomes per transaction.
      */
     mr->disable_reentrancy_guard = true;
+}
+
+void memory_region_enable_lab_fast_store(MemoryRegion *mr)
+{
+    memory_region_enable_lockless_io(mr);
+    mr->lab_fast_store = true;
 }
 
 void memory_region_add_eventfd(MemoryRegion *mr,
@@ -3728,10 +3833,17 @@ static const TypeInfo iommu_memory_region_info = {
     .abstract           = true,
 };
 
+static const TypeInfo ram_discard_manager_info = {
+    .parent             = TYPE_INTERFACE,
+    .name               = TYPE_RAM_DISCARD_MANAGER,
+    .class_size         = sizeof(RamDiscardManagerClass),
+};
+
 static void memory_register_types(void)
 {
     type_register_static(&memory_region_info);
     type_register_static(&iommu_memory_region_info);
+    type_register_static(&ram_discard_manager_info);
 }
 
 type_init(memory_register_types)

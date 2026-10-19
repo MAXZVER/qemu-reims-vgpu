@@ -261,7 +261,13 @@ static void whpx_send_msi(MSIMessage *msg)
     uint8_t trigger_mode = (data >> MSI_DATA_TRIGGER_SHIFT) & 0x1;
     uint8_t delivery = (data >> MSI_DATA_DELIVERY_MODE_SHIFT) & 0x7;
 
-    if (vector == 0) {
+    /*
+     * A vector of 0 is only invalid for fixed delivery. INIT IPIs (used by
+     * guest firmware and kernels to start secondary processors) legitimately
+     * carry vector 0 and must reach the target vCPU, otherwise the APs never
+     * start and the guest stalls or panics waiting for them.
+     */
+    if (vector == 0 && delivery == 0) {
         warn_report("Ignoring request for interrupt vector 0");
         return;
     }
@@ -325,6 +331,13 @@ static void whpx_apic_realize(DeviceState *dev, Error **errp)
 
     memory_region_init_io(&s->io_memory, OBJECT(s), &whpx_apic_io_ops, s,
                           "whpx-apic-msi", APIC_SPACE_SIZE);
+    /*
+     * A write here is an MSI, and delivering it is one WHvRequestInterrupt
+     * built from the written address and data alone — no APIC state lives in
+     * QEMU for it to race on. So a device thread may raise an MSI without the
+     * BQL, which is what lets it signal completion without a main-loop hop.
+     */
+    memory_region_enable_lockless_io(&s->io_memory);
 
     msi_nonbroken = true;
 }

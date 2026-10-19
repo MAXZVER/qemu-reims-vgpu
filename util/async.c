@@ -24,6 +24,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/timer.h"
+#include "qemu/lab-slow.h"
 #include "qapi/error.h"
 #include "qemu/aio.h"
 #include "block/thread-pool.h"
@@ -170,7 +172,14 @@ void aio_bh_call(QEMUBH *bh)
         reentrancy_guard->engaged_in_io = true;
     }
 
-    bh->cb(bh->opaque);
+    {
+        int64_t lab_t = qemu_lab_slow_begin();
+        QEMUBHFunc *lab_cb = bh->cb;
+        const char *lab_name = bh->name;
+
+        bh->cb(bh->opaque);
+        qemu_lab_slow_end("bh", lab_name, (const void *)lab_cb, lab_t);
+    }
 
     if (reentrancy_guard) {
         reentrancy_guard->engaged_in_io = last_engaged_in_io;

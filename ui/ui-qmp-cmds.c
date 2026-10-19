@@ -348,7 +348,6 @@ qmp_screendump(const char *filename, const char *device,
         }
     }
 
-    object_ref(con);
     qemu_console_co_wait_update(con);
 
     /*
@@ -359,11 +358,9 @@ qmp_screendump(const char *filename, const char *device,
     surface = qemu_console_surface(con);
     if (!surface) {
         error_setg(errp, "no surface");
-        object_unref(con);
         return;
     }
     image = pixman_image_ref(surface->image);
-    object_unref(con);
 
     fd = qemu_create(filename, O_WRONLY | O_TRUNC | O_BINARY, 0666, errp);
     if (fd == -1) {

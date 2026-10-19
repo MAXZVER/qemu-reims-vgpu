@@ -16,9 +16,20 @@
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
-#include "trace.h"
 
 #define CKIH_FREQ 26000000 /* 26MHz crystal input */
+
+#ifndef DEBUG_IMX31_CCM
+#define DEBUG_IMX31_CCM 0
+#endif
+
+#define DPRINTF(fmt, args...) \
+    do { \
+        if (DEBUG_IMX31_CCM) { \
+            fprintf(stderr, "[%s]%s: " fmt , TYPE_IMX31_CCM, \
+                                             __func__, ##args); \
+        } \
+    } while (0)
 
 static const char *imx31_ccm_reg_name(uint32_t reg)
 {
@@ -109,7 +120,7 @@ static uint32_t imx31_ccm_get_pll_ref_clk(IMXCCMState *dev)
         freq = CKIH_FREQ;
     }
 
-    trace_imx31_ccm_get_pll_ref_clk(freq);
+    DPRINTF("freq = %u\n", freq);
 
     return freq;
 }
@@ -122,7 +133,7 @@ static uint32_t imx31_ccm_get_mpll_clk(IMXCCMState *dev)
     freq = imx_ccm_calc_pll(s->reg[IMX31_CCM_MPCTL_REG],
                             imx31_ccm_get_pll_ref_clk(dev));
 
-    trace_imx31_ccm_get_mpll_clk(freq);
+    DPRINTF("freq = %u\n", freq);
 
     return freq;
 }
@@ -139,7 +150,7 @@ static uint32_t imx31_ccm_get_mcu_main_clk(IMXCCMState *dev)
         freq = imx31_ccm_get_mpll_clk(dev);
     }
 
-    trace_imx31_ccm_get_mcu_main_clk(freq);
+    DPRINTF("freq = %u\n", freq);
 
     return freq;
 }
@@ -152,7 +163,7 @@ static uint32_t imx31_ccm_get_hclk_clk(IMXCCMState *dev)
     freq = imx31_ccm_get_mcu_main_clk(dev)
            / (1 + EXTRACT(s->reg[IMX31_CCM_PDR0_REG], MAX));
 
-    trace_imx31_ccm_get_hclk_clk(freq);
+    DPRINTF("freq = %u\n", freq);
 
     return freq;
 }
@@ -165,7 +176,7 @@ static uint32_t imx31_ccm_get_ipg_clk(IMXCCMState *dev)
     freq = imx31_ccm_get_hclk_clk(dev)
            / (1 + EXTRACT(s->reg[IMX31_CCM_PDR0_REG], IPG));
 
-    trace_imx31_ccm_get_ipg_clk(freq);
+    DPRINTF("freq = %u\n", freq);
 
     return freq;
 }
@@ -190,7 +201,7 @@ static uint32_t imx31_ccm_get_clock_frequency(IMXCCMState *dev, IMXClk clock)
         break;
     }
 
-    trace_imx31_ccm_get_clock_frequency(clock, freq);
+    DPRINTF("Clock = %d) = %u\n", clock, freq);
 
     return freq;
 }
@@ -198,6 +209,8 @@ static uint32_t imx31_ccm_get_clock_frequency(IMXCCMState *dev, IMXClk clock)
 static void imx31_ccm_reset(DeviceState *dev)
 {
     IMX31CCMState *s = IMX31_CCM(dev);
+
+    DPRINTF("()\n");
 
     memset(s->reg, 0, sizeof(uint32_t) * IMX31_CCM_MAX_REG);
 
@@ -231,7 +244,8 @@ static uint64_t imx31_ccm_read(void *opaque, hwaddr offset, unsigned size)
                       HWADDR_PRIx "\n", TYPE_IMX31_CCM, __func__, offset);
     }
 
-    trace_imx31_ccm_read(imx31_ccm_reg_name(offset >> 2), value);
+    DPRINTF("reg[%s] => 0x%" PRIx32 "\n", imx31_ccm_reg_name(offset >> 2),
+            value);
 
     return (uint64_t)value;
 }
@@ -241,7 +255,8 @@ static void imx31_ccm_write(void *opaque, hwaddr offset, uint64_t value,
 {
     IMX31CCMState *s = (IMX31CCMState *)opaque;
 
-    trace_imx31_ccm_write(imx31_ccm_reg_name(offset >> 2), value);
+    DPRINTF("reg[%s] <= 0x%" PRIx32 "\n", imx31_ccm_reg_name(offset >> 2),
+            (uint32_t)value);
 
     switch (offset >> 2) {
     case IMX31_CCM_CCMR_REG:

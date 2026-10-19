@@ -1,3 +1,6 @@
+# Line endings: LF in the index and in every checkout, whatever core.autocrlf says.
+* text=auto eol=lf
+
 *.c.inc         diff=c
 *.h.inc         diff=c
 *.m             diff=objc

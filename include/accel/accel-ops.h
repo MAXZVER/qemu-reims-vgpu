@@ -13,8 +13,6 @@
 
 struct AccelState {
     Object parent_obj;
-
-    AccelGdbConfig gdbstub;
 };
 
 struct AccelClass {
@@ -37,6 +35,9 @@ struct AccelClass {
     void (*pre_resume_vm)(AccelState *as, bool step_pending);
     bool (*has_memory)(AccelState *accel, AddressSpace *as,
                        hwaddr start_addr, hwaddr size);
+
+    /* gdbstub related hooks */
+    int (*gdbstub_supported_sstep_flags)(AccelState *as);
 
     bool *allowed;
     /*

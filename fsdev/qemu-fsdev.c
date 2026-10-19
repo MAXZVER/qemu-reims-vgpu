@@ -45,7 +45,7 @@ typedef struct FsDriverListEntry {
 static QTAILQ_HEAD(, FsDriverListEntry) fsdriver_entries =
     QTAILQ_HEAD_INITIALIZER(fsdriver_entries);
 
-#define COMMON_FS_DRIVER_OPTIONS "id", "fsdriver", "readonly", "max_xattr"
+#define COMMON_FS_DRIVER_OPTIONS "id", "fsdriver", "readonly"
 
 static FsDriverTable FsDrivers[] = {
     {

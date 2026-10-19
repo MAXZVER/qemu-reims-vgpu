@@ -3,7 +3,6 @@ subdir('alpha')
 subdir('arm')
 subdir('avr')
 subdir('hppa')
-subdir('hexagon')
 subdir('xenpv') # i386 uses it
 subdir('i386')
 subdir('loongarch')

@@ -139,8 +139,9 @@ static char *replay_find_nearest_snapshot(int64_t icount,
                                           int64_t *snapshot_icount)
 {
     BlockDriverState *bs;
-    g_autofree QEMUSnapshotInfo *sn_tab = NULL;
+    QEMUSnapshotInfo *sn_tab;
     QEMUSnapshotInfo *nearest = NULL;
+    char *ret = NULL;
     int rv;
     int nb_sns, i;
 
@@ -148,19 +149,15 @@ static char *replay_find_nearest_snapshot(int64_t icount,
 
     bs = bdrv_all_find_vmstate_bs(NULL, false, NULL, NULL);
     if (!bs) {
-        return NULL;
+        goto fail;
     }
 
     nb_sns = bdrv_snapshot_list(bs, &sn_tab);
-    if (nb_sns < 0) {
-        return NULL;
-    }
 
     for (i = 0; i < nb_sns; i++) {
         rv = bdrv_all_has_snapshot(sn_tab[i].name, false, NULL, NULL);
-        if (rv < 0) {
-            return NULL;
-        }
+        if (rv < 0)
+            goto fail;
         if (rv == 1) {
             if (sn_tab[i].icount != -1ULL
                 && sn_tab[i].icount <= icount
@@ -169,12 +166,14 @@ static char *replay_find_nearest_snapshot(int64_t icount,
             }
         }
     }
-    if (!nearest) {
-        return NULL;
+    if (nearest) {
+        ret = g_strdup(nearest->name);
+        *snapshot_icount = nearest->icount;
     }
+    g_free(sn_tab);
 
-    *snapshot_icount = nearest->icount;
-    return g_strdup(nearest->name);
+fail:
+    return ret;
 }
 
 static void replay_seek(int64_t icount, QEMUTimerCB callback, Error **errp)

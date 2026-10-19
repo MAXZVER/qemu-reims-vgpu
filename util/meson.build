@@ -1,4 +1,4 @@
-util_ss.add(files('osdep.c', 'cutils.c', 'unicode.c', 'qemu-timer-common.c'))
+util_ss.add(files('osdep.c', 'cutils.c', 'unicode.c', 'qemu-timer-common.c', 'lab-slow.c'))
 util_ss.add(files('thread-context.c'), numa)
 if host_os != 'windows'
   util_ss.add(files('aio-posix.c'))
@@ -66,6 +66,10 @@ util_ss.add(files('int128.c'))
 util_ss.add(files('memalign.c'))
 util_ss.add(files('interval-tree.c'))
 util_ss.add(files('lockcnt.c'))
+
+if have_user
+  util_ss.add(files('selfmap.c'))
+endif
 
 if have_system
   util_ss.add(files('crc-ccitt.c'))

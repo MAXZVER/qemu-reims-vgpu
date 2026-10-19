@@ -455,7 +455,7 @@ unsigned long kvm_arch_vcpu_id(CPUState *cpu)
 
 static struct HWBreakpoint {
     target_ulong addr;
-    GdbBreakpointType type;
+    int type;
 } hw_debug_points[MAX_HW_BKPTS];
 
 static CPUWatchpoint hw_watchpoint;
@@ -1412,7 +1412,7 @@ int kvm_arch_remove_sw_breakpoint(CPUState *cs, struct kvm_sw_breakpoint *bp)
     return 0;
 }
 
-static int find_hw_breakpoint(target_ulong addr, GdbBreakpointType type)
+static int find_hw_breakpoint(target_ulong addr, int type)
 {
     int n;
 
@@ -1454,8 +1454,7 @@ static int find_hw_watchpoint(target_ulong addr, int *flag)
     return -1;
 }
 
-int kvm_arch_insert_gdbstub_hw_breakpoint(vaddr addr, vaddr len,
-                                          GdbBreakpointType type)
+int kvm_arch_insert_hw_breakpoint(vaddr addr, vaddr len, int type)
 {
     const unsigned breakpoint_index = nb_hw_breakpoint + nb_hw_watchpoint;
     if (breakpoint_index >= ARRAY_SIZE(hw_debug_points)) {
@@ -1499,8 +1498,7 @@ int kvm_arch_insert_gdbstub_hw_breakpoint(vaddr addr, vaddr len,
     return 0;
 }
 
-int kvm_arch_remove_gdbstub_hw_breakpoint(vaddr addr, vaddr len,
-                                          GdbBreakpointType type)
+int kvm_arch_remove_hw_breakpoint(vaddr addr, vaddr len, int type)
 {
     int n;
 
@@ -1528,7 +1526,7 @@ int kvm_arch_remove_gdbstub_hw_breakpoint(vaddr addr, vaddr len,
     return 0;
 }
 
-void kvm_arch_remove_all_gdbstub_hw_breakpoints(void)
+void kvm_arch_remove_all_hw_breakpoints(void)
 {
     nb_hw_breakpoint = nb_hw_watchpoint = 0;
 }
@@ -1615,7 +1613,7 @@ static int kvm_handle_debug(PowerPCCPU *cpu, struct kvm_run *run)
     CPUPPCState *env = &cpu->env;
     struct kvm_debug_exit_arch *arch_info = &run->debug.arch;
 
-    if (cpu_single_stepping(cs)) {
+    if (cs->singlestep_enabled) {
         return kvm_handle_singlestep();
     }
 
@@ -2439,7 +2437,9 @@ static bool kvmppc_power8_host(void)
 #ifdef TARGET_PPC64
     {
         uint32_t base_pvr = CPU_POWERPC_POWER_SERVER_MASK & mfpvr();
-        ret = (base_pvr == CPU_POWERPC_POWER8_BASE);
+        ret = (base_pvr == CPU_POWERPC_POWER8E_BASE) ||
+              (base_pvr == CPU_POWERPC_POWER8NVL_BASE) ||
+              (base_pvr == CPU_POWERPC_POWER8_BASE);
     }
 #endif /* TARGET_PPC64 */
     return ret;

@@ -6,6 +6,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "system/whpx-wp.h"
 #include "cpu.h"
 #include "system/address-spaces.h"
 #include "system/ioport.h"
@@ -13,10 +14,13 @@
 #include "qemu/accel.h"
 #include "accel/accel-ops.h"
 #include "system/memory.h"
+#include "system/physmem.h"
+#include "system/ram_addr.h"
 #include "system/whpx.h"
 #include "system/cpus.h"
 #include "system/runstate.h"
 #include "qemu/main-loop.h"
+#include "qemu/timer.h"
 #include "hw/core/boards.h"
 #include "hw/intc/ioapic.h"
 #include "qemu/error-report.h"
@@ -284,6 +288,479 @@ void whpx_vcpu_kick(CPUState *cpu)
  * Memory support.
  */
 
+/*
+ * Guest-write tracking. Writable guest RAM is mapped with
+ * WHvMapGpaRangeFlagTrackDirtyPages and log_sync reads the hypervisor's
+ * per-page bitmap, the way KVM's log_sync reads KVM_GET_DIRTY_LOG. Without
+ * it log_sync can only report every page of every logged region as written,
+ * which makes any consumer of the dirty bitmap (display devices, migration)
+ * redo all of its work on every sync.
+ *
+ * Tracking starts enabled when the host exports the query and switches off
+ * for the rest of the run the first time the hypervisor refuses a tracked
+ * mapping or a query; log_sync then falls back to the conservative answer.
+ */
+static bool whpx_dirty_tracking;
+static bool whpx_dirty_tracking_decided;
+
+static void whpx_dirty_tracking_disable(const char *why, HRESULT hr)
+{
+    if (whpx_dirty_tracking) {
+        warn_report("WHPX: guest dirty-page tracking disabled (%s, hr=0x%lx); "
+                    "logged RAM will be reported as fully dirty", why, hr);
+    }
+    whpx_dirty_tracking = false;
+}
+
+/*
+ * Lab REIMS_VGPU_LAB_DIRTY_WP (hw/display/reims-vgpu-dirty.c): the display
+ * device write-protects guest pages it has proven clean, so that reading them
+ * needs no dirty-bitmap query; the guest's first store into one exits here as
+ * a memory access and `whpx_wp_fault_hook` makes the page writable again.
+ * `whpx_wp_invalidate_hook` runs before QEMU itself remaps writable RAM.
+ * `whpx_wp_busy` / `whpx_wp_gen` let a dirty query that failed because it
+ * met a range between its unmap and its map tell that apart and retry.
+ */
+bool (*whpx_wp_fault_hook)(uint64_t gpa);
+
+#if _WIN32_WINNT < 0x0A00   /* declared only for Windows 10 targets; present since Windows 10 */
+WINBASEAPI WINBOOL WINAPI GetSystemCpuSetInformation(PSYSTEM_CPU_SET_INFORMATION Information,
+                                                     ULONG BufferLength, PULONG ReturnedLength,
+                                                     HANDLE Process, ULONG Flags);
+WINBASEAPI WINBOOL WINAPI SetThreadSelectedCpuSets(HANDLE Thread, const ULONG *CpuSetIds,
+                                                   ULONG CpuSetIdCount);
+#endif
+
+/*
+ * Lab REIMS_VGPU_LAB_PCORES=on: the calling thread prefers the performance
+ * cores of a hybrid CPU (i7-14700K: 8 performance cores with two threads each,
+ * 12 efficiency cores), through a CPU-set selection (a preference the scheduler
+ * keeps, not a hard affinity). For the vCPU threads, the device drain and its
+ * recorder, which a frame waits for in turn.
+ */
+void whpx_lab_pin_pcores(const char *who)
+{
+    static int on = -1;
+    ULONG need = 0, ids[256], n = 0;
+    uint8_t *buf;
+    uint8_t maxc = 0;
+    size_t off;
+
+    if (on < 0) {
+        const char *e = getenv("REIMS_VGPU_LAB_PCORES");
+        on = e && strcmp(e, "on") == 0;
+    }
+    if (!on) {
+        return;
+    }
+    GetSystemCpuSetInformation(NULL, 0, &need, NULL, 0);
+    buf = need ? g_malloc0(need) : NULL;
+    if (!buf || !GetSystemCpuSetInformation((PSYSTEM_CPU_SET_INFORMATION)buf, need, &need,
+                                            NULL, 0)) {
+        g_free(buf);
+        return;
+    }
+    for (off = 0; off + 19 <= need;) {
+        PSYSTEM_CPU_SET_INFORMATION r = (PSYSTEM_CPU_SET_INFORMATION)(buf + off);
+        if (!r->Size) {
+            break;
+        }
+        maxc = MAX(maxc, r->CpuSet.EfficiencyClass);
+        off += r->Size;
+    }
+    for (off = 0; off + 19 <= need && n < G_N_ELEMENTS(ids);) {
+        PSYSTEM_CPU_SET_INFORMATION r = (PSYSTEM_CPU_SET_INFORMATION)(buf + off);
+        if (!r->Size) {
+            break;
+        }
+        if (r->CpuSet.EfficiencyClass == maxc) {
+            ids[n++] = r->CpuSet.Id;
+        }
+        off += r->Size;
+    }
+    g_free(buf);
+    if (n && SetThreadSelectedCpuSets(GetCurrentThread(), ids, n)) {
+        fprintf(stderr, "reims-pcores %s: %lu performance cpu sets\n", who, (unsigned long)n);
+    }
+}
+/*
+ * TEMP lab REIMS_VGPU_LAB_EXCL_CORE=on: the drain thread alone on the first performance core and the recorder
+ * (crates/reims-vgpu/src/lab_cores.rs pin_recorder_excl_core) alone on the second; every other thread of the
+ * process (vCPUs, pool helpers, the recording lane, QEMU's own) defaults to the rest. The drain is the frame's
+ * critical path and is serial: a busy hyperthread sibling or a vCPU sharing its core slows every packet.
+ */
+void whpx_lab_excl_core_drain(void)
+{
+    ULONG need = 0, rest[256], drain = 0, n = 0;
+    uint8_t *buf;
+    size_t off;
+    uint8_t maxc = 0;
+    int core0 = -1, core1 = -1;
+    const char *e = getenv("REIMS_VGPU_LAB_EXCL_CORE");
+
+    if (!e || strcmp(e, "on") != 0) {
+        return;
+    }
+    GetSystemCpuSetInformation(NULL, 0, &need, NULL, 0);
+    buf = need ? g_malloc0(need) : NULL;
+    if (!buf || !GetSystemCpuSetInformation((PSYSTEM_CPU_SET_INFORMATION)buf, need, &need,
+                                            NULL, 0)) {
+        g_free(buf);
+        return;
+    }
+    for (off = 0; off + 19 <= need;) {
+        PSYSTEM_CPU_SET_INFORMATION r = (PSYSTEM_CPU_SET_INFORMATION)(buf + off);
+        if (!r->Size) {
+            break;
+        }
+        maxc = MAX(maxc, r->CpuSet.EfficiencyClass);
+        off += r->Size;
+    }
+    /* The two lowest-numbered performance cores. */
+    for (off = 0; off + 19 <= need;) {
+        PSYSTEM_CPU_SET_INFORMATION r = (PSYSTEM_CPU_SET_INFORMATION)(buf + off);
+        if (!r->Size) {
+            break;
+        }
+        if (r->CpuSet.Group == 0 && r->CpuSet.EfficiencyClass == maxc) {
+            int c = r->CpuSet.CoreIndex;
+            if (core0 < 0 || c < core0) {
+                core1 = core0;
+                core0 = c;
+            } else if (c != core0 && (core1 < 0 || c < core1)) {
+                core1 = c;
+            }
+        }
+        off += r->Size;
+    }
+    for (off = 0; off + 19 <= need && n < G_N_ELEMENTS(rest);) {
+        PSYSTEM_CPU_SET_INFORMATION r = (PSYSTEM_CPU_SET_INFORMATION)(buf + off);
+        if (!r->Size) {
+            break;
+        }
+        if (r->CpuSet.Group == 0 && r->CpuSet.CoreIndex == core0) {
+            if (!drain) {
+                drain = r->CpuSet.Id;
+            }
+        } else if (r->CpuSet.Group == 0 && r->CpuSet.CoreIndex != core1) {
+            rest[n++] = r->CpuSet.Id;
+        }
+        off += r->Size;
+    }
+    g_free(buf);
+    if (core0 < 0 || !drain || !n) {
+        return;
+    }
+    {
+        typedef BOOL (WINAPI *SetDefaultFn)(HANDLE, const ULONG *, ULONG);
+        HMODULE k32 = GetModuleHandleA("kernel32.dll");
+        SetDefaultFn set_default = k32 ? (SetDefaultFn)(void *)GetProcAddress(
+                                             k32, "SetProcessDefaultCpuSets")
+                                       : NULL;
+        if (!set_default || !set_default(GetCurrentProcess(), rest, n)) {
+            return;
+        }
+    }
+    SetThreadSelectedCpuSets(GetCurrentThread(), &drain, 1);
+    fprintf(stderr, "reims-excl-core drain=core%d set=%lu recorder=core%d rest=%lu\n", core0,
+            (unsigned long)drain, core1, (unsigned long)n);
+}
+/*
+ * TEMP lab REIMS_VGPU_LAB_DEVICE_CCD=N: the calling device thread prefers the logical processors sharing
+ * last-level cache N - one CCD of the home rig's Ryzen 9 7950X (crates/reims-vgpu/src/lab_cores.rs
+ * pin_device_ccd, the Rust half). The drain, its recorder and the pool hand work across for every draw.
+ */
+void whpx_lab_pin_ccd(const char *who)
+{
+    static int ccd = -2;
+    ULONG need = 0, ids[256], n = 0;
+    uint8_t *buf;
+    size_t off;
+
+    if (ccd == -2) {
+        const char *e = getenv("REIMS_VGPU_LAB_DEVICE_CCD");
+        ccd = e && *e ? atoi(e) : -1;
+    }
+    if (ccd < 0) {
+        return;
+    }
+    GetSystemCpuSetInformation(NULL, 0, &need, NULL, 0);
+    buf = need ? g_malloc0(need) : NULL;
+    if (!buf || !GetSystemCpuSetInformation((PSYSTEM_CPU_SET_INFORMATION)buf, need, &need,
+                                            NULL, 0)) {
+        g_free(buf);
+        return;
+    }
+    for (off = 0; off + 19 <= need && n < G_N_ELEMENTS(ids);) {
+        PSYSTEM_CPU_SET_INFORMATION r = (PSYSTEM_CPU_SET_INFORMATION)(buf + off);
+        if (!r->Size) {
+            break;
+        }
+        if (r->CpuSet.Group == 0 && r->CpuSet.LastLevelCacheIndex == ccd) {
+            ids[n++] = r->CpuSet.Id;
+        }
+        off += r->Size;
+    }
+    g_free(buf);
+    if (n && SetThreadSelectedCpuSets(GetCurrentThread(), ids, n)) {
+        fprintf(stderr, "reims-lab: device-ccd %s ccd=%d sets=%lu\n", who, ccd, (unsigned long)n);
+    }
+}
+
+void (*whpx_wp_invalidate_hook)(void);
+static int whpx_wp_busy;
+static unsigned whpx_wp_gen;
+/* TEMP lab (b454): DIRTY_WP remaps per whpx-stats second - count, time, worst, pages. */
+static uint64_t whpx_lab_rm_n, whpx_lab_rm_ns, whpx_lab_rm_max_ns, whpx_lab_rm_pages;
+
+void whpx_lab_wp_remap_take(uint64_t *n, uint64_t *ns, uint64_t *max_ns, uint64_t *pages)
+{
+    *n = qatomic_xchg(&whpx_lab_rm_n, 0);
+    *ns = qatomic_xchg(&whpx_lab_rm_ns, 0);
+    *max_ns = qatomic_xchg(&whpx_lab_rm_max_ns, 0);
+    *pages = qatomic_xchg(&whpx_lab_rm_pages, 0);
+}
+
+/*
+ * TEMP (lab, REIMS_VGPU_LAB_WP_POPULATE=read|write): refill the second-level translation of a range DIRTY_WP
+ * just remapped, on the WP thread, instead of leaving it to the guest's next touch. A remap drops the range's
+ * entries like an unmap does, so every page of it costs the guest a hypervisor fault again - which undoes
+ * RAM_POPULATE for exactly the pages WindowServer reuses for new surfaces: n210 (Intel, 40 GB), wiring
+ * 4.4 us a page with DIRTY_WP (60 020 remaps in the run) against 1.1 with it off. `read` populates for read
+ * (a write still upgrades the entry), `write` for write (may log the pages dirty). One line a second.
+ */
+static void whpx_lab_wp_populate(uint64_t gpa, uint64_t size, bool writable)
+{
+    static int mode = -1;   /* 0 off, 1 read, 2 write */
+    static uint64_t n, pages, ns, fails;
+    static int64_t last;
+    WHV_MEMORY_RANGE_ENTRY range = { .GuestAddress = gpa, .SizeInBytes = size };
+    WHV_ADVISE_GPA_RANGE advice = { 0 };
+    int64_t t0, now, was;
+    HRESULT hr;
+
+    if (mode < 0) {
+        const char *e = getenv("REIMS_VGPU_LAB_WP_POPULATE");
+        mode = !e ? 0 : strcmp(e, "write") == 0 ? 2 : strcmp(e, "read") == 0 ? 1 : 0;
+    }
+    if (!mode || !whp_dispatch.WHvAdviseGpaRange) {
+        return;
+    }
+    advice.Populate.AccessType = (mode == 2 && writable) ? WHvMemoryAccessWrite : WHvMemoryAccessRead;
+    t0 = get_clock();
+    hr = whp_dispatch.WHvAdviseGpaRange(whpx_global.partition, &range, 1, WHvAdviseGpaRangeCodePopulate,
+                                        &advice, sizeof(advice));
+    now = get_clock();
+    qatomic_add(&n, 1);
+    qatomic_add(&pages, size >> 12);
+    qatomic_add(&ns, (uint64_t)(now - t0));
+    if (FAILED(hr)) {
+        qatomic_add(&fails, 1);
+    }
+    was = qatomic_read(&last);
+    if (now - was >= NANOSECONDS_PER_SECOND && qatomic_cmpxchg(&last, was, now) == was) {
+        uint64_t cn = qatomic_xchg(&n, 0), cp = qatomic_xchg(&pages, 0), cns = qatomic_xchg(&ns, 0);
+        uint64_t cf = qatomic_xchg(&fails, 0);
+        fprintf(stderr, "reims-lab: wp-populate mode=%d n=%" PRIu64 " pages=%" PRIu64 " us=%" PRIu64
+                " fails=%" PRIu64 "\n", mode, cn, cp, cns / 1000, cf);
+    }
+}
+
+/*
+ * TEMP (lab, REIMS_VGPU_LAB_UNTRACK_POPULATE): writable second-level entries for guest RAM the device stopped
+ * tracking, filled in by a device thread before the guest reuses the pages. See reims-vgpu-dirty.c.
+ */
+int whpx_populate_write(const uint64_t *ranges, unsigned n)
+{
+    WHV_ADVISE_GPA_RANGE advice = { 0 };
+    HRESULT hr;
+
+    if (!n) {
+        return 0;
+    }
+    if (!whp_dispatch.WHvAdviseGpaRange || !whpx_global.partition) {
+        return -1;
+    }
+    QEMU_BUILD_BUG_ON(sizeof(WHV_MEMORY_RANGE_ENTRY) != 2 * sizeof(uint64_t));
+    advice.Populate.AccessType = WHvMemoryAccessWrite;
+    hr = whp_dispatch.WHvAdviseGpaRange(whpx_global.partition, (const WHV_MEMORY_RANGE_ENTRY *)ranges, n,
+                                        WHvAdviseGpaRangeCodePopulate, &advice, sizeof(advice));
+    return FAILED(hr) ? -2 : 0;
+}
+
+int whpx_wp_remap(uint64_t gpa, uint64_t size, bool writable)
+{
+    struct whpx_state *whpx = &whpx_global;
+    MemoryRegionSection sec = memory_region_find(get_system_memory(), gpa, size);
+    HRESULT hr;
+    void *mem;
+    int64_t t_rm;
+    int rc = 0;
+
+    if (!sec.mr) {
+        return -1;
+    }
+    if (!memory_region_is_ram(sec.mr) || sec.mr->readonly || sec.mr->rom_device ||
+        int128_get64(sec.size) < size) {
+        memory_region_unref(sec.mr);
+        return -1;
+    }
+    mem = memory_region_get_ram_ptr(sec.mr) + sec.offset_within_region;
+    memory_region_unref(sec.mr);
+    t_rm = get_clock();
+    qatomic_inc(&whpx_wp_busy);
+    {
+        /*
+         * TEMP (lab, QEMU_WHPX_WP_VIEW): the protection is the hypervisor view's page protection - a price that does
+         * not grow with the read-only ranges already there. RW->RO then drops the range's dirty bits through a query
+         * (it resets what it returns), as the remap below does.
+         */
+        void *hv = qemu_win_ram_hv_view(mem, size);
+
+        if (hv != mem) {
+            DWORD old;
+
+            if (!VirtualProtect(hv, size, writable ? PAGE_READWRITE : PAGE_READONLY, &old)) {
+                rc = -2;
+            } else if (!writable && whpx_dirty_tracking && whp_dispatch.WHvQueryGpaRangeDirtyBitmap) {
+                uint64_t words = DIV_ROUND_UP(size >> 12, 64), small[64];
+                uint64_t *bm = words <= ARRAY_SIZE(small) ? small : g_new(uint64_t, words);
+
+                whp_dispatch.WHvQueryGpaRangeDirtyBitmap(whpx->partition, gpa, size, bm, words * 8);
+                if (bm != small) {
+                    g_free(bm);
+                }
+            }
+            goto done;
+        }
+    }
+    /*
+     * Mapped over the live mapping: one call, and no moment where the range is
+     * unmapped (a dirty query meeting it then fails). The hypervisor takes it
+     * and changes the protection; it drops the range's bits on RW->RO exactly
+     * as an unmap+map pair does (scratchpad whpover.c). Only if it refuses does
+     * the pair run.
+     */
+    hr = whp_dispatch.WHvMapGpaRange(whpx->partition, mem, gpa, size,
+                                     WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagExecute |
+                                     (writable ? WHvMapGpaRangeFlagWrite : 0) |
+                                     WHvMapGpaRangeFlagTrackDirtyPages);
+    if (SUCCEEDED(hr)) {
+        /* done */
+    } else if (FAILED(whp_dispatch.WHvUnmapGpaRange(whpx->partition, gpa, size))) {
+        rc = -2;
+    } else {
+        hr = whp_dispatch.WHvMapGpaRange(whpx->partition, mem, gpa, size,
+                                         WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagExecute |
+                                         (writable ? WHvMapGpaRangeFlagWrite : 0) |
+                                         WHvMapGpaRangeFlagTrackDirtyPages);
+        if (FAILED(hr)) {
+            /* Put the writable tracked mapping back, whatever was asked. */
+            hr = whp_dispatch.WHvMapGpaRange(whpx->partition, mem, gpa, size,
+                                             WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagExecute |
+                                             WHvMapGpaRangeFlagWrite |
+                                             WHvMapGpaRangeFlagTrackDirtyPages);
+            if (FAILED(hr)) {
+                error_report("WHPX: write-protect remap could not restore 0x%" PRIx64, gpa);
+                abort();
+            }
+            rc = -3;
+        }
+    }
+done:
+    if (rc == 0) {
+        whpx_lab_wp_populate(gpa, size, writable);
+    }
+    qatomic_inc(&whpx_wp_gen);
+    qatomic_dec(&whpx_wp_busy);
+    {   /* TEMP lab (b454) */
+        uint64_t d = get_clock() - t_rm, m;
+
+        qatomic_inc(&whpx_lab_rm_n);
+        qatomic_add(&whpx_lab_rm_ns, d);
+        qatomic_add(&whpx_lab_rm_pages, size >> 12);
+        while ((m = qatomic_read(&whpx_lab_rm_max_ns)) < d && qatomic_cmpxchg(&whpx_lab_rm_max_ns, m, d) != m) {
+        }
+    }
+    return rc;
+}
+
+/*
+ * TEMP (lab, n128): the hypervisor fills in its second-level translation for a
+ * freshly mapped stretch of guest RAM at once (WHvAdviseGpaRange Populate),
+ * instead of one exit per page on the guest's first touch. On by default with
+ * whpx_lab_resident below (hq031, AMD, 40 GB guest, guest dd faulting in 1 GiB
+ * of pages it never touched since boot: 15.3 us a page without, 1.7 us with
+ * both; 0.8 us for pages it had touched). Alone it does not last: n128/hq028
+ * populated without locking and Windows trimmed the pages back out, 9.2 us a
+ * page on 24 GB. REIMS_VGPU_LAB_RAM_POPULATE=off turns it off. Big RAM
+ * sections only; one line per call.
+ */
+static void whpx_lab_populate(uint64_t gpa, uint64_t size, bool ram)
+{
+    static int on = -1;
+    WHV_MEMORY_RANGE_ENTRY range = { .GuestAddress = gpa, .SizeInBytes = size };
+    WHV_ADVISE_GPA_RANGE advice = { 0 };
+    int64_t t0;
+    HRESULT hr;
+
+    if (on < 0) {
+        const char *e = getenv("REIMS_VGPU_LAB_RAM_POPULATE");
+        on = !(e && strcmp(e, "off") == 0);
+    }
+    if (!on || !ram || size < (64ULL << 20) || !whp_dispatch.WHvAdviseGpaRange) {
+        return;
+    }
+    advice.Populate.AccessType = WHvMemoryAccessWrite;
+    t0 = get_clock();
+    hr = whp_dispatch.WHvAdviseGpaRange(whpx_global.partition, &range, 1,
+                                        WHvAdviseGpaRangeCodePopulate,
+                                        &advice, sizeof(advice));
+    fprintf(stderr, "reims-lab: populate gpa=0x%" PRIx64 " size_mb=%" PRIu64
+            " hr=0x%lx ms=%" PRId64 "\n", gpa, size >> 20, hr,
+            (get_clock() - t0) / 1000000);
+}
+
+/*
+ * TEMP (lab, REIMS_VGPU_LAB_RAM_RESIDENT): guest RAM kept resident in this process. The guest touches its
+ * RAM through the hypervisor's second-level translation, which Windows' working-set aging does not see, so it
+ * trims guest RAM out of QEMU's working set as if unused (AMD host, 49 GB free: working set 2.27 GB of 12.88 GB
+ * private) and every page the guest takes back - zeroing a new surface - is a fault back in on the host. Full-
+ * screen transitions wire ~400 MB of fresh surfaces each, at 2.3 us a page with 12 GB of guest RAM and 9 us with
+ * 24 GB (hq024-hq028). A hard working-set minimum covering guest RAM (SeIncreaseWorkingSetPrivilege, which
+ * ordinary users hold) and VirtualLock of each big RAM section keep it in. One line per section.
+ * On by default (hq030: 12 GB guest 2.1 -> 1.6 us a page; with whpx_lab_populate it is what makes a 40-48 GB
+ * guest's fresh pages cheap, hq031); REIMS_VGPU_LAB_RAM_RESIDENT=off turns it off. A host that cannot hold the
+ * minimum (another big VM already locked) refuses it and the section stays ordinary (set=0 in the line).
+ */
+static void whpx_lab_resident(void *mem, uint64_t size, bool ram)
+{
+    static int on = -1;
+    static uint64_t locked;
+    SIZE_T cur_min = 0, cur_max = 0, want;
+    BOOL set, lk;
+    int64_t t0;
+
+    if (on < 0) {
+        const char *e = getenv("REIMS_VGPU_LAB_RAM_RESIDENT");
+        on = !(e && strcmp(e, "off") == 0);
+    }
+    if (!on || !ram || size < (64ULL << 20)) {
+        return;
+    }
+    t0 = get_clock();
+    GetProcessWorkingSetSize(GetCurrentProcess(), &cur_min, &cur_max);
+    locked += size;
+    want = (SIZE_T)(locked + (1ULL << 30));   /* guest RAM so far, plus 1 GiB for QEMU's own pages */
+    set = SetProcessWorkingSetSizeEx(GetCurrentProcess(), MAX(want, cur_min), MAX(want * 2, cur_max),
+                                     QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+    DWORD set_err = set ? 0 : GetLastError();
+    lk = set && VirtualLock(mem, size);
+    fprintf(stderr, "reims-lab: resident size_mb=%" PRIu64 " ws_min_mb=%" PRIu64 " set=%d err=%lu lock=%d "
+            "lock_err=%lu ms=%" PRId64 "\n", size >> 20, (uint64_t)want >> 20, set, set_err, lk,
+            lk ? 0UL : GetLastError(), (get_clock() - t0) / 1000000);
+}
+
 static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
 {
     struct whpx_state *whpx = &whpx_global;
@@ -310,6 +787,10 @@ static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
         add = false;
     }
 
+    if (whpx_wp_invalidate_hook && writable && memory_region_is_ram(area)) {
+        whpx_wp_invalidate_hook();   /* lab DIRTY_WP: no protection outlives a remap */
+    }
+
     if (!add) {
         hr = whp_dispatch.WHvUnmapGpaRange(whpx->partition,
                 gva, size);
@@ -323,6 +804,47 @@ static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
     flags = WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagExecute
      | (writable ? WHvMapGpaRangeFlagWrite : 0);
     mem = memory_region_get_ram_ptr(area) + section->offset_within_region;
+    {
+        /* TEMP (lab, QEMU_WHPX_WP_VIEW): the hypervisor maps the RAM's protection view, all of it writable again */
+        void *hv = qemu_win_ram_hv_view(mem, size);
+
+        if (hv != mem) {
+            DWORD old;
+
+            if (writable && !VirtualProtect(hv, size, PAGE_READWRITE, &old)) {
+                error_report("WHPX: wp-view could not make 0x%" PRIx64 "+0x%" PRIx64 " writable", gva, size);
+                abort();
+            }
+            mem = hv;
+        }
+    }
+
+    if (!whpx_dirty_tracking_decided) {
+        const char *ut = getenv("REIMS_VGPU_LAB_RAM_UNTRACKED");
+
+        whpx_dirty_tracking = whp_dispatch.WHvQueryGpaRangeDirtyBitmap != NULL;
+        /*
+         * TEMP (lab, n125): RAM mapped without dirty tracking, to measure what
+         * tracked mappings cost the guest's own CPU work (4 KiB SLAT, logging).
+         * Every sync then reports logged RAM fully dirty: diagnostic only.
+         */
+        if (ut && strcmp(ut, "on") == 0) {
+            whpx_dirty_tracking = false;
+            fprintf(stderr, "reims-lab: guest RAM mapped untracked\n");
+        }
+        whpx_dirty_tracking_decided = true;
+    }
+    if (whpx_dirty_tracking && writable && memory_region_is_ram(area)) {
+        hr = whp_dispatch.WHvMapGpaRange(whpx->partition, mem, gva, size,
+                                         flags |
+                                         WHvMapGpaRangeFlagTrackDirtyPages);
+        if (SUCCEEDED(hr)) {
+            whpx_lab_populate(gva, size, writable && memory_region_is_ram(area));
+            whpx_lab_resident(mem, size, writable && memory_region_is_ram(area));
+            return;
+        }
+        whpx_dirty_tracking_disable("tracked mapping refused", hr);
+    }
 
     hr = whp_dispatch.WHvMapGpaRange(whpx->partition,
          mem, gva, size, flags);
@@ -330,6 +852,8 @@ static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
         error_report("WHPX: failed to map GPA range");
         abort();
     }
+    whpx_lab_populate(gva, size, writable && memory_region_is_ram(area));
+    whpx_lab_resident(mem, size, writable && memory_region_is_ram(area));
 }
 
 static void whpx_region_add(MemoryListener *listener,
@@ -352,16 +876,127 @@ static void whpx_transaction_commit(MemoryListener *listener)
 {
 }
 
+/* 64 MiB of 4 KiB pages: about 0.7 ms of hypervisor walk. */
+#define WHPX_DIRTY_QUERY_UNLOCKED_PAGES 16384
+
 static void whpx_log_sync(MemoryListener *listener,
                          MemoryRegionSection *section)
 {
+    struct whpx_state *whpx = &whpx_global;
     MemoryRegion *mr = section->mr;
+    uint64_t gpa = section->offset_within_address_space;
+    uint64_t size = int128_get64(section->size);
+    uint64_t page = qemu_real_host_page_size();
+    uint64_t pages, words;
+    g_autofree uint64_t *bitmap = NULL;
+    HRESULT hr;
 
     if (!memory_region_is_ram(mr)) {
         return;
     }
 
-    memory_region_set_dirty(mr, 0, int128_get64(section->size));
+    /*
+     * Only writable, page-aligned RAM was mapped tracked. The hypervisor
+     * bitmap has one bit per 4 KiB page, which is also the page the QEMU
+     * bitmaps are kept in on this host.
+     */
+    if (whpx_dirty_tracking && !mr->readonly && !mr->rom_device &&
+        page == 4096 && QEMU_IS_ALIGNED(gpa, page) &&
+        QEMU_IS_ALIGNED(size, page) && size / page <= UINT32_MAX * 8ULL) {
+        pages = size / page;
+        words = DIV_ROUND_UP(pages, 64);
+        bitmap = g_new0(uint64_t, words);
+        ram_addr_t ram_addr = memory_region_get_ram_addr(mr) +
+                              section->offset_within_region;
+        /*
+         * The query walks every page of the range in the hypervisor: tens of
+         * milliseconds for gigabytes of guest RAM. It touches only the partition
+         * and this local bitmap, so run it without the BQL; holding it here
+         * stalled the main loop (interrupt delivery) and every vCPU's MMIO
+         * dispatch for the whole walk. Everything read from the section is
+         * captured above; guest RAM is never unplugged while running.
+         *
+         * Only for a long walk, though: a range of a few thousand pages
+         * returns in tens of microseconds, less than giving the BQL up and
+         * taking it back costs, and a ranged sync (memory_region_sync_dirty_
+         * ranges) issues hundreds of those per harvest.
+         */
+        bool relock = bql_locked() && pages > WHPX_DIRTY_QUERY_UNLOCKED_PAGES;
+        int64_t t0 = get_clock();
+        if (relock) {
+            bql_unlock();
+        }
+        unsigned wp_gen0 = qatomic_read(&whpx_wp_gen);
+        int wp_tries = 0;
+
+        hr = whp_dispatch.WHvQueryGpaRangeDirtyBitmap(whpx->partition, gpa,
+                                                      size, bitmap,
+                                                      words * sizeof(uint64_t));
+        /* Lab DIRTY_WP: a query that met a range mid-remap is asked again. */
+        while (FAILED(hr) && wp_tries++ < 1000 &&
+               (qatomic_read(&whpx_wp_busy) || qatomic_read(&whpx_wp_gen) != wp_gen0)) {
+            while (qatomic_read(&whpx_wp_busy)) {
+                g_usleep(20);
+            }
+            wp_gen0 = qatomic_read(&whpx_wp_gen);
+            hr = whp_dispatch.WHvQueryGpaRangeDirtyBitmap(whpx->partition, gpa,
+                                                          size, bitmap,
+                                                          words * sizeof(uint64_t));
+        }
+        if (relock) {
+            bql_lock();
+        }
+        {
+            /*
+             * TEMP diagnostic (bring-up): cost of the hypervisor query, one
+             * line a second: calls, total and worst call time (including
+             * the BQL re-take), pages walked.
+             */
+            static uint64_t n, ns, max_ns, pages_walked;
+            static int64_t last;
+            int64_t now = get_clock(), dt = now - t0;
+            int64_t was;
+
+            /*
+             * Atomics, not a lock: every query thread (the drain and the
+             * dirty tracker's prefetch pool) passes here, hundreds of
+             * thousands of times a second, and a shared mutex queued them
+             * behind each other. A late update may land in the next line.
+             */
+            qatomic_add(&n, 1);
+            qatomic_add(&ns, (uint64_t)dt);
+            qatomic_add(&pages_walked, pages);
+            if ((uint64_t)dt > qatomic_read(&max_ns)) {
+                qatomic_set(&max_ns, (uint64_t)dt);
+            }
+            was = qatomic_read(&last);
+            if (now - was >= NANOSECONDS_PER_SECOND &&
+                qatomic_cmpxchg(&last, was, now) == was) {
+                uint64_t cn = qatomic_xchg(&n, 0), cns = qatomic_xchg(&ns, 0);
+
+                fprintf(stderr, "whpx-dirty-diag epoch_ms=%" PRId64
+                        " syncs=%" PRIu64 " total_us=%" PRIu64
+                        " avg_us=%" PRIu64 " max_us=%" PRIu64
+                        " pages=%" PRIu64 "\n", g_get_real_time() / 1000, cn,
+                        cns / 1000, cn ? cns / cn / 1000 : 0,
+                        qatomic_xchg(&max_ns, 0) / 1000,
+                        qatomic_xchg(&pages_walked, 0));
+            }
+        }
+        if (SUCCEEDED(hr)) {
+            /*
+             * The bitmap is little-endian 64-bit words; on this (x86,
+             * little-endian) host that is bit-for-bit the little-endian
+             * unsigned-long bitmap QEMU consumes, whatever the long's width.
+             */
+            physical_memory_set_dirty_lebitmap((unsigned long *)bitmap,
+                                               ram_addr, pages);
+            return;
+        }
+        whpx_dirty_tracking_disable("bitmap query failed", hr);
+    }
+
+    memory_region_set_dirty(mr, 0, size);
 }
 
 static MemoryListener whpx_memory_listener = {
@@ -371,6 +1006,7 @@ static MemoryListener whpx_memory_listener = {
     .region_add = whpx_region_add,
     .region_del = whpx_region_del,
     .log_sync = whpx_log_sync,
+    .log_sync_ranged = true,
     .priority = MEMORY_LISTENER_PRIORITY_ACCEL,
 };
 
@@ -572,6 +1208,97 @@ static void whpx_type_init(void)
     type_register_static(&whpx_cpu_accel_type);
 }
 
+/*
+ * TEMP lab (devices agent, 2026-10-07): QEMU_LAB_WHV_MS=<n> logs every
+ * partition-wide memory call (map, unmap, dirty query, advise) longer than n
+ * ms with its get_clock() stamp. The whole guest freezes 20-150 ms about once
+ * a second (every guest process late by the same amount, d026); these calls
+ * are the host operations that can stop every vCPU at once.
+ */
+static WHvMapGpaRange_t lab_whv_map;
+static WHvUnmapGpaRange_t lab_whv_unmap;
+static WHvQueryGpaRangeDirtyBitmap_t lab_whv_query;
+static WHvAdviseGpaRange_t lab_whv_advise;
+static int64_t lab_whv_ns;
+
+static void lab_whv_log(const char *what, int64_t t0, uint64_t gpa, uint64_t size)
+{
+    int64_t t1 = get_clock();
+
+    if (t1 - t0 > lab_whv_ns) {
+        fprintf(stderr, "lab-whv %s %.2f ms at %" PRId64 " gpa=0x%" PRIx64
+                " size_mb=%" PRIu64 "\n", what, (t1 - t0) / 1e6, t0, gpa,
+                size >> 20);
+    }
+}
+
+static HRESULT WINAPI lab_whv_map_w(WHV_PARTITION_HANDLE p, VOID *src,
+                                    WHV_GUEST_PHYSICAL_ADDRESS gpa, UINT64 size,
+                                    WHV_MAP_GPA_RANGE_FLAGS flags)
+{
+    int64_t t0 = get_clock();
+    HRESULT hr = lab_whv_map(p, src, gpa, size, flags);
+
+    lab_whv_log("map", t0, gpa, size);
+    return hr;
+}
+
+static HRESULT WINAPI lab_whv_unmap_w(WHV_PARTITION_HANDLE p,
+                                      WHV_GUEST_PHYSICAL_ADDRESS gpa, UINT64 size)
+{
+    int64_t t0 = get_clock();
+    HRESULT hr = lab_whv_unmap(p, gpa, size);
+
+    lab_whv_log("unmap", t0, gpa, size);
+    return hr;
+}
+
+static HRESULT WINAPI lab_whv_query_w(WHV_PARTITION_HANDLE p,
+                                      WHV_GUEST_PHYSICAL_ADDRESS gpa, UINT64 size,
+                                      UINT64 *bitmap, UINT32 bytes)
+{
+    int64_t t0 = get_clock();
+    HRESULT hr = lab_whv_query(p, gpa, size, bitmap, bytes);
+
+    lab_whv_log("dirty-query", t0, gpa, size);
+    return hr;
+}
+
+static HRESULT WINAPI lab_whv_advise_w(WHV_PARTITION_HANDLE p,
+                                       const WHV_MEMORY_RANGE_ENTRY *r, UINT32 n,
+                                       WHV_ADVISE_GPA_RANGE_CODE code,
+                                       const VOID *buf, UINT32 bytes)
+{
+    int64_t t0 = get_clock();
+    HRESULT hr = lab_whv_advise(p, r, n, code, buf, bytes);
+
+    lab_whv_log("advise", t0, n ? r[0].GuestAddress : 0, n ? r[0].SizeInBytes : 0);
+    return hr;
+}
+
+static void lab_whv_wrap(void)
+{
+    const char *e = getenv("QEMU_LAB_WHV_MS");
+
+    if (!e || !*e) {
+        return;
+    }
+    lab_whv_ns = (int64_t)(atof(e) * 1e6);
+    lab_whv_map = whp_dispatch.WHvMapGpaRange;
+    whp_dispatch.WHvMapGpaRange = lab_whv_map_w;
+    lab_whv_unmap = whp_dispatch.WHvUnmapGpaRange;
+    whp_dispatch.WHvUnmapGpaRange = lab_whv_unmap_w;
+    if (whp_dispatch.WHvQueryGpaRangeDirtyBitmap) {
+        lab_whv_query = whp_dispatch.WHvQueryGpaRangeDirtyBitmap;
+        whp_dispatch.WHvQueryGpaRangeDirtyBitmap = lab_whv_query_w;
+    }
+    if (whp_dispatch.WHvAdviseGpaRange) {
+        lab_whv_advise = whp_dispatch.WHvAdviseGpaRange;
+        whp_dispatch.WHvAdviseGpaRange = lab_whv_advise_w;
+    }
+    fprintf(stderr, "lab-whv on threshold_ms=%s\n", e);
+}
+
 bool init_whp_dispatch(void)
 {
     if (whp_dispatch_initialized) {
@@ -583,6 +1310,7 @@ bool init_whp_dispatch(void)
     }
     assert(load_whp_dispatch_fns(&hWinHvPlatform,
         WINHV_PLATFORM_FNS_SUPPLEMENTAL));
+    lab_whv_wrap();
     whp_dispatch_initialized = true;
 
     return true;

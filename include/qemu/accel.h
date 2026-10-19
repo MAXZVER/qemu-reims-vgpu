@@ -74,16 +74,11 @@ bool accel_cpu_common_realize(CPUState *cpu, Error **errp);
 void accel_cpu_common_unrealize(CPUState *cpu);
 
 /**
- * struct AccelGdbConfig - gdbstub configuration for an accelerator.
+ * accel_supported_gdbstub_sstep_flags:
  *
- * @sstep_flags: Set SSTEP_* flags that accelerator supports for guest debug.
- * @can_reverse: Whether reverse mode is supported.
+ * Returns the supported single step modes for the configured
+ * accelerator.
  */
-typedef struct AccelGdbConfig {
-    unsigned sstep_flags;
-    bool can_reverse;
-} AccelGdbConfig;
-
-bool accel_supports_guest_debug(AccelState *accel);
+int accel_supported_gdbstub_sstep_flags(void);
 
 #endif /* QEMU_ACCEL_H */

@@ -114,8 +114,7 @@ bool vring_notify(VRing *vr)
         vr->cookie = virtio_ccw_notify(vdev.schid, vr->id, vr->cookie);
         break;
     case S390_IPL_TYPE_PCI:
-        vr->cookie = virtio_pci_notify(vr);
-        break;
+        vr->cookie = virtio_pci_notify(vr->id);
     default:
         return 1;
     }
@@ -154,14 +153,14 @@ static void vr_bswap_descriptor(VRingDesc *desc)
 
 void vring_send_buf(VRing *vr, void *p, int len, int flags)
 {
-    uint16_t avail_idx;
-
-    avail_idx = be_ipl() ? vr->avail->idx : bswap16(vr->avail->idx);
+    if (!be_ipl()) {
+        vr->avail->idx = bswap16(vr->avail->idx);
+    }
 
     /* For follow-up chains we need to keep the first entry point */
     if (!(flags & VRING_HIDDEN_IS_CHAIN)) {
-        vr->avail->ring[avail_idx % vr->num] = be_ipl() ? vr->next_idx :
-                                                          bswap16(vr->next_idx);
+        vr->avail->ring[vr->avail->idx % vr->num] = be_ipl() ? vr->next_idx :
+                                                               bswap16(vr->next_idx);
     }
 
     vr->desc[vr->next_idx].addr = (unsigned long)p;
@@ -178,23 +177,23 @@ void vring_send_buf(VRing *vr, void *p, int len, int flags)
 
     /* Chains only have a single ID */
     if (!(flags & VRING_DESC_F_NEXT)) {
-        avail_idx++;
-        vr->avail->idx = be_ipl() ? avail_idx : bswap16(avail_idx);
+        vr->avail->idx++;
+    }
+
+    if (!be_ipl()) {
+        vr->avail->idx = bswap16(vr->avail->idx);
     }
 }
 
 int vr_poll(VRing *vr)
 {
-    uint16_t used_idx;
-
-    used_idx = be_ipl() ? vr->used->idx : bswap16(vr->used->idx);
-    if (used_idx == vr->used_idx) {
+    if (vr->used->idx == vr->used_idx) {
         vring_notify(vr);
         yield();
         return 0;
     }
 
-    vr->used_idx = used_idx;
+    vr->used_idx = vr->used->idx; /* Endianness is preserved */
     vr->next_idx = 0;
     vr->desc[0].len = 0;
     vr->desc[0].flags = 0;
@@ -247,8 +246,6 @@ bool virtio_is_supported(VDev *vdev)
     case S390_IPL_TYPE_QEMU_SCSI:
     case S390_IPL_TYPE_CCW:
         return virtio_ccw_is_supported(vdev);
-    case S390_IPL_TYPE_PCI:
-        return virtio_pci_is_supported(vdev);
     default:
         return false;
     }

@@ -60,7 +60,6 @@ struct DBusDisplay {
     DBusClipboardRequest clipboard_request[QEMU_CLIPBOARD_SELECTION__COUNT];
 
     Notifier notifier;
-    Notifier console_notifier;
 };
 
 #ifdef WIN32
@@ -87,8 +86,6 @@ dbus_display_console_new(DBusDisplay *display, QemuConsole *con);
 int
 dbus_display_console_get_index(DBusDisplayConsole *ddc);
 
-QemuConsole *
-dbus_display_console_get_qemu_console(DBusDisplayConsole *ddc);
 
 extern const DisplayChangeListenerOps dbus_console_dcl_ops;
 

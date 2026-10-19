@@ -80,6 +80,8 @@ struct AspeedSMCState {
 
     AspeedSMCFlash flashes[ASPEED_SMC_CS_MAX];
 
+    uint8_t snoop_index;
+    uint8_t snoop_dummies;
     bool unselect;
 };
 

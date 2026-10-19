@@ -20,6 +20,7 @@
 
 #include "qemu/osdep.h"
 #include <sys/ioctl.h>
+#include <linux/kvm.h>
 #include <linux/vfio.h>
 
 #include "exec/target_page.h"
@@ -200,7 +201,7 @@ out:
 }
 
 static void vfio_ram_discard_notify_discard(RamDiscardListener *rdl,
-                                            const MemoryRegionSection *section)
+                                            MemoryRegionSection *section)
 {
     VFIORamDiscardListener *vrdl = container_of(rdl, VFIORamDiscardListener,
                                                 listener);
@@ -218,7 +219,7 @@ static void vfio_ram_discard_notify_discard(RamDiscardListener *rdl,
 }
 
 static int vfio_ram_discard_notify_populate(RamDiscardListener *rdl,
-                                            const MemoryRegionSection *section)
+                                            MemoryRegionSection *section)
 {
     VFIORamDiscardListener *vrdl = container_of(rdl, VFIORamDiscardListener,
                                                 listener);
@@ -460,7 +461,7 @@ static void vfio_device_error_append(VFIODevice *vbasedev, Error **errp)
 }
 
 VFIORamDiscardListener *vfio_find_ram_discard_listener(
-    VFIOContainer *bcontainer, const MemoryRegionSection *section)
+    VFIOContainer *bcontainer, MemoryRegionSection *section)
 {
     VFIORamDiscardListener *vrdl;
 
@@ -730,7 +731,7 @@ static void vfio_listener_region_del(MemoryListener *listener,
         }
 
         /*
-         * Fake an IOTLB entry for writable RAM sections which is needed
+         * Fake an IOTLB entry for writable identity mapping which is needed
          * by dirty tracking when switch out of PT domain. In fact, in
          * unmap_bitmap, only translated_addr field is used to set dirty
          * bitmap.
@@ -745,8 +746,7 @@ static void vfio_listener_region_del(MemoryListener *listener,
         if (global_dirty_tracking && memory_region_is_ram(section->mr) &&
             !section->readonly) {
             entry.iova = iova;
-            entry.translated_addr = memory_region_get_ram_addr(section->mr) +
-                                    section->offset_within_region;
+            entry.translated_addr = iova;
             iotlb = &entry;
         }
 
@@ -1149,8 +1149,8 @@ out:
     }
 }
 
-static int vfio_ram_discard_query_dirty_bitmap(const MemoryRegionSection *section,
-                                               void *opaque)
+static int vfio_ram_discard_query_dirty_bitmap(MemoryRegionSection *section,
+                                             void *opaque)
 {
     const hwaddr size = int128_get64(section->size);
     const hwaddr iova = section->offset_within_address_space;

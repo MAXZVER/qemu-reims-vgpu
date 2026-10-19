@@ -30,7 +30,6 @@
 #include "qemu/main-loop.h"
 #include "hw/misc/vmcoreinfo.h"
 #include "migration/blocker.h"
-#include "migration/misc.h"
 #include "hw/core/cpu.h"
 #include "win_dump.h"
 #include "qemu/range.h"
@@ -1772,8 +1771,7 @@ static void vmcoreinfo_update_phys_base(DumpState *s)
         if (prefix && g_str_has_prefix(lines[i], prefix)) {
             if (qemu_strtou64(lines[i] + strlen(prefix), NULL, 16,
                               &phys_base) < 0) {
-                warn_report("failed to parse %s in VMCOREINFO: '%s'",
-                            prefix, lines[i] + strlen(prefix));
+                warn_report("Failed to read %s", prefix);
             } else {
                 s->dump_info.phys_base = phys_base;
             }
@@ -2082,8 +2080,8 @@ void qmp_dump_guest_memory(bool paging, const char *protocol,
     bool detach_p = false;
     bool kdump_raw = false;
 
-    if (migration_guest_ram_loading()) {
-        error_setg(errp, "Dump not allowed during migration.");
+    if (runstate_check(RUN_STATE_INMIGRATE)) {
+        error_setg(errp, "Dump not allowed during incoming migration.");
         return;
     }
 

@@ -18,7 +18,6 @@ mips_ss.add(files(
   'lmmi_helper.c',
   'msa_helper.c',
   'msa_translate.c',
-  'octeon_crypto.c',
   'op_helper.c',
   'rel6_translate.c',
   'translate.c',

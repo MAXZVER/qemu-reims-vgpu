@@ -52,8 +52,8 @@ shown here.
 First, QEMU should be started like this::
 
  # qemu-system-TARGET [...] \
-     -chardev socket,id=chrqmp0,port=4444,host=localhost,server=on \
-     -object monitor-qmp,chardev=chrqmp0,pretty=on,id=qmp0
+     -chardev socket,id=qmp,port=4444,host=localhost,server=on \
+     -mon chardev=qmp,mode=control,pretty=on
 
 Then, in a different terminal::
 

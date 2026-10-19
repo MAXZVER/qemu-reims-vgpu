@@ -1353,9 +1353,26 @@ hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range)
              * This must be done prior to the creation of any vCPU
              * but past hv_vm_create()
              */
-            hv_gic_config_t cfg = hv_gic_config_create();
-            hv_gic_config_set_distributor_base(cfg, 0x08000000);
-            hv_gic_config_set_redistributor_base(cfg, 0x080A0000);
+            MachineClass *mc = MACHINE_GET_CLASS(ms);
+            /*
+             * Fallback matches hw/arm/virt.c's base_memmap; boards whose
+             * GICv3 lives elsewhere must implement get_vgic_bases or the
+             * in-kernel vGIC is placed at GPAs the guest never accesses.
+             */
+            uint64_t dist_base = 0x08000000;
+            uint64_t redist_base = 0x080A0000;
+            hv_gic_config_t cfg;
+
+            if (mc->get_vgic_bases &&
+                !mc->get_vgic_bases(ms, &dist_base, &redist_base)) {
+                error_report("HVF: machine has no GICv3 for the platform vGIC");
+                ret = HV_UNSUPPORTED;
+                goto cleanup;
+            }
+
+            cfg = hv_gic_config_create();
+            hv_gic_config_set_distributor_base(cfg, dist_base);
+            hv_gic_config_set_redistributor_base(cfg, redist_base);
             ret = hv_gic_create(cfg);
             if (ret != HV_SUCCESS) {
                 error_report("error creating platform VGIC");
@@ -1437,8 +1454,16 @@ int hvf_arch_init_vcpu(CPUState *cpu)
             continue;
         }
 
-        if (ri) {
-            assert(!(ri->type & ARM_CP_NO_RAW));
+        /*
+         * Skip NO_RAW registers instead of asserting on them. Some ID registers
+         * (e.g. ID_AA64ISAR0_EL1) became ARM_CP_NO_RAW in system emulation
+         * because a field is computed at read time via a readfn (RNDR depends on
+         * SCR_EL3.TRNDR under FEAT_RNG_TRAP). Such regs have no raw backing store
+         * to sync with HVF, so they must not be added to the cpreg sync list.
+         * Without this, hvf_arch_init_vcpu() aborts on macOS hosts and no
+         * aarch64 HVF guest (incl. vmapple) can start.
+         */
+        if (ri && !(ri->type & ARM_CP_NO_RAW)) {
             arm_cpu->cpreg_indexes[sregs_cnt++] = kvm_id;
         }
     }
@@ -1478,18 +1503,20 @@ int hvf_arch_init_vcpu(CPUState *cpu)
                               arm_cpu->mp_affinity);
     assert_hvf_ok(ret);
 
-    pfr = GET_IDREG(&arm_cpu->isar, ID_AA64PFR0);
+    ret = hv_vcpu_get_sys_reg(cpu->accel->fd, HV_SYS_REG_ID_AA64PFR0_EL1, &pfr);
+    assert_hvf_ok(ret);
     pfr |= env->gicv3state ? (1 << 24) : 0;
     ret = hv_vcpu_set_sys_reg(cpu->accel->fd, HV_SYS_REG_ID_AA64PFR0_EL1, pfr);
     assert_hvf_ok(ret);
 
-    ret = hv_vcpu_set_sys_reg(cpu->accel->fd, HV_SYS_REG_ID_AA64ISAR0_EL1,
-                              GET_IDREG(&arm_cpu->isar, ID_AA64ISAR0));
+    /* We're limited to underlying hardware caps, override internal versions */
+    ret = hv_vcpu_get_sys_reg(cpu->accel->fd, HV_SYS_REG_ID_AA64MMFR0_EL1,
+                              &arm_cpu->isar.idregs[ID_AA64MMFR0_EL1_IDX]);
     assert_hvf_ok(ret);
 
     clamp_id_aa64mmfr0_parange_to_ipa_size(&arm_cpu->isar);
     ret = hv_vcpu_set_sys_reg(cpu->accel->fd, HV_SYS_REG_ID_AA64MMFR0_EL1,
-                              GET_IDREG(&arm_cpu->isar, ID_AA64MMFR0));
+                              arm_cpu->isar.idregs[ID_AA64MMFR0_EL1_IDX]);
     assert_hvf_ok(ret);
 
     if (!hvf_irqchip_in_kernel()) {
@@ -2324,6 +2351,238 @@ static void hvf_sync_vtimer(CPUState *cpu)
     }
 }
 
+/*
+ * Emulate a load/store that took a data abort with ISV=0, i.e. with no
+ * instruction syndrome: the CPU only describes single general-purpose
+ * loads/stores in the ISS, so LDP/STP and SIMD&FP accesses to MMIO arrive
+ * undecoded. macOS 13+ guest kernels perform such accesses against device
+ * memory during early boot (the macOS 12 kernel does not), so vmapple needs
+ * this to run newer guests.
+ *
+ * Decodes the faulting instruction from guest memory and performs the access
+ * at the already-translated fault IPA. Covers exactly the A64 classes that
+ * report ISV=0 and can plausibly target MMIO:
+ *   - load/store pair, GPR and SIMD&FP (LDP/STP/LDNP/STNP/LDPSW), all
+ *     indexing modes
+ *   - load/store single SIMD&FP register (LDR/STR/LDUR/STUR B/H/S/D/Q),
+ *     immediate/register-offset/pre/post-index forms
+ * Anything else (exclusives, atomics, SP-based writeback, ...) returns false
+ * so the caller can fail loudly with full context.
+ *
+ * On success the emulated instruction is complete: registers and PC are
+ * updated in env (state was pulled via cpu_synchronize_state, so the handler
+ * tail's flush_cpu_state pushes everything back to HVF).
+ */
+static bool hvf_emulate_isv0_mmio(CPUState *cpu, hwaddr ipa, uint32_t *insn_out)
+{
+    CPUARMState *env = cpu_env(cpu);
+    AddressSpace *as = cpu_get_address_space(cpu, ARMASIdx_NS);
+    uint32_t insn = 0;
+
+    cpu_synchronize_state(cpu);
+
+    if (cpu_memory_rw_debug(cpu, env->pc, &insn, sizeof(insn), false)) {
+        return false;
+    }
+    *insn_out = insn;
+
+    if ((insn & 0x38000000) == 0x28000000) {
+        /* Load/store pair (incl. no-allocate): C4.1.66 op0=x101. */
+        uint32_t opc = extract32(insn, 30, 2);
+        bool is_vector = extract32(insn, 26, 1);
+        uint32_t mode = extract32(insn, 23, 2);   /* 0=STNP/LDNP 1=post 2=offset 3=pre */
+        bool is_load = extract32(insn, 22, 1);
+        int64_t imm7 = sextract32(insn, 15, 7);
+        uint32_t rt2 = extract32(insn, 10, 5);
+        uint32_t rn = extract32(insn, 5, 5);
+        uint32_t rt = extract32(insn, 0, 5);
+        bool wback = (mode == 1) || (mode == 3);
+        bool sext = false;
+        int esize;
+
+        if (is_vector) {
+            if (opc == 3) {
+                return false;               /* unallocated */
+            }
+            esize = 4 << opc;               /* S/D/Q */
+        } else if (opc == 0) {
+            esize = 4;
+        } else if (opc == 1 && is_load) {
+            esize = 4;
+            sext = true;                    /* LDPSW */
+        } else if (opc == 2) {
+            esize = 8;
+        } else {
+            return false;                   /* unallocated / STGP */
+        }
+        if (wback && rn == 31) {
+            return false;                   /* SP-based MMIO writeback: refuse */
+        }
+
+        for (int i = 0; i < 2; i++) {
+            uint32_t reg = i ? rt2 : rt;
+            hwaddr addr = ipa + (hwaddr)i * esize;
+            uint8_t buf[16] = { 0 };
+
+            if (is_load) {
+                address_space_read(as, addr, MEMTXATTRS_UNSPECIFIED, buf, esize);
+                if (is_vector) {
+                    env->vfp.zregs[reg].d[0] = ldq_le_p(buf);
+                    env->vfp.zregs[reg].d[1] = esize == 16 ? ldq_le_p(buf + 8) : 0;
+                } else if (reg != 31) {
+                    uint64_t v = esize == 4 ? ldl_le_p(buf) : ldq_le_p(buf);
+                    env->xregs[reg] = sext ? sextract64(v, 0, 32) : v;
+                }
+            } else {
+                if (is_vector) {
+                    stq_le_p(buf, env->vfp.zregs[reg].d[0]);
+                    if (esize == 16) {
+                        stq_le_p(buf + 8, env->vfp.zregs[reg].d[1]);
+                    }
+                } else if (reg != 31) {
+                    if (esize == 4) {
+                        stl_le_p(buf, (uint32_t)env->xregs[reg]);
+                    } else {
+                        stq_le_p(buf, env->xregs[reg]);
+                    }
+                }
+                address_space_write(as, addr, MEMTXATTRS_UNSPECIFIED, buf, esize);
+            }
+        }
+        if (wback) {
+            env->xregs[rn] += imm7 * esize;
+        }
+        env->pc += 4;
+        return true;
+    }
+
+    if (extract32(insn, 24, 6) == 0x38) {
+        /*
+         * Load/store single GPR, imm9/register-offset forms: bits[29:24]=
+         * 111000. The pre/post-indexed (writeback) forms report ISV=0
+         * because the syndrome cannot describe the base update — macOS 13+
+         * uses e.g. "str w9, [x8, #128]!" on MMIO.
+         */
+        uint32_t size = extract32(insn, 30, 2);
+        uint32_t opc = extract32(insn, 22, 2);
+        uint32_t rn = extract32(insn, 5, 5);
+        uint32_t rt = extract32(insn, 0, 5);
+        bool wback = false;
+        int esize = 1 << size;
+        uint8_t buf[8] = { 0 };
+
+        if (extract32(insn, 21, 1)) {
+            if (extract32(insn, 10, 2) != 2) {
+                return false;           /* atomics etc., not register-offset */
+            }
+        } else {
+            switch (extract32(insn, 10, 2)) {
+            case 0:                     /* LDUR/STUR: no writeback */
+            case 2:                     /* LDTR/STTR: treat as plain access */
+                break;
+            case 1:                     /* post-index */
+            case 3:                     /* pre-index */
+                wback = true;
+                break;
+            }
+        }
+        if (size == 3 && opc == 2) {
+            return false;               /* PRFUM: prefetch never aborts */
+        }
+        if (wback && rn == 31) {
+            return false;               /* SP-based MMIO writeback: refuse */
+        }
+
+        if (opc == 0) {                 /* store */
+            if (rt != 31) {
+                stq_le_p(buf, env->xregs[rt]);
+            }
+            address_space_write(as, ipa, MEMTXATTRS_UNSPECIFIED, buf, esize);
+        } else {                        /* load: 01 zext, 10 sext→X, 11 sext→W */
+            uint64_t v;
+
+            address_space_read(as, ipa, MEMTXATTRS_UNSPECIFIED, buf, esize);
+            v = ldq_le_p(buf) & MAKE_64BIT_MASK(0, esize * 8);
+            if (opc == 2) {
+                v = sextract64(v, 0, esize * 8);
+            } else if (opc == 3) {
+                v = (uint32_t)sextract64(v, 0, esize * 8);
+            }
+            if (rt != 31) {
+                env->xregs[rt] = v;
+            }
+        }
+        if (wback) {
+            env->xregs[rn] += sextract32(insn, 12, 9);
+        }
+        env->pc += 4;
+        return true;
+    }
+
+    if (extract32(insn, 24, 6) == 0x3d || extract32(insn, 24, 6) == 0x3c) {
+        /* Load/store single SIMD&FP register: bits[29:24]=1111 0V. */
+        uint32_t size = extract32(insn, 30, 2);
+        uint32_t opc = extract32(insn, 22, 2);
+        bool unsigned_imm = extract32(insn, 24, 2) == 1;
+        bool is_load = opc & 1;
+        uint32_t rn = extract32(insn, 5, 5);
+        uint32_t rt = extract32(insn, 0, 5);
+        uint32_t scale = size;
+        bool wback = false;
+        int esize;
+        uint8_t buf[16] = { 0 };
+
+        if (opc & 2) {
+            if (size != 0) {
+                return false;               /* only Q extends the size range */
+            }
+            scale = 4;
+        }
+        esize = 1 << scale;
+
+        if (!unsigned_imm) {
+            if (extract32(insn, 21, 1)) {
+                if (extract32(insn, 10, 2) != 2) {
+                    return false;           /* not a register-offset form */
+                }
+            } else {
+                switch (extract32(insn, 10, 2)) {
+                case 0:                     /* LDUR/STUR: no writeback */
+                    break;
+                case 1:                     /* post-index */
+                case 3:                     /* pre-index */
+                    wback = true;
+                    break;
+                default:
+                    return false;
+                }
+            }
+        }
+        if (wback && rn == 31) {
+            return false;                   /* SP-based MMIO writeback: refuse */
+        }
+
+        if (is_load) {
+            address_space_read(as, ipa, MEMTXATTRS_UNSPECIFIED, buf, esize);
+            env->vfp.zregs[rt].d[0] = ldq_le_p(buf);
+            env->vfp.zregs[rt].d[1] = esize == 16 ? ldq_le_p(buf + 8) : 0;
+        } else {
+            stq_le_p(buf, env->vfp.zregs[rt].d[0]);
+            if (esize == 16) {
+                stq_le_p(buf + 8, env->vfp.zregs[rt].d[1]);
+            }
+            address_space_write(as, ipa, MEMTXATTRS_UNSPECIFIED, buf, esize);
+        }
+        if (wback) {
+            env->xregs[rn] += sextract32(insn, 12, 9);
+        }
+        env->pc += 4;
+        return true;
+    }
+
+    return false;
+}
+
 static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
 {
     CPUARMState *env = cpu_env(cpu);
@@ -2338,7 +2597,7 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
     case EC_SOFTWARESTEP: {
         ret = EXCP_DEBUG;
 
-        if (!cpu_single_stepping(cpu)) {
+        if (!cpu->singlestep_enabled) {
             error_report("EC_SOFTWARESTEP but single-stepping not enabled");
         }
         break;
@@ -2430,11 +2689,24 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
          */
         assert(!s1ptw);
 
-        /*
-         * TODO: ISV will be 0 for SIMD or SVE accesses.
-         * Inject the exception into the guest.
-         */
-        assert(isv);
+        if (!isv) {
+            /*
+             * No instruction syndrome (LDP/STP, SIMD&FP, ...): decode and
+             * emulate the faulting instruction. macOS 13+ guests do such
+             * accesses against MMIO in early boot.
+             */
+            uint32_t insn = 0;
+
+            if (!hvf_emulate_isv0_mmio(cpu, ipa, &insn)) {
+                error_report("hvf: unhandled ISV=0 data abort: pc=0x%" PRIx64
+                             " insn=0x%08x va=0x%llx ipa=0x%llx wnr=%d",
+                             env->pc, insn, excp->virtual_address,
+                             excp->physical_address, iswrite);
+                abort();
+            }
+            /* Emulation advanced env->pc itself; flushed at handler tail. */
+            break;
+        }
 
         /*
          * Emulate MMIO.
@@ -2547,7 +2819,7 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
         assert_hvf_ok(r);
 
         /* Handle single-stepping over instructions which trigger a VM exit */
-        if (cpu_single_stepping(cpu)) {
+        if (cpu->singlestep_enabled) {
             ret = EXCP_DEBUG;
         }
     }
@@ -2601,7 +2873,7 @@ int hvf_arch_vcpu_exec(CPUState *cpu)
     flush_cpu_state(cpu);
 
     do {
-        if (!(cpu->singlestep_flags & SSTEP_NOIRQ) &&
+        if (!(cpu->singlestep_enabled & SSTEP_NOIRQ) &&
             hvf_inject_interrupts(cpu)) {
             return EXCP_INTERRUPT;
         }
@@ -2724,8 +2996,7 @@ int hvf_arch_remove_sw_breakpoint(CPUState *cpu, struct hvf_sw_breakpoint *bp)
     return 0;
 }
 
-int hvf_arch_insert_gdbstub_hw_breakpoint(vaddr addr, vaddr len,
-                                          GdbBreakpointType type)
+int hvf_arch_insert_hw_breakpoint(vaddr addr, vaddr len, int type)
 {
     switch (type) {
     case GDB_BREAKPOINT_HW:
@@ -2733,14 +3004,13 @@ int hvf_arch_insert_gdbstub_hw_breakpoint(vaddr addr, vaddr len,
     case GDB_WATCHPOINT_READ:
     case GDB_WATCHPOINT_WRITE:
     case GDB_WATCHPOINT_ACCESS:
-        return insert_gdbstub_hw_watchpoint(addr, len, type);
+        return insert_hw_watchpoint(addr, len, type);
     default:
         return -ENOSYS;
     }
 }
 
-int hvf_arch_remove_gdbstub_hw_breakpoint(vaddr addr, vaddr len,
-                                          GdbBreakpointType type)
+int hvf_arch_remove_hw_breakpoint(vaddr addr, vaddr len, int type)
 {
     switch (type) {
     case GDB_BREAKPOINT_HW:
@@ -2748,13 +3018,13 @@ int hvf_arch_remove_gdbstub_hw_breakpoint(vaddr addr, vaddr len,
     case GDB_WATCHPOINT_READ:
     case GDB_WATCHPOINT_WRITE:
     case GDB_WATCHPOINT_ACCESS:
-        return delete_gdbstub_hw_watchpoint(addr, len, type);
+        return delete_hw_watchpoint(addr, len, type);
     default:
         return -ENOSYS;
     }
 }
 
-void hvf_arch_remove_all_gdbstub_hw_breakpoints(void)
+void hvf_arch_remove_all_hw_breakpoints(void)
 {
     if (cur_hw_wps > 0) {
         g_array_remove_range(hw_watchpoints, 0, cur_hw_wps);
@@ -2866,7 +3136,7 @@ void hvf_arch_update_guest_debug(CPUState *cpu)
     CPUARMState *env = &arm_cpu->env;
 
     /* Check whether guest debugging is enabled */
-    cpu->accel->guest_debug_enabled = cpu_single_stepping(cpu) ||
+    cpu->accel->guest_debug_enabled = cpu->singlestep_enabled ||
                                     hvf_sw_breakpoints_active(cpu) ||
                                     hvf_arm_hw_debug_active(cpu);
 
@@ -2880,7 +3150,7 @@ void hvf_arch_update_guest_debug(CPUState *cpu)
     cpu_synchronize_state(cpu);
 
     /* Enable/disable single-stepping */
-    if (cpu_single_stepping(cpu)) {
+    if (cpu->singlestep_enabled) {
         env->cp15.mdscr_el1 =
             deposit64(env->cp15.mdscr_el1, MDSCR_EL1_SS_SHIFT, 1, 1);
         pstate_write(env, pstate_read(env) | PSTATE_SS);
@@ -2899,4 +3169,9 @@ void hvf_arch_update_guest_debug(CPUState *cpu)
     }
 
     hvf_arch_set_traps(cpu);
+}
+
+bool hvf_arch_supports_guest_debug(void)
+{
+    return true;
 }

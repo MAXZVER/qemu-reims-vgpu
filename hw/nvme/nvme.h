@@ -160,14 +160,7 @@ typedef struct NvmeZone {
 #define NVME_FDP_MAX_NS_RUHS 32u
 #define FDPVSS 0
 
-/*
- * NOTE: Apart from event type 0, any event type with a shift value of 0 is
- * considered unsupported and thus skipped in get/set features calls.
- *
- * NOTE: NvmeRuHandle uses a 64bit event mask - refactor to support event types
- *       of 63 or greater.
- */
-static const uint8_t nvme_fdp_evf_shifts[FDP_EVT_MAX + 1] = {
+static const uint8_t nvme_fdp_evf_shifts[FDP_EVT_MAX] = {
     /* Host events */
     [FDP_EVT_RU_NOT_FULLY_WRITTEN]      = 0,
     [FDP_EVT_RU_ATL_EXCEEDED]           = 1,
@@ -451,11 +444,6 @@ typedef struct NvmeRequest {
     NvmeSg                  sg;
     bool                    atomic_write;
     QTAILQ_ENTRY(NvmeRequest)entry;
-    /*
-     * If you add a new field here, please make sure to update
-     * nvme_vmstate_request, pre_save_validate_aer_req() and
-     * pre_save_validate_cq_req().
-     */
 } NvmeRequest;
 
 typedef struct NvmeBounceContext {
@@ -652,7 +640,6 @@ typedef struct NvmeCtrl {
 
     NvmeNamespace   namespace;
     NvmeNamespace   *namespaces[NVME_MAX_NAMESPACES + 1];
-    uint32_t        num_queues;
     NvmeSQueue      **sq;
     NvmeCQueue      **cq;
     NvmeSQueue      admin_sq;
@@ -681,9 +668,6 @@ typedef struct NvmeCtrl {
 
     /* Socket mapping to SPDM over NVMe Security In/Out commands */
     int spdm_socket;
-
-    /* Migration-related stuff */
-    Error *migration_blocker;
 } NvmeCtrl;
 
 typedef enum NvmeResetType {
@@ -763,8 +747,5 @@ void nvme_atomic_configure_max_write_size(bool dn, uint16_t awun,
                                           uint16_t awupf, NvmeAtomic *atomic);
 void nvme_ns_atomic_configure_boundary(bool dn, uint16_t nabsn,
                                        uint16_t nabspf, NvmeAtomic *atomic);
-
-extern const VMStateDescription nvme_vmstate_atomic;
-extern const VMStateDescription nvme_vmstate_ns;
 
 #endif /* HW_NVME_NVME_H */

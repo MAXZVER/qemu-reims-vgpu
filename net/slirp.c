@@ -46,6 +46,10 @@
 #include "qobject/qdict.h"
 #include "util.h"
 #include "migration/register.h"
+#include "qemu/main-loop.h"   /* TEMP lab QEMU_SLIRP_THREAD */
+#include "qemu/rcu.h"
+#include "qemu/thread.h"
+#include "qemu/timer.h"
 #include "migration/vmstate.h"
 #include "migration/qemu-file-types.h"
 
@@ -97,6 +101,24 @@ typedef struct SlirpState {
     gchar *smb_dir;
 #endif
     GSList *fwd;
+#ifdef _WIN32
+    /*
+     * TEMP lab (Opus 2026-10-18, QEMU_SLIRP_THREAD=1; Mish: "the network in its own thread too, take the whole main
+     * loop apart"): libslirp runs in its own thread - its sockets (WSAEventSelect on lab_ev + WSAPoll), its timers
+     * (lab_timers, on QEMU_CLOCK_VIRTUAL like the stock ones) and slirp_input. The guest's frames come in through
+     * lab_in (net_slirp_receive, main loop), slirp's go out through lab_out and lab_out_bh, which hands them to the
+     * NIC in the main loop. Only this thread calls libslirp once it runs (HMP hostfwd_add at run time does not).
+     */
+    bool lab_thread;
+    bool lab_quit;
+    HANDLE lab_ev;
+    QemuThread lab_th;
+    QemuMutex lab_mutex;
+    GQueue lab_in;
+    GQueue lab_out;
+    QEMUBH *lab_out_bh;
+    GPtrArray *lab_timers;
+#endif
 } SlirpState;
 
 static struct slirp_config_str *slirp_configs;
@@ -121,6 +143,22 @@ static ssize_t net_slirp_send_packet(const void *pkt, size_t pkt_len,
     uint8_t min_pkt[ETH_ZLEN];
     size_t min_pktsz = sizeof(min_pkt);
 
+#ifdef _WIN32
+    if (s->lab_thread) {
+        /* TEMP lab (QEMU_SLIRP_THREAD): the slirp thread queues the frame; the main loop hands it to the NIC. */
+        GByteArray *f = g_byte_array_sized_new(pkt_len);
+
+        g_byte_array_append(f, pkt, pkt_len);
+        qemu_mutex_lock(&s->lab_mutex);
+        g_queue_push_tail(&s->lab_out, f);
+        qemu_mutex_unlock(&s->lab_mutex);
+        if (!qemu_thread_is_self(&s->lab_th)) {
+            qemu_bh_schedule(s->lab_out_bh);   /* not from the slirp thread: nobody else will kick */
+        }
+        return pkt_len;
+    }
+#endif
+
     if (net_peer_needs_padding(&s->nc)) {
         if (eth_pad_short_frame(min_pkt, &min_pktsz, pkt, pkt_len)) {
             pkt = min_pkt;
@@ -135,6 +173,19 @@ static ssize_t net_slirp_receive(NetClientState *nc, const uint8_t *buf, size_t 
 {
     SlirpState *s = DO_UPCAST(SlirpState, nc, nc);
 
+#ifdef _WIN32
+    if (s->lab_thread) {
+        /* TEMP lab (QEMU_SLIRP_THREAD): the frame goes to the slirp thread. */
+        GByteArray *f = g_byte_array_sized_new(size);
+
+        g_byte_array_append(f, buf, size);
+        qemu_mutex_lock(&s->lab_mutex);
+        g_queue_push_tail(&s->lab_in, f);
+        qemu_mutex_unlock(&s->lab_mutex);
+        SetEvent(s->lab_ev);
+        return size;
+    }
+#endif
     slirp_input(s->slirp, buf, size);
 
     return size;
@@ -158,7 +209,19 @@ static void net_slirp_cleanup(NetClientState *nc)
 {
     SlirpState *s = DO_UPCAST(SlirpState, nc, nc);
 
+#ifdef _WIN32
+    if (s->lab_thread) {   /* TEMP lab (QEMU_SLIRP_THREAD) */
+        qatomic_set(&s->lab_quit, true);
+        SetEvent(s->lab_ev);
+        qemu_thread_join(&s->lab_th);
+        qemu_bh_delete(s->lab_out_bh);
+    }
+#endif
     g_slist_free_full(s->fwd, slirp_free_fwd);
+#ifdef _WIN32
+    /* The slirp thread never registered it: removing it wrote through NULL at exit. */
+    if (!s->lab_thread)
+#endif
     main_loop_poll_remove_notifier(&s->poll_notifier);
     unregister_savevm(NULL, "slirp", s->slirp);
     slirp_cleanup(s->slirp);
@@ -194,6 +257,9 @@ struct SlirpTimer {
     SlirpTimerId id;
     void *cb_opaque;
 #endif
+    /* TEMP lab (QEMU_SLIRP_THREAD): a timer the slirp thread runs, not the main loop. */
+    SlirpState *lab_s;
+    int64_t lab_expire;   /* QEMU_CLOCK_VIRTUAL ms, -1 = not armed */
 };
 
 #if SLIRP_CHECK_VERSION(4,7,0)
@@ -213,10 +279,20 @@ static void *net_slirp_timer_new_opaque(SlirpTimerId id,
                                         void *cb_opaque, void *opaque)
 {
     SlirpState *s = opaque;
-    SlirpTimer *t = g_new(SlirpTimer, 1);
+    SlirpTimer *t = g_new0(SlirpTimer, 1);
     t->slirp = s->slirp;
     t->id = id;
     t->cb_opaque = cb_opaque;
+    t->lab_expire = -1;
+#ifdef _WIN32
+    if (s->lab_thread) {
+        t->lab_s = s;
+        qemu_mutex_lock(&s->lab_mutex);
+        g_ptr_array_add(s->lab_timers, t);
+        qemu_mutex_unlock(&s->lab_mutex);
+        return t;
+    }
+#endif
     timer_init_full(&t->timer, NULL, QEMU_CLOCK_VIRTUAL,
                     SCALE_MS, QEMU_TIMER_ATTR_EXTERNAL,
                     net_slirp_timer_cb, t);
@@ -237,6 +313,15 @@ static void *net_slirp_timer_new(SlirpTimerCb cb,
 static void net_slirp_timer_free(void *timer, void *opaque)
 {
     SlirpTimer *t = timer;
+#ifdef _WIN32
+    if (t->lab_s) {
+        qemu_mutex_lock(&t->lab_s->lab_mutex);
+        g_ptr_array_remove_fast(t->lab_s->lab_timers, t);
+        qemu_mutex_unlock(&t->lab_s->lab_mutex);
+        g_free(t);
+        return;
+    }
+#endif
     timer_del(&t->timer);
     g_free(t);
 }
@@ -245,6 +330,13 @@ static void net_slirp_timer_mod(void *timer, int64_t expire_timer,
                                 void *opaque)
 {
     SlirpTimer *t = timer;
+#ifdef _WIN32
+    if (t->lab_s) {
+        t->lab_expire = expire_timer;   /* the slirp thread's own call: no lock needed for its own field */
+        SetEvent(t->lab_s->lab_ev);
+        return;
+    }
+#endif
     timer_mod(&t->timer, expire_timer);
 }
 
@@ -260,8 +352,9 @@ static void net_slirp_register_poll_sock(slirp_os_socket fd, void *opaque)
 #ifdef WIN32
     AioContext *ctxt = qemu_get_aio_context();
     g_autofree char *msg = NULL;
+    SlirpState *s = opaque;
 
-    if (WSAEventSelect(fd, event_notifier_get_handle(&ctxt->notifier),
+    if (WSAEventSelect(fd, s->lab_thread ? s->lab_ev : event_notifier_get_handle(&ctxt->notifier),
                        FD_READ | FD_ACCEPT | FD_CLOSE |
                        FD_CONNECT | FD_WRITE | FD_OOB) != 0) {
         msg = g_win32_error_message(WSAGetLastError());
@@ -284,8 +377,174 @@ static void net_slirp_unregister_poll_sock(slirp_os_socket fd, void *opaque)
 
 static void net_slirp_notify(void *opaque)
 {
+#ifdef _WIN32
+    SlirpState *s = opaque;
+
+    if (s->lab_thread) {
+        SetEvent(s->lab_ev);
+        return;
+    }
+#endif
     qemu_notify_event();
 }
+
+
+#ifdef _WIN32
+/* ---- TEMP lab (QEMU_SLIRP_THREAD) ---- */
+static int lab_slirp_add_poll(slirp_os_socket fd, int events, void *opaque)
+{
+    GArray *fds = opaque;
+    WSAPOLLFD pfd = { .fd = fd, .events = 0, .revents = 0 };
+
+    if (events & SLIRP_POLL_IN) {
+        pfd.events |= POLLRDNORM;
+    }
+    if (events & SLIRP_POLL_OUT) {
+        pfd.events |= POLLWRNORM;
+    }
+    if (events & SLIRP_POLL_PRI) {
+        pfd.events |= POLLRDBAND;   /* WSAPoll refuses POLLPRI */
+    }
+    g_array_append_val(fds, pfd);
+    return fds->len - 1;
+}
+
+static int lab_slirp_get_revents(int idx, void *opaque)
+{
+    GArray *fds = opaque;
+    SHORT r = g_array_index(fds, WSAPOLLFD, idx).revents;
+    int ret = 0;
+
+    if (r & (POLLRDNORM | POLLHUP)) {
+        ret |= SLIRP_POLL_IN;
+    }
+    if (r & POLLRDBAND) {
+        ret |= SLIRP_POLL_PRI;
+    }
+    if (r & POLLWRNORM) {
+        ret |= SLIRP_POLL_OUT;
+    }
+    if (r & POLLERR) {
+        ret |= SLIRP_POLL_ERR;
+    }
+    if (r & POLLHUP) {
+        ret |= SLIRP_POLL_HUP;
+    }
+    return ret;
+}
+
+/* The main loop: slirp's frames to the NIC. */
+static void lab_slirp_out_bh(void *opaque)
+{
+    SlirpState *s = opaque;
+
+    GQueue batch = G_QUEUE_INIT;
+
+    qemu_mutex_lock(&s->lab_mutex);   /* the whole batch at once: one lock, one pass into the NIC */
+    batch = s->lab_out;
+    g_queue_init(&s->lab_out);
+    qemu_mutex_unlock(&s->lab_mutex);
+    for (;;) {
+        GByteArray *f;
+        const uint8_t *pkt;
+        size_t len;
+        uint8_t min_pkt[ETH_ZLEN];
+        size_t min_pktsz = sizeof(min_pkt);
+
+        f = g_queue_pop_head(&batch);
+        if (!f) {
+            break;
+        }
+        pkt = f->data;
+        len = f->len;
+        if (net_peer_needs_padding(&s->nc) && eth_pad_short_frame(min_pkt, &min_pktsz, pkt, len)) {
+            pkt = min_pkt;
+            len = min_pktsz;
+        }
+        qemu_send_packet(&s->nc, pkt, len);
+        g_byte_array_unref(f);
+    }
+}
+
+/* Fire the armed timers that are due; returns ms to the next one (or `cap`). */
+static uint32_t lab_slirp_run_timers(SlirpState *s, uint32_t cap)
+{
+    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+    int64_t next = -1;
+    guint i;
+
+    for (i = 0; i < s->lab_timers->len; i++) {
+        SlirpTimer *t = g_ptr_array_index(s->lab_timers, i);
+
+        if (t->lab_expire >= 0 && t->lab_expire <= now) {
+            t->lab_expire = -1;
+            slirp_handle_timer(t->slirp, t->id, t->cb_opaque);   /* may arm, add or free timers */
+            i = (guint)-1;   /* the array may have changed: walk it again from the start */
+            now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+            next = -1;
+            continue;
+        }
+        if (t->lab_expire >= 0 && (next < 0 || t->lab_expire < next)) {
+            next = t->lab_expire;
+        }
+    }
+    if (next < 0) {
+        return cap;
+    }
+    return (uint32_t)MIN((int64_t)cap, MAX(next - now, 0));
+}
+
+static void *lab_slirp_thread(void *opaque)
+{
+    SlirpState *s = opaque;
+    GArray *fds = g_array_new(FALSE, FALSE, sizeof(WSAPOLLFD));
+
+    rcu_register_thread();
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);   /* wakes on the guest's ACKs first */
+    while (!qatomic_read(&s->lab_quit)) {
+        uint32_t timeout;
+        int n;
+
+        for (;;) {   /* the guest's frames */
+            GByteArray *f;
+
+            qemu_mutex_lock(&s->lab_mutex);
+            f = g_queue_pop_head(&s->lab_in);
+            qemu_mutex_unlock(&s->lab_mutex);
+            if (!f) {
+                break;
+            }
+            slirp_input(s->slirp, f->data, f->len);
+            g_byte_array_unref(f);
+        }
+        if (!g_queue_is_empty(&s->lab_out)) {
+            qemu_bh_schedule(s->lab_out_bh);
+        }
+        timeout = lab_slirp_run_timers(s, 1000);
+        g_array_set_size(fds, 0);
+        slirp_pollfds_fill_socket(s->slirp, &timeout, lab_slirp_add_poll, fds);
+        n = fds->len ? WSAPoll((WSAPOLLFD *)fds->data, fds->len, 0) : 0;
+        if (n == 0 && g_queue_is_empty(&s->lab_in)) {
+            WaitForSingleObject(s->lab_ev, timeout);   /* sockets (WSAEventSelect), frames, timer arms, quit */
+            n = fds->len ? WSAPoll((WSAPOLLFD *)fds->data, fds->len, 0) : 0;
+        }
+        slirp_pollfds_poll(s->slirp, n < 0, lab_slirp_get_revents, fds);
+        if (!g_queue_is_empty(&s->lab_out)) {
+            qemu_bh_schedule(s->lab_out_bh);   /* one main-loop wake for the pass's whole batch */
+        }
+    }
+    rcu_unregister_thread();
+    g_array_free(fds, TRUE);
+    return NULL;
+}
+
+static bool lab_slirp_thread_on(void)
+{
+    const char *e = getenv("QEMU_SLIRP_THREAD");
+    return e && strcmp(e, "1") == 0;
+}
+/* ---- end TEMP lab QEMU_SLIRP_THREAD ---- */
+#endif
 
 static const SlirpCb slirp_cb = {
     .send_packet = net_slirp_send_packet,
@@ -663,6 +922,17 @@ static int net_slirp_init(NetClientState *peer, const char *model,
     cfg.vnameserver6 = ip6_dns;
     cfg.vdnssearch = dnssearch;
     cfg.vdomainname = vdomainname;
+#ifdef _WIN32
+    if (lab_slirp_thread_on()) {   /* TEMP lab (QEMU_SLIRP_THREAD): before slirp_new, which registers sockets */
+        s->lab_thread = true;
+        s->lab_ev = CreateEvent(NULL, FALSE, FALSE, NULL);
+        qemu_mutex_init(&s->lab_mutex);
+        g_queue_init(&s->lab_in);
+        g_queue_init(&s->lab_out);
+        s->lab_out_bh = qemu_bh_new(lab_slirp_out_bh, s);
+        s->lab_timers = g_ptr_array_new();
+    }
+#endif
     s->slirp = slirp_new(&cfg, &slirp_cb, s);
     QTAILQ_INSERT_TAIL(&slirp_stacks, s, entry);
 
@@ -679,6 +949,9 @@ static int net_slirp_init(NetClientState *peer, const char *model,
                          slirp_state_version(), &savevm_slirp_state, s->slirp);
 
     s->poll_notifier.notify = net_slirp_poll_notify;
+#ifdef _WIN32
+    if (!s->lab_thread)
+#endif
     main_loop_poll_add_notifier(&s->poll_notifier);
 
     for (config = slirp_configs; config; config = config->next) {
@@ -702,6 +975,12 @@ static int net_slirp_init(NetClientState *peer, const char *model,
 
     s->exit_notifier.notify = slirp_smb_exit;
     qemu_add_exit_notifier(&s->exit_notifier);
+#ifdef _WIN32
+    if (s->lab_thread) {   /* TEMP lab (QEMU_SLIRP_THREAD): from here on only this thread calls libslirp */
+        qemu_thread_create(&s->lab_th, "slirp", lab_slirp_thread, s, QEMU_THREAD_JOINABLE);
+        fprintf(stderr, "slirp: in its own thread (QEMU_SLIRP_THREAD)\n");
+    }
+#endif
     return 0;
 
 error:

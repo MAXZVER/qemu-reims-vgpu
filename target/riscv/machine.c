@@ -20,35 +20,30 @@
 #include "cpu.h"
 #include "qemu/error-report.h"
 #include "system/kvm.h"
-#include "system/tcg.h"
 #include "migration/cpu.h"
 #include "exec/icount.h"
-#include "target/riscv/tcg/debug.h"
+#include "target/riscv/debug.h"
 #include "hw/riscv/machines-qom.h"
 
 static bool pmp_needed(void *opaque)
 {
     RISCVCPU *cpu = opaque;
 
-    if (kvm_enabled()) {
-        return false;
-    }
-
-    return tcg_enabled() && cpu->cfg.pmp;
+    return cpu->cfg.pmp;
 }
 
 static int pmp_post_load(void *opaque, int version_id)
 {
-#ifdef CONFIG_TCG
     RISCVCPU *cpu = opaque;
     CPURISCVState *env = &cpu->env;
+    int i;
     uint8_t pmp_regions = riscv_cpu_cfg(env)->pmp_regions;
 
-    for (int i = 0; i < pmp_regions; i++) {
+    for (i = 0; i < pmp_regions; i++) {
         pmp_update_rule_addr(env, i);
     }
     pmp_update_rule_nums(env);
-#endif
+
     return 0;
 }
 
@@ -245,22 +240,16 @@ static int debug_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_debug = {
     .name = "cpu/debug",
-    .version_id = 4,
-    .minimum_version_id = 4,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .needed = debug_needed,
     .post_load = debug_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT16(env.mcontext, RISCVCPU),
         VMSTATE_UINT8(env.trigger_cur, RISCVCPU),
-        VMSTATE_VARRAY_UINT32(env.tdata1, RISCVCPU,
-                              env.num_triggers, 0,
-                              vmstate_info_uint64, uint64_t),
-        VMSTATE_VARRAY_UINT32(env.tdata2, RISCVCPU,
-                              env.num_triggers, 0,
-                              vmstate_info_uint64, uint64_t),
-        VMSTATE_VARRAY_UINT32(env.tdata3, RISCVCPU,
-                              env.num_triggers, 0,
-                              vmstate_info_uint64, uint64_t),
+        VMSTATE_UINT64_ARRAY(env.tdata1, RISCVCPU, RV_MAX_TRIGGERS),
+        VMSTATE_UINT64_ARRAY(env.tdata2, RISCVCPU, RV_MAX_TRIGGERS),
+        VMSTATE_UINT64_ARRAY(env.tdata3, RISCVCPU, RV_MAX_TRIGGERS),
         VMSTATE_END_OF_LIST()
     }
 };

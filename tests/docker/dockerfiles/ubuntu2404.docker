@@ -160,8 +160,7 @@ ENV RUSTC=/usr/bin/rustc-1.83
 ENV RUSTDOC=/usr/bin/rustdoc-1.83
 ENV CARGO_HOME=/usr/local/cargo
 ENV PATH=$CARGO_HOME/bin:$PATH
-RUN apt update && \
-  DEBIAN_FRONTEND=noninteractive eatmydata \
+RUN DEBIAN_FRONTEND=noninteractive eatmydata \
   apt install -y --no-install-recommends cargo
 RUN cargo install --locked bindgen-cli
 # As a final step configure the user (if env is defined)

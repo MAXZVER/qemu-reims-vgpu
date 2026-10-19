@@ -103,6 +103,8 @@ static inline void os_setup_post(void) {}
 static inline void os_set_proc_name(const char *dummy) {}
 void os_set_line_buffering(void);
 void os_setup_early_signal_handling(void);
+/* TEMP lab: every other thread's stack to stderr (os-win32.c). */
+void qemu_lab_dump_thread_stacks(const char *why);
 
 int getpagesize(void);
 

@@ -212,9 +212,7 @@ static inline uint32_t *tegra241_cmdqv_vintf_lvcmdq_ptr(Tegra241CMDQV *cmdqv,
 /*
  * Flush cached register writes into the mmap'd host VINTF page0 after a
  * successful HW_QUEUE_ALLOC, so the guest's earlier writes survive
- * the cache-to-hardware transition. GERRORN is intentionally not synced,
- * as overwriting it with the cached value could recreate a GERROR != GERRORN
- * mismatch and stall the VCMDQ.
+ * the cache-to-hardware transition.
  */
 static void tegra241_cmdqv_sync_vcmdq(Tegra241CMDQV *cmdqv, int index)
 {
@@ -231,6 +229,9 @@ static void tegra241_cmdqv_sync_vcmdq(Tegra241CMDQV *cmdqv, int index)
 
     ptr = tegra241_cmdqv_vintf_lvcmdq_ptr(cmdqv, index, A_VCMDQ0_CONFIG);
     *ptr = cmdqv->vcmdq_config[index];
+
+    ptr = tegra241_cmdqv_vintf_lvcmdq_ptr(cmdqv, index, A_VCMDQ0_GERRORN);
+    *ptr = cmdqv->vcmdq_gerrorn[index];
 }
 
 /*
@@ -840,17 +841,12 @@ static void tegra241_cmdqv_event_read(void *opaque)
         struct iommu_vevent_tegra241_cmdqv vevent;
     } buf;
     Error *local_err = NULL;
-    int ret;
 
-    ret = smmuv3_accel_event_read_validate(veventq,
-                                           IOMMU_VEVENTQ_TYPE_TEGRA241_CMDQV,
-                                           &buf, sizeof(buf), &local_err);
-    if (ret < 0) {
+    if (!smmuv3_accel_event_read_validate(veventq,
+                                          IOMMU_VEVENTQ_TYPE_TEGRA241_CMDQV,
+                                          &buf, sizeof(buf), &local_err)) {
         warn_report_err_once(local_err);
         return;
-    }
-    if (ret > 0) {
-        return; /* EAGAIN/EINTR */
     }
 
     if (buf.vevent.lvcmdq_err_map[0] || buf.vevent.lvcmdq_err_map[1]) {

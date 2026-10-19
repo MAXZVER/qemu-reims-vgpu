@@ -54,7 +54,7 @@ While GDB can always fall back to inserting breakpoints into memory
 accelerator. For TCG system emulation we advertise an infinite number
 of hardware assisted breakpoints and watchpoints. For other
 accelerators it will depend on if support has been added (see
-the AccelGdbConfig structure).
+supports_guest_debug and related hooks in AccelOpsClass).
 
 As TCG cannot track all memory accesses in user-mode there is no
 support for watchpoints.

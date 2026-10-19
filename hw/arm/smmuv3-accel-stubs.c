@@ -47,10 +47,10 @@ bool smmuv3_accel_alloc_veventq(SMMUv3State *s, Error **errp)
     return true;
 }
 
-int smmuv3_accel_event_read_validate(IOMMUFDVeventq *veventq, uint32_t type,
-                                     void *buf, size_t size, Error **errp)
+bool smmuv3_accel_event_read_validate(IOMMUFDVeventq *veventq, uint32_t type,
+                                      void *buf, size_t size, Error **errp)
 {
-    return 0;
+    return true;
 }
 
 

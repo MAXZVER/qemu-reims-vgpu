@@ -27,6 +27,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/atomic.h"
 #include <windows.h>
 #include "qapi/error.h"
 #include "qemu/main-loop.h"
@@ -34,6 +35,7 @@
 #include "qemu/sockets.h"
 #include "qemu/cutils.h"
 #include "qemu/error-report.h"
+#include "qemu/timer.h"
 #include <malloc.h>
 
 static int get_allocation_granularity(void)
@@ -42,6 +44,336 @@ static int get_allocation_granularity(void)
 
     GetSystemInfo(&system_info);
     return system_info.dwAllocationGranularity;
+}
+
+/*
+ * TEMP (lab): REIMS_VGPU_LAB_RAM_LARGE=on backs each guest RAM block of 1 GiB or more with large pages. Guest
+ * RAM then sits in the hypervisor's second-level tables as 2 MiB mappings (one walk and one TLB entry per 2 MiB
+ * instead of per 4 KiB) and is never trimmed out of the working set (large pages are not pageable). Needs the
+ * account's "Lock pages in memory" right (SeLockMemoryPrivilege), which this only enables in the process token;
+ * without it, or without enough contiguous free memory, the block falls back to ordinary pages. One line a block.
+ * On by default (n209, Intel, 40 GB guest, x2 interleaved: a guest memcpy of 1 GiB through a reused buffer 0.015 s
+ * against 0.022 s; full-screen transitions and stripes unchanged within noise; a fresh guest page costs the same,
+ * the guest's own pages stay 4 KiB). REIMS_VGPU_LAB_RAM_LARGE=off turns it off. whpx_lab_resident's VirtualLock
+ * then refuses (87) and needs not succeed: large pages are never paged.
+ */
+static void *qemu_lab_large_ram_alloc(size_t size)
+{
+    static int on = -1;
+    static bool priv;
+    SIZE_T large = GetLargePageMinimum();
+    size_t want;
+    int64_t t0;
+    void *ptr;
+    DWORD err;
+
+    if (on < 0) {
+        const char *e = getenv("REIMS_VGPU_LAB_RAM_LARGE");
+        HANDLE tok;
+
+        on = !(e && strcmp(e, "off") == 0);
+        if (on && OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) {
+            TOKEN_PRIVILEGES tp = { .PrivilegeCount = 1 };
+
+            if (LookupPrivilegeValueA(NULL, "SeLockMemoryPrivilege", &tp.Privileges[0].Luid)) {
+                tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                /* Succeeds with ERROR_NOT_ALL_ASSIGNED when the account does not hold the right. */
+                priv = AdjustTokenPrivileges(tok, FALSE, &tp, 0, NULL, NULL) &&
+                       GetLastError() == ERROR_SUCCESS;
+            }
+            CloseHandle(tok);
+        }
+    }
+    if (!on || size < (1ULL << 30) || large == 0) {
+        return NULL;
+    }
+    want = ROUND_UP(size, large);
+    t0 = get_clock();
+    ptr = priv ? VirtualAlloc(NULL, want, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE) : NULL;
+    err = ptr ? 0 : GetLastError();
+    fprintf(stderr, "reims-lab: large-page RAM size_mb=%zu page_kb=%zu priv=%d ok=%d err=%lu ms=%" PRId64 "\n",
+            size >> 20, (size_t)(large >> 10), priv, ptr != NULL, priv ? err : 1314UL,
+            (get_clock() - t0) / 1000000);
+    return ptr;
+}
+
+/*
+ * TEMP (lab, QEMU_WHPX_WP_VIEW=on): guest RAM of 1 GiB and more as one pagefile-backed section mapped twice. QEMU and
+ * the device use the first view (the pointer returned); the hypervisor maps the second (qemu_win_ram_hv_view), and
+ * write protection is that view's page protection (VirtualProtect), not the hypervisor's GPA map. A store from the
+ * guest to a page read-only there exits like one to a GPA mapped read-only; the host's own stores go through the
+ * first view and never fault. Why: a WHvMapGpaRange remap costs ~22 ns for every read-only range already in the
+ * partition (whpfrag2.c, 2026-10-15: 5.5 us with none, 327 us with 16k, 740 us with 32k; mappings split in chunks do
+ * not help), the WP thread remaps at 0.5-1 ms in the VM, and a canvas scene's ~10k protects take 16 s at its duty.
+ * VirtualProtect on the view: 1.4 us on a guest-written page, flat to 100k protected regions (whpwp.c, whpsem.c).
+ * Not with large pages (4K protection inside a large page is impossible).
+ */
+typedef struct QemuWinRamView {
+    char *host, *hv;
+    size_t size;
+    HANDLE section;
+} QemuWinRamView;
+
+static QemuWinRamView qemu_win_ram_views[8];
+static int qemu_win_ram_nviews;
+
+static bool qemu_win_wp_view_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("QEMU_WHPX_WP_VIEW");
+
+        /* On by default since b476 (canvas 5K 56.9 -> 66.4 fps, no 16 s warm-up); `=off` restores. */
+        on = !(e && strcmp(e, "off") == 0);
+    }
+    return on;
+}
+
+static void *qemu_win_ram_view_alloc(size_t size)
+{
+    QemuWinRamView *v;
+    HANDLE h;
+    void *a, *b;
+
+    if (!qemu_win_wp_view_on() || size < (1ULL << 30) ||
+        qemu_win_ram_nviews == ARRAY_SIZE(qemu_win_ram_views)) {
+        return NULL;
+    }
+    h = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE | SEC_COMMIT,
+                           (DWORD)((uint64_t)size >> 32), (DWORD)size, NULL);
+    if (!h) {
+        fprintf(stderr, "reims-lab: wp-view section of %zu MB refused (%lu)\n", size >> 20, GetLastError());
+        return NULL;
+    }
+    a = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, size);
+    b = a ? MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, size) : NULL;
+    if (!b) {
+        fprintf(stderr, "reims-lab: wp-view views of %zu MB refused (%lu)\n", size >> 20, GetLastError());
+        if (a) {
+            UnmapViewOfFile(a);
+        }
+        CloseHandle(h);
+        return NULL;
+    }
+    v = &qemu_win_ram_views[qemu_win_ram_nviews];
+    v->host = a;
+    v->hv = b;
+    v->size = size;
+    v->section = h;
+    qatomic_store_release(&qemu_win_ram_nviews, qemu_win_ram_nviews + 1);
+    fprintf(stderr, "reims-lab: wp-view RAM size_mb=%zu host=%p hv=%p\n", size >> 20, a, b);
+    return a;
+}
+
+void *qemu_win_ram_hv_view(void *host, size_t len)
+{
+    int i, n = qatomic_load_acquire(&qemu_win_ram_nviews);
+
+    for (i = 0; i < n; i++) {
+        QemuWinRamView *v = &qemu_win_ram_views[i];
+
+        if ((char *)host >= v->host && (char *)host + len <= v->host + v->size) {
+            return v->hv + ((char *)host - v->host);
+        }
+    }
+    return host;
+}
+
+/*
+ * TEMP (lab, WP_VIEW): one linear window over scattered pages of guest RAM - the Windows form of the POSIX packed
+ * alias (MAP_SHARED | MAP_FIXED per page) a device builds when a task's virtually linear surface sits on
+ * guest-physical pages that are not. Guest RAM under WP_VIEW is one pagefile section, so each page can be mapped
+ * once more: reserve a placeholder for the whole window, split it per RUN and replace each piece with a view of
+ * the section at the run's offset. An alias, not a copy - guest CPU stores, the device's stores and the GPU's
+ * reads all address the same pages. Measured (lab/tools/session-2026-10-15/whp/placeholder4k.c): 1.8 us a page,
+ * page-aligned section offsets accepted, write-through exact.
+ *
+ * Runs, not pages (b610, 2026-10-16): the per-page form split and replaced one placeholder piece per 4 KiB page,
+ * so a 5K surface cost 2 x 14400 kernel address-space calls at build and as many unmappings at teardown - all
+ * against the one pagefile section whose protection the WP dirty machinery flips ~10k times a scene. The device
+ * drain ground to zero draws a second, the guest span polling device registers, and every vCPU exit that needed
+ * the BQL queued behind it for 1-13 s (canvas 0.4 fps; aliases off: 61). A guest surface off a contiguous
+ * physical allocation is one run, so maximal consecutive pages are mapped as one view: 3 calls per run. The
+ * run table out-param hands the layout to qemu_win_ram_alias_free, which unmaps one view per run.
+ *
+ * The three calls are looked up at run time: the build targets an older Windows API level than the one that
+ * declares them (Windows 10 1803).
+ */
+#ifndef MEM_RESERVE_PLACEHOLDER
+#define MEM_RESERVE_PLACEHOLDER 0x00040000
+#endif
+#ifndef MEM_REPLACE_PLACEHOLDER
+#define MEM_REPLACE_PLACEHOLDER 0x00004000
+#endif
+#ifndef MEM_PRESERVE_PLACEHOLDER
+#define MEM_PRESERVE_PLACEHOLDER 0x00000002
+#endif
+
+typedef PVOID (WINAPI *QemuVirtualAlloc2Fn)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void *, ULONG);
+typedef PVOID (WINAPI *QemuMapViewOfFile3Fn)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, void *, ULONG);
+typedef BOOL (WINAPI *QemuUnmapViewOfFile2Fn)(HANDLE, PVOID, ULONG);
+
+static QemuVirtualAlloc2Fn qemu_win_va2;
+static QemuMapViewOfFile3Fn qemu_win_mv3;
+static QemuUnmapViewOfFile2Fn qemu_win_uv2;
+
+static bool qemu_win_placeholder_api(void)
+{
+    static int state = -1;   /* benign race: every thread resolves the same three pointers */
+
+    if (qatomic_read(&state) < 0) {
+        HMODULE k = GetModuleHandleW(L"kernelbase.dll");
+
+        if (k) {
+            qemu_win_va2 = (QemuVirtualAlloc2Fn)(void *)GetProcAddress(k, "VirtualAlloc2");
+            qemu_win_mv3 = (QemuMapViewOfFile3Fn)(void *)GetProcAddress(k, "MapViewOfFile3");
+            qemu_win_uv2 = (QemuUnmapViewOfFile2Fn)(void *)GetProcAddress(k, "UnmapViewOfFile2");
+        }
+        qatomic_set(&state, qemu_win_va2 && qemu_win_mv3 && qemu_win_uv2);
+    }
+    return qatomic_read(&state) > 0;
+}
+
+/* The WP_VIEW section and byte offset behind `len` bytes of guest RAM at `host` (QEMU's view). */
+static bool qemu_win_ram_section_of(const void *host, size_t len, HANDLE *section, uint64_t *offset)
+{
+    int i, n = qatomic_load_acquire(&qemu_win_ram_nviews);
+
+    for (i = 0; i < n; i++) {
+        QemuWinRamView *v = &qemu_win_ram_views[i];
+
+        if (v->section && (const char *)host >= v->host && (const char *)host + len <= v->host + v->size) {
+            *section = v->section;
+            *offset = (uint64_t)((const char *)host - v->host);
+            return true;
+        }
+    }
+    return false;
+}
+
+void *qemu_win_ram_alias_pages(void *const *hosts, size_t count, size_t page, unsigned long *err,
+                               size_t *failed_index, QemuWinRamAliasRun **runs_out, size_t *runs_n_out)
+{
+    HANDLE proc = GetCurrentProcess();
+    QemuWinRamAliasRun *runs = NULL;
+    size_t runs_n = 0, runs_alloc = 0;
+    char *view;
+    size_t i = 0, j = 0;
+    bool split = false;
+
+    *err = 0;
+    *failed_index = SIZE_MAX;
+    if (runs_out) {
+        *runs_out = NULL;
+    }
+    if (runs_n_out) {
+        *runs_n_out = 0;
+    }
+    if (count == 0 || !qemu_win_placeholder_api()) {
+        *err = ERROR_NOT_SUPPORTED;
+        return NULL;
+    }
+    view = qemu_win_va2(proc, NULL, count * page, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, NULL, 0);
+    if (!view) {
+        *err = GetLastError();
+        return NULL;
+    }
+    while (i < count) {
+        HANDLE section;
+        uint64_t offset;
+
+        j = i;
+        split = false;
+        if (!qemu_win_ram_section_of(hosts[i], page, &section, &offset) || (offset & (page - 1))) {
+            *err = ERROR_INVALID_ADDRESS;
+            goto fail;
+        }
+        /*
+         * Extend the run while the next page is this section's next page: one view for the whole run.
+         * Window page k sits at view + k * page, so a run of section-consecutive pages maps exactly onto
+         * the packed layout the caller requires - the layout a per-page build produced, minus the calls.
+         */
+        while (j + 1 < count) {
+            HANDLE next_section;
+            uint64_t next_offset;
+
+            if (!qemu_win_ram_section_of(hosts[j + 1], page, &next_section, &next_offset) ||
+                next_section != section || next_offset != offset + (j + 1 - i) * page) {
+                break;
+            }
+            j++;
+        }
+        /* Split [i, j+1) off the placeholder that still spans [i, count); the last run is already alone. */
+        if (j + 1 < count) {
+            if (!VirtualFree(view + i * page, (j + 1 - i) * page,
+                             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+                *err = GetLastError();
+                goto fail;
+            }
+            split = true;
+        }
+        if (!qemu_win_mv3(section, proc, view + i * page, offset, (j + 1 - i) * page,
+                          MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0)) {
+            *err = GetLastError();
+            goto fail;
+        }
+        if (runs_n == runs_alloc) {
+            runs_alloc = runs_alloc ? runs_alloc * 2 : 16;
+            runs = g_realloc(runs, runs_alloc * sizeof(*runs));
+        }
+        runs[runs_n].first_page = i;
+        runs[runs_n].pages = j + 1 - i;
+        runs_n++;
+        i = j + 1;
+    }
+    if (!runs_out || !runs) {
+        /* The caller declined the table (or built none): drop it, free() falls back to per page. */
+        g_free(runs);
+    } else {
+        *runs_out = runs;
+    }
+    if (runs_n_out) {
+        *runs_n_out = runs_n;
+    }
+    return view;
+
+fail:
+    *failed_index = i;
+    {
+        size_t k;
+
+        for (k = 0; k < runs_n; k++) {
+            qemu_win_uv2(proc, view + runs[k].first_page * page, 0);
+        }
+    }
+    /* Run i's own placeholder (or the unsplit rest from i), then the rest after a split. */
+    VirtualFree(view + i * page, 0, MEM_RELEASE);
+    if (split && j + 1 < count) {
+        VirtualFree(view + (j + 1) * page, 0, MEM_RELEASE);
+    }
+    g_free(runs);
+    return NULL;
+}
+
+void qemu_win_ram_alias_free(void *view, size_t count, size_t page,
+                             const QemuWinRamAliasRun *runs, size_t runs_n)
+{
+    HANDLE proc = GetCurrentProcess();
+    size_t k;
+
+    if (!view || !qemu_win_placeholder_api()) {
+        return;
+    }
+    if (runs && runs_n) {
+        for (k = 0; k < runs_n; k++) {
+            qemu_win_uv2(proc, (char *)view + runs[k].first_page * page, 0);
+        }
+        return;
+    }
+    for (k = 0; k < count; k++) {
+        qemu_win_uv2(proc, (char *)view + k * page, 0);
+    }
 }
 
 void *qemu_anon_ram_alloc(size_t size, uint64_t *align, bool shared,
@@ -58,7 +390,13 @@ void *qemu_anon_ram_alloc(size_t size, uint64_t *align, bool shared,
         return NULL;
     }
 
-    ptr = VirtualAlloc(NULL, size, MEM_COMMIT, PAGE_READWRITE);
+    ptr = qemu_win_ram_view_alloc(size);
+    if (!ptr) {
+        ptr = qemu_lab_large_ram_alloc(size);
+    }
+    if (!ptr) {
+        ptr = VirtualAlloc(NULL, size, MEM_COMMIT, PAGE_READWRITE);
+    }
     trace_qemu_anon_ram_alloc(size, ptr);
 
     if (ptr && align) {
@@ -69,7 +407,21 @@ void *qemu_anon_ram_alloc(size_t size, uint64_t *align, bool shared,
 
 void qemu_anon_ram_free(void *ptr, size_t size)
 {
+    int i;
+
     trace_qemu_anon_ram_free(ptr, size);
+    for (i = 0; ptr && i < qemu_win_ram_nviews; i++) {
+        QemuWinRamView *v = &qemu_win_ram_views[i];
+
+        if (v->host == ptr && v->section) {   /* TEMP (lab, QEMU_WHPX_WP_VIEW) */
+            UnmapViewOfFile(v->hv);
+            UnmapViewOfFile(v->host);
+            CloseHandle(v->section);
+            v->section = NULL;
+            v->size = 0;
+            return;
+        }
+    }
     if (ptr) {
         VirtualFree(ptr, 0, MEM_RELEASE);
     }
@@ -259,10 +611,24 @@ void qemu_set_tty_echo(int fd, bool echo)
 
 int getpagesize(void)
 {
-    SYSTEM_INFO system_info;
+    /*
+     * GetSystemInfo is a system call (NtQueryInformationProcess) and this is
+     * asked on every dirty-log sync (physical_memory_set_dirty_lebitmap via
+     * qemu_real_host_page_size), hundreds of thousands of times a second
+     * under reims-vgpu's on-demand dirty tracking. The page size cannot
+     * change while the process runs.
+     */
+    static int page_size;
+    int ps = qatomic_read(&page_size);
 
-    GetSystemInfo(&system_info);
-    return system_info.dwPageSize;
+    if (!ps) {
+        SYSTEM_INFO system_info;
+
+        GetSystemInfo(&system_info);
+        ps = system_info.dwPageSize;
+        qatomic_set(&page_size, ps);
+    }
+    return ps;
 }
 
 bool qemu_prealloc_mem(int fd, char *area, size_t sz, int max_threads,

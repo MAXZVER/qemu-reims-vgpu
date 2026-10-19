@@ -31,6 +31,8 @@
 #include "migration/vmstate.h"
 #include "trace.h"
 
+void (*hid_lab_mark)(uint32_t kind, uint32_t arg);
+
 #define HID_USAGE_ERROR_ROLLOVER        0x01
 #define HID_USAGE_POSTFAIL              0x02
 #define HID_USAGE_ERROR_UNDEFINED       0x03
@@ -217,6 +219,9 @@ static void hid_pointer_sync(DeviceState *dev)
         next->buttons_state = curr->buttons_state;
         /* make current guest visible, notify guest */
         hs->n++;
+        if (hid_lab_mark) {
+            hid_lab_mark(3, curr->buttons_state);
+        }
         hs->event(hs);
     }
 }
@@ -237,6 +242,9 @@ static void hid_keyboard_event(DeviceState *dev, QemuConsole *src,
     for (i = 0; i < count; i++) {
         slot = (hs->head + hs->n) & QUEUE_MASK; hs->n++;
         hs->kbd.keycodes[slot] = scancodes[i];
+    }
+    if (hid_lab_mark) {
+        hid_lab_mark(1, evt->key.down);
     }
     hs->event(hs);
 }
@@ -358,6 +366,9 @@ int hid_pointer_poll(HIDState *hs, uint8_t *buf, int len)
     hs->idle_pending = false;
 
     hid_pointer_activate(hs);
+    if (hid_lab_mark && hs->n) {
+        hid_lab_mark(4, hs->n);
+    }
 
     /* When the buffer is empty, return the last event.  Relative
        movements will all be zero.  */
@@ -439,6 +450,9 @@ int hid_keyboard_poll(HIDState *hs, uint8_t *buf, int len)
         return 0;
     }
 
+    if (hid_lab_mark && hs->n) {
+        hid_lab_mark(2, hs->n);
+    }
     hid_keyboard_process_keycode(hs);
 
     buf[0] = hs->kbd.modifiers & 0xff;

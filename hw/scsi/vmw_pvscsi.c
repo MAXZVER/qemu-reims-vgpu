@@ -392,18 +392,9 @@ static void
 pvscsi_cmp_ring_put(PVSCSIState *s, struct PVSCSIRingCmpDesc *cmp_desc)
 {
     hwaddr cmp_descr_pa;
-    PVSCSIRingCmpDesc cmp_desc_conv;
 
     cmp_descr_pa = pvscsi_ring_pop_cmp_descr(&s->rings);
     trace_pvscsi_cmp_ring_put(cmp_descr_pa);
-    cmp_desc_conv = (struct PVSCSIRingCmpDesc) {
-        .context = cpu_to_le64(cmp_desc->context),
-        .dataLen = cpu_to_le64(cmp_desc->dataLen),
-        .senseLen = cpu_to_le32(cmp_desc->senseLen),
-        .hostStatus = cpu_to_le16(cmp_desc->hostStatus),
-        .scsiStatus = cpu_to_le16(cmp_desc->scsiStatus),
-    };
-    cmp_desc = &cmp_desc_conv;
     physical_memory_write(cmp_descr_pa, cmp_desc, sizeof(*cmp_desc));
 }
 
@@ -411,18 +402,9 @@ static void
 pvscsi_msg_ring_put(PVSCSIState *s, struct PVSCSIRingMsgDesc *msg_desc)
 {
     hwaddr msg_descr_pa;
-    PVSCSIRingMsgDesc msg_desc_conv;
-    int i;
 
     msg_descr_pa = pvscsi_ring_pop_msg_descr(&s->rings);
     trace_pvscsi_msg_ring_put(msg_descr_pa);
-    msg_desc_conv = (PVSCSIRingMsgDesc) {
-        .type = cpu_to_le32(msg_desc->type),
-    };
-    for (i = 0; i < ARRAY_SIZE(msg_desc->args); i++) {
-        msg_desc_conv.args[i] = cpu_to_le32(msg_desc->args[i]);
-    }
-    msg_desc = &msg_desc_conv;
     physical_memory_write(msg_descr_pa, msg_desc, sizeof(*msg_desc));
 }
 
@@ -499,9 +481,6 @@ pvscsi_get_next_sg_elem(PVSCSISGState *sg)
     struct PVSCSISGElement elem;
 
     physical_memory_read(sg->elemAddr, &elem, sizeof(elem));
-    elem.addr = le64_to_cpu(elem.addr);
-    elem.length = le32_to_cpu(elem.length);
-    elem.flags = le32_to_cpu(elem.flags);
     if ((elem.flags & ~PVSCSI_KNOWN_FLAGS) != 0) {
         /*
             * There is PVSCSI_SGE_FLAG_CHAIN_ELEMENT flag described in
@@ -780,12 +759,6 @@ pvscsi_process_io(PVSCSIState *s)
 
         trace_pvscsi_process_io(next_descr_pa);
         physical_memory_read(next_descr_pa, &descr, sizeof(descr));
-        descr.context = le64_to_cpu(descr.context);
-        descr.dataAddr = le64_to_cpu(descr.dataAddr);
-        descr.dataLen = le64_to_cpu(descr.dataLen);
-        descr.senseAddr = le64_to_cpu(descr.senseAddr);
-        descr.senseLen = le32_to_cpu(descr.senseLen);
-        descr.flags = le32_to_cpu(descr.flags);
         pvscsi_process_request_descriptor(s, &descr);
     }
 
@@ -835,17 +808,6 @@ pvscsi_on_cmd_setup_rings(PVSCSIState *s)
 {
     PVSCSICmdDescSetupRings *rc =
         (PVSCSICmdDescSetupRings *) s->curr_cmd_data;
-    PVSCSICmdDescSetupRings translated;
-    int i;
-
-    translated.reqRingNumPages = le32_to_cpu(rc->reqRingNumPages);
-    translated.cmpRingNumPages = le32_to_cpu(rc->cmpRingNumPages);
-    translated.ringsStatePPN = le64_to_cpu(rc->ringsStatePPN);
-    for (i = 0; i < PVSCSI_SETUP_RINGS_MAX_NUM_PAGES; i++) {
-        translated.reqRingPPNs[i] = le64_to_cpu(rc->reqRingPPNs[i]);
-        translated.cmpRingPPNs[i] = le64_to_cpu(rc->cmpRingPPNs[i]);
-    }
-    rc = &translated;
 
     trace_pvscsi_on_cmd_arrived("PVSCSI_CMD_SETUP_RINGS");
 
@@ -868,11 +830,6 @@ pvscsi_on_cmd_abort(PVSCSIState *s)
 {
     PVSCSICmdDescAbortCmd *cmd = (PVSCSICmdDescAbortCmd *) s->curr_cmd_data;
     PVSCSIRequest *r, *next;
-
-    PVSCSICmdDescAbortCmd translated = *cmd;
-    translated.context = le32_to_cpu(cmd->context);
-    translated.target = le32_to_cpu(cmd->target);
-    cmd = &translated;
 
     trace_pvscsi_on_cmd_abort(cmd->context, cmd->target);
 
@@ -905,10 +862,6 @@ pvscsi_on_cmd_reset_device(PVSCSIState *s)
         (struct PVSCSICmdDescResetDevice *) s->curr_cmd_data;
     SCSIDevice *sdev;
 
-    PVSCSICmdDescResetDevice translated = *cmd;
-    translated.target = le32_to_cpu(cmd->target);
-    cmd = &translated;
-
     sdev = pvscsi_device_find(s, 0, cmd->target, cmd->lun, &target_lun);
 
     trace_pvscsi_on_cmd_reset_dev(cmd->target, (int) target_lun, sdev);
@@ -939,14 +892,6 @@ pvscsi_on_cmd_setup_msg_ring(PVSCSIState *s)
 {
     PVSCSICmdDescSetupMsgRing *rc =
         (PVSCSICmdDescSetupMsgRing *) s->curr_cmd_data;
-    PVSCSICmdDescSetupMsgRing translated = *rc;
-    int i;
-
-    translated.numPages = le32_to_cpu(rc->numPages);
-    for (i = 0; i < PVSCSI_SETUP_MSG_RING_MAX_NUM_PAGES; i++) {
-        translated.ringPPNs[i] = le64_to_cpu(rc->ringPPNs[i]);
-    }
-    rc = &translated;
 
     trace_pvscsi_on_cmd_arrived("PVSCSI_CMD_SETUP_MSG_RING");
 
@@ -1049,7 +994,7 @@ pvscsi_on_command_data(PVSCSIState *s, uint32_t value)
     size_t bytes_arrived = s->curr_cmd_data_cntr * sizeof(uint32_t);
 
     assert(bytes_arrived < sizeof(s->curr_cmd_data));
-    s->curr_cmd_data[s->curr_cmd_data_cntr++] = cpu_to_le32(value);
+    s->curr_cmd_data[s->curr_cmd_data_cntr++] = value;
 
     pvscsi_do_command_processing(s);
 }

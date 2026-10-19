@@ -65,6 +65,176 @@ system_ss.add(when: 'CONFIG_ATI_VGA', if_true: [files('ati.c', 'ati_2d.c', 'ati_
 system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_PCI'],     if_true: [files('apple-gfx.m', 'apple-gfx-pci.m')])
 system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],    if_true: [files('apple-gfx.m', 'apple-gfx-mmio.m')])
 
+if config_all_devices.has_key('CONFIG_REIMS_VGPU')
+  # Thin QEMU C device links crates/reims-vgpu (Cargo staticlib). Which backends
+  # are *linked in* is a configure-time choice baked into the binary, never a
+  # runtime env sniff.
+  #
+  # `both` links both and lets the device pick between them at run time
+  # (REIMS_VGPU_RAIL). That is not a relaxation of the rule above — it is what
+  # makes the rule affordable. An Apple host reaches its GPU natively through
+  # Metal and through MoltenVK, and telling a metal2vulkan defect from a defect
+  # in this device means running the *same guest stream* both ways. With one
+  # backend per binary that comparison costs a rebuild, which changes the
+  # binary, the caches and the boot alongside the thing being measured.
+  # Sources live in the parent repo, two directories above this vendored submodule.
+  reims_vgpu_repo_dir = meson.global_source_root() / '..' / '..'
+  reims_vgpu_abi_header_dir = reims_vgpu_repo_dir / 'crates' / 'reims-vgpu' / 'include'
+  # A meson option and not the environment, because meson re-runs this file
+  # whenever ninja decides the build is out of date — and that regeneration
+  # inherits ninja's environment, not the one the configure ran under. A build
+  # configured for Vulkan therefore silently became a Metal one the first time
+  # any meson.build changed under a plain `ninja`, and on Linux that build fails
+  # with twenty Rust errors from an Apple-only arm. An option is stored in the
+  # build directory and survives regeneration, which is the property this needs.
+  #
+  # `env` keeps `REIMS_VGPU_BACKEND` working for a caller that has not been
+  # taught the option yet, and it is only ever read on a real configure —
+  # `scripts/qemu-build` passes the option, so the fallback is not on the path
+  # any boot takes.
+  reims_vgpu_backend_kind = get_option('reims_vgpu_backend')
+  if reims_vgpu_backend_kind == 'env'
+    reims_vgpu_backend_kind = run_command(find_program('sh'), '-c',
+      'printf %s "${REIMS_VGPU_BACKEND:-metal}"', check: true).stdout().strip()
+  endif
+  cargo = find_program('cargo')
+  # Rust staticlib always needs these on Unix; Apple frameworks only on Darwin.
+  reims_vgpu_rust_sys_libs = ['-lm', '-ldl', '-lpthread']
+  if host_os == 'darwin'
+    reims_vgpu_rust_sys_libs += ['-liconv']
+  elif host_os == 'windows'
+    # mingw-w64: no libm/libdl to link; winit's native windowing stack and the
+    # sockets lib the Rust std target expects.
+    reims_vgpu_rust_sys_libs = ['-luser32', '-lgdi32', '-ldwmapi', '-lole32',
+                                '-lshell32', '-limm32', '-loleaut32', '-lws2_32',
+                                '-luserenv', '-lntdll', '-luxtheme']
+    # TEMP lab (PGO): the profiling runtime a `-Cprofile-generate` Rust staticlib
+    # references and does not bundle. Present only on a host set up for a PGO
+    # run; an archive nothing references adds nothing to the link.
+    if import('fs').exists('E:/pgo-c/libprofiler_builtins.a')
+      reims_vgpu_rust_sys_libs += ['E:/pgo-c/libprofiler_builtins.a']
+    endif
+  endif
+  if reims_vgpu_backend_kind == 'metal'
+    # host-window: the Metal rail presents through a Rust-owned winit window and
+    # a CAMetalLayer on its view, the same window the Vulkan rail fills through a
+    # swapchain. Which rail fills it is a run-time answer, so this feature is on
+    # for every arm that ships one; QEMU's own display is then unused and the
+    # boot passes -display none.
+    reims_vgpu_cargo_features = '--features backend-metal,host-window'
+    if host_os == 'darwin'
+      # The same list as the vulkan and both arms below: winit's native
+      # windowing stack is what widened it past Metal + QuartzCore, and all
+      # three arms now carry a window. Spelled out in full rather than shared,
+      # for the reason the 'both' arm gives.
+      reims_vgpu_link_args = [
+        '-framework', 'AppKit',
+        '-framework', 'ApplicationServices',
+        '-framework', 'Carbon',
+        '-framework', 'CoreFoundation',
+        '-framework', 'CoreGraphics',
+        '-framework', 'CoreVideo',
+        '-framework', 'Foundation',
+        '-framework', 'Metal',
+        '-framework', 'QuartzCore',
+        '-lobjc',
+      ] + reims_vgpu_rust_sys_libs
+    else
+      # Host metal stubs: no Apple frameworks.
+      reims_vgpu_link_args = reims_vgpu_rust_sys_libs
+    endif
+  elif reims_vgpu_backend_kind == 'vulkan'
+    # host-window adds the Rust-owned winit + VkSurfaceKHR presentation window
+    # (kb host-window), opt-in at runtime behind REIMS_VGPU_WINDOW. Always built into
+    # the vulkan binary; reims_vgpu_qemu_window_start returns ERR_STATE if unused.
+    reims_vgpu_cargo_features = '--no-default-features --features backend-vulkan,host-window,lab-tcache'
+    # ash loads the Vulkan loader at runtime; no link-time Vulkan dep.
+    if host_os == 'darwin'
+      # winit/raw-window-metal link against the native macOS windowing stack even
+      # when REIMS_VGPU_WINDOW is off at runtime. Keep the Rust staticlib dependency
+      # self-contained so a Darwin Vulkan QEMU link does not depend on Cocoa
+      # already being enabled elsewhere in QEMU.
+      reims_vgpu_link_args = [
+        '-framework', 'AppKit',
+        '-framework', 'ApplicationServices',
+        '-framework', 'Carbon',
+        '-framework', 'CoreFoundation',
+        '-framework', 'CoreGraphics',
+        '-framework', 'CoreVideo',
+        '-framework', 'Foundation',
+        '-framework', 'Metal',
+        '-framework', 'QuartzCore',
+        '-lobjc',
+      ] + reims_vgpu_rust_sys_libs
+    else
+      # Linux window backends are loaded by winit/ash-window at runtime.
+      reims_vgpu_link_args = reims_vgpu_rust_sys_libs
+      # Runtime-dead measurement (scripts/runtime-dead). When the staticlib is
+      # built with -C instrument-coverage, its objects carry __llvm_prf_* but
+      # nothing that writes them: rustc bundles the profiler runtime into a
+      # final artifact, and this staticlib is not one — it is linked by QEMU.
+      # So the profile runtime is named here instead, whole-archive because no
+      # instrumented object references it and the linker would drop every
+      # member. REIMS_VGPU_COVERAGE holds the path to
+      # libclang_rt.profile-<arch>.a; unset (the default) changes nothing.
+      reims_vgpu_coverage_rt = run_command('sh', '-c',
+        'printf %s "$REIMS_VGPU_COVERAGE"', check: false).stdout().strip()
+      if reims_vgpu_coverage_rt != ''
+        reims_vgpu_link_args += ['-Wl,--whole-archive', reims_vgpu_coverage_rt,
+                                 '-Wl,--no-whole-archive']
+      endif
+    endif
+  elif reims_vgpu_backend_kind == 'both'
+    # Metal + Vulkan in one staticlib, chosen at run time. Apple only: the crate
+    # rejects backend-metal off macOS, because there is no host-stub Metal arm.
+    if host_os != 'darwin'
+      error('reims_vgpu_backend=both requires an Apple host (backend-metal has ' +
+            'no host-stub arm); use metal or vulkan')
+    endif
+    reims_vgpu_cargo_features = '--features backend-metal,backend-vulkan,host-window'
+    # The union of the two arms' frameworks, which on Darwin is the Vulkan list:
+    # it already names Metal, QuartzCore, Foundation and CoreGraphics for winit
+    # and raw-window-metal, so the Metal arm adds nothing to it. Spelled out in
+    # full rather than derived from the branch above, because a reader checking
+    # what this binary links should not have to evaluate two branches to find
+    # out, and because the day the two lists stop overlapping this must not
+    # silently drop one of them.
+    reims_vgpu_link_args = [
+      '-framework', 'AppKit',
+      '-framework', 'ApplicationServices',
+      '-framework', 'Carbon',
+      '-framework', 'CoreFoundation',
+      '-framework', 'CoreGraphics',
+      '-framework', 'CoreVideo',
+      '-framework', 'Foundation',
+      '-framework', 'Metal',
+      '-framework', 'QuartzCore',
+      '-lobjc',
+    ] + reims_vgpu_rust_sys_libs
+  else
+    error('unknown REIMS_VGPU_BACKEND: ' + reims_vgpu_backend_kind +
+          ' (metal | vulkan | both)')
+  endif
+  reims_vgpu_built = reims_vgpu_repo_dir / 'target' / 'release' / 'libreims_vgpu.a'
+  reims_vgpu_a = custom_target('reims-vgpu-staticlib',
+    output: 'libreims_vgpu.a',
+    console: true,
+    build_always_stale: true,
+    command: [find_program('sh'), '-c',
+      '"' + cargo.full_path() + '" build --release --manifest-path "' +
+      reims_vgpu_repo_dir + '/Cargo.toml" -p reims-vgpu ' + reims_vgpu_cargo_features +
+      ' && ( cmp -s "' + reims_vgpu_built + '" "@OUTPUT@" || cp "' +
+      reims_vgpu_built + '" "@OUTPUT@" )'])
+  # Header lives outside the qemu submodule tree; use compile_args -I.
+  reims_vgpu_dep = declare_dependency(
+    link_with: reims_vgpu_a,
+    link_args: reims_vgpu_link_args,
+    compile_args: ['-I' + reims_vgpu_abi_header_dir])
+  system_ss.add(when: 'CONFIG_REIMS_VGPU',
+    if_true: [files('reims-vgpu-mmio.c', 'reims-vgpu-pci.c', 'reims-vgpu-dirty.c',
+                    'reims-vgpu-shim.c'), reims_vgpu_dep])
+endif
+
 if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
   virtio_gpu_ss = ss.source_set()
   virtio_gpu_ss.add(when: 'CONFIG_VIRTIO_GPU',

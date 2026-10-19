@@ -76,7 +76,6 @@ typedef struct TPMState {
     size_t be_buffer_size;
 
     TPMPPI ppi;
-    bool ppi_enabled;
 } TPMState;
 
 extern const VMStateDescription vmstate_locty;

@@ -277,8 +277,7 @@ void json_lexer_init(JSONLexer *lexer, bool enable_interpolation)
     lexer->start_state = lexer->state = enable_interpolation
         ? IN_START_INTERP : IN_START;
     lexer->token = g_string_sized_new(3);
-    lexer->cur_x = lexer->cur_y = 1;
-    lexer->x = lexer->y = 1;
+    lexer->x = lexer->y = 0;
 }
 
 static void json_lexer_feed_char(JSONLexer *lexer, char ch, bool flush)
@@ -286,10 +285,10 @@ static void json_lexer_feed_char(JSONLexer *lexer, char ch, bool flush)
     int new_state;
     bool char_consumed = false;
 
-    lexer->cur_x++;
+    lexer->x++;
     if (ch == '\n') {
-        lexer->cur_x = 1;
-        lexer->cur_y++;
+        lexer->x = 0;
+        lexer->y++;
     }
 
     while (flush ? lexer->state != lexer->start_state : !char_consumed) {
@@ -317,8 +316,6 @@ static void json_lexer_feed_char(JSONLexer *lexer, char ch, bool flush)
         case IN_START:
             g_string_truncate(lexer->token, 0);
             new_state = lexer->start_state;
-            lexer->x = lexer->cur_x;
-            lexer->y = lexer->cur_y;
             break;
         case JSON_ERROR:
             json_message_process_token(lexer, lexer->token, JSON_ERROR,

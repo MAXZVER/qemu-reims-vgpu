@@ -20,7 +20,18 @@
 #include "hw/misc/imx_ccm.h"
 #include "qemu/module.h"
 #include "qemu/log.h"
-#include "trace.h"
+
+#ifndef DEBUG_IMX_EPIT
+#define DEBUG_IMX_EPIT 0
+#endif
+
+#define DPRINTF(fmt, args...) \
+    do { \
+        if (DEBUG_IMX_EPIT) { \
+            fprintf(stderr, "[%s]%s: " fmt , TYPE_IMX_EPIT, \
+                                             __func__, ##args); \
+        } \
+    } while (0)
 
 static const char *imx_epit_reg_name(uint32_t reg)
 {
@@ -69,7 +80,7 @@ static uint32_t imx_epit_get_freq(IMXEPITState *s)
     uint32_t prescaler = 1 + extract32(s->cr, CR_PRESCALE_SHIFT, CR_PRESCALE_BITS);
     uint32_t f_in = imx_ccm_get_clock_frequency(s->ccm, imx_epit_clocks[clksrc]);
     uint32_t freq = f_in / prescaler;
-    trace_imx_epit_get_freq(freq);
+    DPRINTF("ptimer frequency is %u\n", freq);
     return freq;
 }
 
@@ -135,7 +146,8 @@ static uint64_t imx_epit_read(void *opaque, hwaddr offset, unsigned size)
                       HWADDR_PRIx "\n", TYPE_IMX_EPIT, __func__, offset);
         break;
     }
-    trace_imx_epit_read(imx_epit_reg_name(offset >> 2), reg_value);
+
+    DPRINTF("(%s) = 0x%08x\n", imx_epit_reg_name(offset >> 2), reg_value);
 
     return reg_value;
 }
@@ -316,7 +328,8 @@ static void imx_epit_write(void *opaque, hwaddr offset, uint64_t value,
 {
     IMXEPITState *s = IMX_EPIT(opaque);
 
-    trace_imx_epit_write(imx_epit_reg_name(offset >> 2), value);
+    DPRINTF("(%s, value = 0x%08x)\n", imx_epit_reg_name(offset >> 2),
+            (uint32_t)value);
 
     switch (offset >> 2) {
     case 0: /* CR */
@@ -349,7 +362,7 @@ static void imx_epit_cmp(void *opaque)
     /* The cmp ptimer can't be running when the peripheral is disabled */
     assert(s->cr & CR_EN);
 
-    trace_imx_epit_cmp(s->sr);
+    DPRINTF("sr was %d\n", s->sr);
     /* Set interrupt status bit SR.OCIF and update the interrupt state */
     s->sr |= SR_OCIF;
     imx_epit_update_int(s);
@@ -385,6 +398,8 @@ static void imx_epit_realize(DeviceState *dev, Error **errp)
 {
     IMXEPITState *s = IMX_EPIT(dev);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+    DPRINTF("\n");
 
     sysbus_init_irq(sbd, &s->irq);
     memory_region_init_io(&s->iomem, OBJECT(s), &imx_epit_ops, s, TYPE_IMX_EPIT,

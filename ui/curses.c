@@ -411,19 +411,11 @@ static void curses_refresh(DisplayChangeListener *dcl)
     }
 }
 
-static void curses_cleanup(void)
+static void curses_atexit(void)
 {
-    if (!dcl) {
-        return;
-    }
-
     endwin();
-    qemu_console_unregister_listener(dcl);
-    g_clear_pointer(&dcl, g_free);
-    g_clear_pointer(&screenpad, delwin);
-    g_clear_pointer(&vga_to_curses, g_free);
-    g_clear_pointer(&screen, g_free);
-    g_clear_pointer(&kbd_layout, kbd_layout_free);
+    g_free(vga_to_curses);
+    g_free(screen);
 }
 
 /*
@@ -807,6 +799,8 @@ static void curses_display_init(DisplayState *ds, DisplayOptions *opts)
     vga_to_curses = g_new0(cchar_t, 256);
     curses_setup();
     curses_keyboard_setup();
+    atexit(curses_atexit);
+
     curses_winch_init();
 
     dcl = g_new0(DisplayChangeListener, 1);
@@ -818,7 +812,6 @@ static void curses_display_init(DisplayState *ds, DisplayOptions *opts)
 static QemuDisplay qemu_display_curses = {
     .type       = DISPLAY_TYPE_CURSES,
     .init       = curses_display_init,
-    .cleanup    = curses_cleanup,
 };
 
 static void register_curses(void)

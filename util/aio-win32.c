@@ -16,6 +16,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/timer.h"
+#include "qemu/lab-slow.h"
 #include "block/block.h"
 #include "qemu/main-loop.h"
 #include "qemu/lockcnt.h"
@@ -269,7 +271,12 @@ static bool aio_dispatch_handlers(AioContext *ctx, HANDLE event)
             (revents || event_notifier_get_handle(node->e) == event) &&
             node->io_notify) {
             node->pfd.revents = 0;
-            node->io_notify(node->e);
+            {
+                int64_t lab_t = qemu_lab_slow_begin();
+
+                node->io_notify(node->e);
+                qemu_lab_slow_end("aio-notify", NULL, (const void *)node->io_notify, lab_t);
+            }
 
             /* aio_notify() does not count as progress */
             if (node->e != &ctx->notifier) {
@@ -281,7 +288,10 @@ static bool aio_dispatch_handlers(AioContext *ctx, HANDLE event)
             (node->io_read || node->io_write)) {
             node->pfd.revents = 0;
             if ((revents & G_IO_IN) && node->io_read) {
+                int64_t lab_t = qemu_lab_slow_begin();
+
                 node->io_read(node->opaque);
+                qemu_lab_slow_end("aio-read", NULL, (const void *)node->io_read, lab_t);
                 progress = true;
             }
             if ((revents & G_IO_OUT) && node->io_write) {

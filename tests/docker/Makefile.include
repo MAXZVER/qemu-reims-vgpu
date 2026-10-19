@@ -16,8 +16,9 @@ DOCKER_DEFAULT_REGISTRY := registry.gitlab.com/qemu-project/qemu
 endif
 DOCKER_REGISTRY := $(if $(REGISTRY),$(REGISTRY),$(DOCKER_DEFAULT_REGISTRY))
 
-CONTAINER_COMMAND ?= $(shell $(SRC_PATH)/tests/docker/docker.py probe)
-DOCKER_SCRIPT=$(SRC_PATH)/tests/docker/docker.py --command "$(CONTAINER_COMMAND)"
+CONTAINER_ENGINE = auto
+DOCKER_SCRIPT=$(SRC_PATH)/tests/docker/docker.py --engine $(CONTAINER_ENGINE)
+RUNC ?= $(shell $(DOCKER_SCRIPT) probe)
 
 CUR_TIME := $(shell date +%Y-%m-%d-%H.%M.%S.$$$$)
 DOCKER_SRC_COPY := $(BUILD_DIR)/docker-src.$(CUR_TIME)
@@ -40,7 +41,7 @@ docker-qemu-src: $(DOCKER_SRC_COPY)
 # General rule for building docker images.
 docker-image-%: $(DOCKER_FILES_DIR)/%.docker
 	  $(call quiet-command,			\
-		DOCKER_BUILDKIT=1 $(CONTAINER_COMMAND) build \
+		DOCKER_BUILDKIT=1 $(RUNC) build		\
 		$(if $(DOCKER_V),,--quiet)		\
 		$(if $(NOCACHE),--no-cache,		\
 			$(if $(DOCKER_REGISTRY),--cache-from $(DOCKER_REGISTRY)/qemu/$*)) \
@@ -151,7 +152,7 @@ $(foreach i,$(filter-out $(DOCKER_PARTIAL_IMAGES),$(DOCKER_IMAGES)), \
 )
 
 docker:
-	@echo 'Build QEMU and run tests inside $(CONTAINER_COMMAND) containers'
+	@echo 'Build QEMU and run tests inside $(RUNC) containers'
 	@echo
 	@echo 'Available targets:'
 	@echo
@@ -218,10 +219,10 @@ docker-run: docker-qemu-src
 			$(IMAGE) --executable $(EXECUTABLE),		\
 			"  COPYING $(EXECUTABLE) to $(IMAGE)"))
 	$(call quiet-command,						\
-		$(CONTAINER_COMMAND) run 				\
+		$(RUNC) run 						\
 			--rm						\
 			$(if $(NOUSER),,				\
-				$(if $(filter docker,$(CONTAINER_COMMAND)), \
+				$(if $(filter docker,$(RUNC)),		\
 					-u $(UID),			\
 					--userns keep-id		\
 				)					\

@@ -14,7 +14,18 @@
 #include "qemu/osdep.h"
 #include "hw/misc/imx_ccm.h"
 #include "qemu/module.h"
-#include "trace.h"
+
+#ifndef DEBUG_IMX_CCM
+#define DEBUG_IMX_CCM 0
+#endif
+
+#define DPRINTF(fmt, args...) \
+    do { \
+        if (DEBUG_IMX_CCM) { \
+            fprintf(stderr, "[%s]%s: " fmt , TYPE_IMX_CCM, \
+                                             __func__, ##args); \
+        } \
+    } while (0)
 
 
 uint32_t imx_ccm_get_clock_frequency(IMXCCMState *dev, IMXClk clock)
@@ -26,7 +37,7 @@ uint32_t imx_ccm_get_clock_frequency(IMXCCMState *dev, IMXClk clock)
         freq = klass->get_clock_frequency(dev, clock);
     }
 
-    trace_imx_ccm_get_clock_frequency(clock, freq);
+    DPRINTF("(clock = %d) = %u\n", clock, freq);
 
     return freq;
 }
@@ -53,7 +64,8 @@ uint32_t imx_ccm_calc_pll(uint32_t pllreg, uint32_t base_freq)
     freq = ((2 * (base_freq >> 10) * (mfi * mfd + mfn)) /
             (mfd * pd)) << 10;
 
-    trace_imx_ccm_calc_pll(pllreg, base_freq, freq);
+    DPRINTF("(pllreg = 0x%08x, base_freq = %u) = %d\n", pllreg, base_freq,
+            freq);
 
     return freq;
 }

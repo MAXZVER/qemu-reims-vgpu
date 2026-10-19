@@ -37,6 +37,7 @@
 #include "qemu/error-report.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
+#include "qemu/bswap.h"
 #include "qom/object.h"
 #include "hw/acpi/acpi_aml_interface.h"
 
@@ -91,9 +92,12 @@ static char default_osk[64] = "This is a dummy key. Enter the real key "
 struct AppleSMCData {
     uint8_t len;
     const char *key;
+    const char *type;
     const char *data;
     QLIST_ENTRY(AppleSMCData) node;
 };
+
+#define APPLESMC_MAX_KEYS 16
 
 OBJECT_DECLARE_SIMPLE_TYPE(AppleSMCState, APPLE_SMC)
 
@@ -115,7 +119,67 @@ struct AppleSMCState {
     uint8_t data[255];
     char *osk;
     QLIST_HEAD(, AppleSMCData) data_def;
+    /* The keys in the SMC's own order (ascending), for GET_KEY_BY_INDEX. */
+    const struct AppleSMCData *sorted[APPLESMC_MAX_KEYS];
+    uint32_t nkeys;
+    uint8_t nkeys_be[4];
 };
+
+/*
+ * TEMP lab (devices agent, 2026-10-07): QEMU_LAB_SMC=1 prints, once a second,
+ * the SMC commands the guest sent and the keys it read. The idle Tahoe guest
+ * drives ~200k I/O-port exits a second on this device.
+ */
+static void applesmc_lab_count(uint8_t cmd, const uint8_t *key)
+{
+    static int on = -1;
+    static int64_t last;
+    static uint32_t cmds[256];
+    static char keys[8][5];
+    static uint32_t keyn[8];
+    int64_t now;
+    int i;
+
+    if (on < 0) {
+        const char *e = getenv("QEMU_LAB_SMC");
+        on = e && *e == '1';
+    }
+    if (!on) {
+        return;
+    }
+    if (key) {
+        for (i = 0; i < 8; i++) {
+            if (!keyn[i] || !memcmp(keys[i], key, 4)) {
+                memcpy(keys[i], key, 4);
+                keys[i][4] = 0;
+                keyn[i]++;
+                break;
+            }
+        }
+    } else {
+        cmds[cmd]++;
+    }
+    now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    if (now - last >= 1000) {
+        GString *g = g_string_new("lab-smc cmds");
+        for (i = 0; i < 256; i++) {
+            if (cmds[i]) {
+                g_string_append_printf(g, " 0x%02x:%u", i, cmds[i]);
+                cmds[i] = 0;
+            }
+        }
+        g_string_append(g, " keys");
+        for (i = 0; i < 8; i++) {
+            if (keyn[i]) {
+                g_string_append_printf(g, " '%s':%u", keys[i], keyn[i]);
+                keyn[i] = 0;
+            }
+        }
+        fprintf(stderr, "%s\n", g->str);
+        g_string_free(g, true);
+        last = now;
+    }
+}
 
 static void applesmc_io_cmd_write(void *opaque, hwaddr addr, uint64_t val,
                                   unsigned size)
@@ -124,8 +188,14 @@ static void applesmc_io_cmd_write(void *opaque, hwaddr addr, uint64_t val,
     uint8_t status = s->status & 0x0f;
 
     smc_debug("CMD received: 0x%02x\n", (uint8_t)val);
+    applesmc_lab_count((uint8_t)val, NULL);
+    if (getenv("QEMU_LAB_SMC_OLD") && val != APPLESMC_READ_CMD) {
+        val = 0xff;     /* TEMP lab A/B: the old device, which refused these */
+    }
     switch (val) {
     case APPLESMC_READ_CMD:
+    case APPLESMC_GET_KEY_BY_INDEX_CMD:
+    case APPLESMC_GET_KEY_TYPE_CMD:
         /* did last command run through OK? */
         if (status == APPLESMC_ST_CMD_DONE || status == APPLESMC_ST_NEW_CMD) {
             s->cmd = val;
@@ -143,6 +213,50 @@ static void applesmc_io_cmd_write(void *opaque, hwaddr addr, uint64_t val,
     }
     s->read_pos = 0;
     s->data_pos = 0;
+}
+
+/*
+ * TEMP lab (Opus, 2026-10-07): with QEMU_LAB_SMC=1, every key the guest asked
+ * for (read or type) that this SMC does not have, with how many times, since
+ * boot - one "lab-smc missing" line every 5 s while the set grows or is asked.
+ * What macOS looks for and gets "no such key" (PerfPowerServices enumerating
+ * forever was one such gap).
+ */
+static void applesmc_lab_missing(uint8_t cmd, const char *key)
+{
+    static GHashTable *seen;
+    static int64_t last;
+    static uint64_t asked;
+    char k[8];
+    gpointer n;
+    int64_t now;
+
+    if (!getenv("QEMU_LAB_SMC")) {
+        return;
+    }
+    if (!seen) {
+        seen = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    }
+    snprintf(k, sizeof(k), "%c%.4s", cmd == APPLESMC_READ_CMD ? 'r' : 't', key);
+    n = g_hash_table_lookup(seen, k);
+    g_hash_table_insert(seen, g_strdup(k), GUINT_TO_POINTER(GPOINTER_TO_UINT(n) + 1));
+    asked++;
+    now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    if (now - last >= 5000) {
+        GString *g = g_string_new("lab-smc missing");
+        GHashTableIter it;
+        gpointer kk, vv;
+
+        g_string_append_printf(g, " asked=%" PRIu64 " distinct=%u", asked,
+                               g_hash_table_size(seen));
+        g_hash_table_iter_init(&it, seen);
+        while (g_hash_table_iter_next(&it, &kk, &vv)) {
+            g_string_append_printf(g, " %s:%u", (char *)kk, GPOINTER_TO_UINT(vv));
+        }
+        fprintf(stderr, "%s\n", g->str);
+        g_string_free(g, true);
+        last = now;
+    }
 }
 
 static const struct AppleSMCData *applesmc_find_key(AppleSMCState *s)
@@ -165,6 +279,58 @@ static void applesmc_io_data_write(void *opaque, hwaddr addr, uint64_t val,
 
     smc_debug("DATA received: 0x%02x\n", (uint8_t)val);
     switch (s->cmd) {
+    case APPLESMC_GET_KEY_BY_INDEX_CMD:
+    case APPLESMC_GET_KEY_TYPE_CMD:
+        /*
+         * Four bytes (the big-endian index, or the key), then the answer.
+         * macOS sends no length byte here: it waits for the answer after the
+         * fourth byte (with one expected, the idle Tahoe guest polled the
+         * status ~8000 times a second until its timeout). A length byte that
+         * does come is taken and ignored. A guest that cannot enumerate the
+         * keys retries without end: before this command was answered at all
+         * the idle guest sent GET_KEY_BY_INDEX ~34000 times a second, ~200k
+         * port exits.
+         */
+        if ((s->status & 0x0f) == APPLESMC_ST_CMD_DONE) {
+            break;
+        }
+        if (s->read_pos < 3) {
+            s->key[s->read_pos] = val;
+            s->status = APPLESMC_ST_ACK;
+        } else if (s->read_pos == 3) {
+            s->key[3] = val;
+            if (s->cmd == APPLESMC_GET_KEY_BY_INDEX_CMD) {
+                uint32_t i = ldl_be_p(s->key);
+
+                d = i < s->nkeys ? s->sorted[i] : NULL;
+                if (d) {
+                    memcpy(s->data, d->key, 4);
+                    s->data_len = 4;
+                }
+            } else {
+                d = applesmc_find_key(s);
+                if (d) {
+                    s->data[0] = d->len;
+                    memcpy(s->data + 1, d->type, 4);
+                    s->data[5] = 0x80;          /* readable */
+                    s->data_len = 6;
+                }
+            }
+            s->data_pos = 0;
+            if (d) {
+                s->status = APPLESMC_ST_ACK | APPLESMC_ST_DATA_READY;
+                s->status_1e = APPLESMC_ST_CMD_DONE;
+            } else {
+                s->status = APPLESMC_ST_CMD_DONE;
+                s->status_1e = s->cmd == APPLESMC_GET_KEY_BY_INDEX_CMD ?
+                    APPLESMC_ST_1E_BAD_INDEX : APPLESMC_ST_1E_NOEXIST;
+                if (s->cmd != APPLESMC_GET_KEY_BY_INDEX_CMD) {
+                    applesmc_lab_missing(s->cmd, (const char *)s->key);
+                }
+            }
+        }
+        s->read_pos++;
+        break;
     case APPLESMC_READ_CMD:
         if ((s->status & 0x0f) == APPLESMC_ST_CMD_DONE) {
             break;
@@ -173,6 +339,7 @@ static void applesmc_io_data_write(void *opaque, hwaddr addr, uint64_t val,
             s->key[s->read_pos] = val;
             s->status = APPLESMC_ST_ACK;
         } else if (s->read_pos == 4) {
+            applesmc_lab_count(0, (const uint8_t *)s->key);
             d = applesmc_find_key(s);
             if (d != NULL) {
                 memcpy(s->data, d->data, d->len);
@@ -185,6 +352,7 @@ static void applesmc_io_data_write(void *opaque, hwaddr addr, uint64_t val,
                           s->key[0], s->key[1], s->key[2], s->key[3]);
                 s->status = APPLESMC_ST_CMD_DONE;
                 s->status_1e = APPLESMC_ST_1E_NOEXIST;
+                applesmc_lab_missing(s->cmd, (const char *)s->key);
             }
         }
         s->read_pos++;
@@ -208,6 +376,8 @@ static uint64_t applesmc_io_data_read(void *opaque, hwaddr addr, unsigned size)
 
     switch (s->cmd) {
     case APPLESMC_READ_CMD:
+    case APPLESMC_GET_KEY_BY_INDEX_CMD:
+    case APPLESMC_GET_KEY_TYPE_CMD:
         if (!(s->status & APPLESMC_ST_DATA_READY)) {
             break;
         }
@@ -241,6 +411,27 @@ static uint64_t applesmc_io_cmd_read(void *opaque, hwaddr addr, unsigned size)
     AppleSMCState *s = opaque;
 
     smc_debug("CMD sent: 0x%02x\n", s->status);
+    if (getenv("QEMU_LAB_SMC")) {
+        /* TEMP lab: status polls by (command, status, key, step) */
+        static uint32_t n;
+        static char last[64];
+        static int64_t t;
+        char now[64];
+        int64_t ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+
+        snprintf(now, sizeof(now), "cmd=0x%02x st=0x%02x e=0x%02x key='%.4s' pos=%u/%u",
+                 s->cmd, s->status, s->status_1e, s->key, s->read_pos,
+                 s->data_pos);
+        if (strcmp(now, last) || ms - t >= 1000) {
+            if (n > 50) {
+                fprintf(stderr, "lab-smc polls %u x %s\n", n, last);
+            }
+            n = 0;
+            t = ms;
+            memcpy(last, now, sizeof(last));
+        }
+        n++;
+    }
     return s->status;
 }
 
@@ -254,16 +445,44 @@ static uint64_t applesmc_io_err_read(void *opaque, hwaddr addr, unsigned size)
 }
 
 static void applesmc_add_key(AppleSMCState *s, const char *key,
-                             int len, const char *data)
+                             const char *type, int len, const char *data)
 {
     struct AppleSMCData *def;
 
     def = g_new0(struct AppleSMCData, 1);
     def->key = key;
+    def->type = type;
     def->len = len;
     def->data = data;
 
     QLIST_INSERT_HEAD(&s->data_def, def, node);
+}
+
+static int applesmc_key_cmp(const void *a, const void *b)
+{
+    const struct AppleSMCData *x = *(const struct AppleSMCData *const *)a;
+    const struct AppleSMCData *y = *(const struct AppleSMCData *const *)b;
+
+    return memcmp(x->key, y->key, 4);
+}
+
+/* "#KEY" (the key count) and the ascending index GET_KEY_BY_INDEX walks. */
+static void applesmc_index_keys(AppleSMCState *s)
+{
+    struct AppleSMCData *d;
+
+    s->nkeys = 1;                       /* "#KEY" itself */
+    QLIST_FOREACH(d, &s->data_def, node) {
+        s->nkeys++;
+    }
+    assert(s->nkeys <= APPLESMC_MAX_KEYS);
+    stl_be_p(s->nkeys_be, s->nkeys);
+    applesmc_add_key(s, "#KEY", "ui32", 4, (const char *)s->nkeys_be);
+    s->nkeys = 0;
+    QLIST_FOREACH(d, &s->data_def, node) {
+        s->sorted[s->nkeys++] = d;
+    }
+    qsort(s->sorted, s->nkeys, sizeof(s->sorted[0]), applesmc_key_cmp);
 }
 
 static void qdev_applesmc_isa_reset(DeviceState *dev)
@@ -330,12 +549,13 @@ static void applesmc_isa_realize(DeviceState *dev, Error **errp)
     }
 
     QLIST_INIT(&s->data_def);
-    applesmc_add_key(s, "REV ", 6, "\x01\x13\x0f\x00\x00\x03");
-    applesmc_add_key(s, "OSK0", 32, s->osk);
-    applesmc_add_key(s, "OSK1", 32, s->osk + 32);
-    applesmc_add_key(s, "NATJ", 1, "\x00");
-    applesmc_add_key(s, "MSSP", 1, "\x00");
-    applesmc_add_key(s, "MSSD", 1, "\x03");
+    applesmc_add_key(s, "REV ", "{rev", 6, "\x01\x13\x0f\x00\x00\x03");
+    applesmc_add_key(s, "OSK0", "ch8*", 32, s->osk);
+    applesmc_add_key(s, "OSK1", "ch8*", 32, s->osk + 32);
+    applesmc_add_key(s, "NATJ", "ui8 ", 1, "\0");
+    applesmc_add_key(s, "MSSP", "ui8 ", 1, "\0");
+    applesmc_add_key(s, "MSSD", "si8 ", 1, "\0x3");
+    applesmc_index_keys(s);
 }
 
 static void applesmc_unrealize(DeviceState *dev)

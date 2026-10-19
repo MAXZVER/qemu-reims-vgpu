@@ -157,8 +157,7 @@ ENV MAKE="/usr/bin/make"
 ENV NINJA="/usr/bin/ninja"
 ENV PYTHON="/usr/bin/python3"
 # netmap/cscope/global
-RUN apt update && \
-  DEBIAN_FRONTEND=noninteractive eatmydata \
+RUN DEBIAN_FRONTEND=noninteractive eatmydata \
   apt install -y --no-install-recommends \
   cscope\
   global\

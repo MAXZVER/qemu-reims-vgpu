@@ -72,7 +72,6 @@ undocumented; you can get a complete list by running
    riscv/mips
    riscv/shakti-c
    riscv/sifive_u
-   riscv/tt_atlantis
    riscv/virt
    riscv/xiangshan-kunminghu
 

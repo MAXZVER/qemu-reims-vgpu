@@ -109,8 +109,13 @@ void tcg_handle_interrupt(CPUState *cpu, int mask)
     }
 }
 
+static bool tcg_supports_guest_debug(void)
+{
+    return true;
+}
+
 /* Translate GDB watchpoint type to a flags value for cpu_watchpoint_* */
-static inline int xlat_gdb_type(CPUState *cpu, GdbBreakpointType gdbtype)
+static inline int xlat_gdb_type(CPUState *cpu, int gdbtype)
 {
     static const int xlat[] = {
         [GDB_WATCHPOINT_WRITE]  = BP_GDB | BP_MEM_WRITE,
@@ -126,8 +131,7 @@ static inline int xlat_gdb_type(CPUState *cpu, GdbBreakpointType gdbtype)
     return cputype;
 }
 
-static int tcg_insert_gdbstub_breakpoint(CPUState *cs, GdbBreakpointType type,
-                                         vaddr addr, vaddr len)
+static int tcg_insert_breakpoint(CPUState *cs, int type, vaddr addr, vaddr len)
 {
     CPUState *cpu;
     int err = 0;
@@ -158,8 +162,7 @@ static int tcg_insert_gdbstub_breakpoint(CPUState *cs, GdbBreakpointType type,
     }
 }
 
-static int tcg_remove_gdbstub_breakpoint(CPUState *cs, GdbBreakpointType type,
-                                         vaddr addr, vaddr len)
+static int tcg_remove_breakpoint(CPUState *cs, int type, vaddr addr, vaddr len)
 {
     CPUState *cpu;
     int err = 0;
@@ -190,7 +193,7 @@ static int tcg_remove_gdbstub_breakpoint(CPUState *cs, GdbBreakpointType type,
     }
 }
 
-static void tcg_remove_all_gdbstub_breakpoints(CPUState *cpu)
+static inline void tcg_remove_all_breakpoints(CPUState *cpu)
 {
     cpu_breakpoint_remove_all(cpu, BP_GDB);
     cpu_watchpoint_remove_all(cpu, BP_GDB);
@@ -218,9 +221,10 @@ static void tcg_accel_ops_init(AccelClass *ac)
     }
 
     ops->cpu_reset_hold = tcg_cpu_reset_hold;
-    ops->insert_gdbstub_breakpoint = tcg_insert_gdbstub_breakpoint;
-    ops->remove_gdbstub_breakpoint = tcg_remove_gdbstub_breakpoint;
-    ops->remove_all_gdbstub_breakpoints = tcg_remove_all_gdbstub_breakpoints;
+    ops->supports_guest_debug = tcg_supports_guest_debug;
+    ops->insert_breakpoint = tcg_insert_breakpoint;
+    ops->remove_breakpoint = tcg_remove_breakpoint;
+    ops->remove_all_breakpoints = tcg_remove_all_breakpoints;
 }
 
 static void tcg_accel_ops_class_init(ObjectClass *oc, const void *data)

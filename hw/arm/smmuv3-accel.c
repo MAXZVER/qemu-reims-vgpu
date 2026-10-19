@@ -441,13 +441,8 @@ bool smmuv3_accel_issue_inv_cmd(SMMUv3State *bs, void *cmd, SMMUDevice *sdev,
                    sizeof(Cmd), &entry_num, cmd, errp);
 }
 
-/*
- * Returns  0 on success (buf is populated and valid).
- * Returns  1 if the read should be retried (EAGAIN/EINTR).
- * Returns -1 on error with @errp set.
- */
-int smmuv3_accel_event_read_validate(IOMMUFDVeventq *veventq, uint32_t type,
-                                     void *buf, size_t size, Error **errp)
+bool smmuv3_accel_event_read_validate(IOMMUFDVeventq *veventq, uint32_t type,
+                                      void *buf, size_t size, Error **errp)
 {
     uint32_t last_seq = veventq->last_event_seq;
     uint32_t id = veventq->veventq_id;
@@ -457,22 +452,22 @@ int smmuv3_accel_event_read_validate(IOMMUFDVeventq *veventq, uint32_t type,
     bytes = read(veventq->veventq_fd, buf, size);
     if (bytes <= 0) {
         if (errno == EAGAIN || errno == EINTR) {
-            return 1;
+            return true;
         }
         error_setg(errp, "vEVENTQ(type %u id %u): read failed (%m)", type, id);
-        return -1;
+        return false;
     }
     hdr = (struct iommufd_vevent_header *)buf;
     if (bytes == sizeof(*hdr) &&
         (hdr->flags & IOMMU_VEVENTQ_FLAG_LOST_EVENTS)) {
         error_setg(errp, "vEVENTQ(type %u id %u): overflowed", type, id);
         veventq->event_start = false;
-        return -1;
+        return false;
     }
     if (bytes < size) {
         error_setg(errp, "vEVENTQ(type %u id %u): short read(%zd/%zd bytes)",
                           type, id, bytes, size);
-        return -1;
+        return false;
     }
     /* Check sequence in hdr for lost events if any */
     if (veventq->event_start && (hdr->sequence - last_seq != 1)) {
@@ -481,7 +476,7 @@ int smmuv3_accel_event_read_validate(IOMMUFDVeventq *veventq, uint32_t type,
     }
     veventq->last_event_seq = hdr->sequence;
     veventq->event_start = true;
-    return 0;
+    return true;
 }
 
 static void smmuv3_accel_event_read(void *opaque)
@@ -493,17 +488,12 @@ static void smmuv3_accel_event_read(void *opaque)
         struct iommu_vevent_arm_smmuv3 vevent;
     } buf;
     Error *local_err = NULL;
-    int ret;
 
-    ret = smmuv3_accel_event_read_validate(veventq,
-                                           IOMMU_VEVENTQ_TYPE_ARM_SMMUV3, &buf,
-                                           sizeof(buf), &local_err);
-    if (ret < 0) {
+    if (!smmuv3_accel_event_read_validate(veventq,
+                                          IOMMU_VEVENTQ_TYPE_ARM_SMMUV3, &buf,
+                                          sizeof(buf), &local_err)) {
         warn_report_err_once(local_err);
         return;
-    }
-    if (ret > 0) {
-        return; /* EAGAIN/EINTR */
     }
     smmuv3_propagate_event(s, (Evt *)&buf.vevent);
 }

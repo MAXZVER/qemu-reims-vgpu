@@ -20,10 +20,18 @@
 #include "qemu/log.h"
 #include "qemu/error-report.h"
 #include "qemu/lockable.h"
+#include "qemu/timer.h"
 #include "system/runstate.h"
 #include "trace.h"
 #include "qapi/error.h"
 #include "hw/audio/virtio-snd.h"
+#include "system/iothread.h"      /* TEMP lab QEMU_VSND_DIRECT */
+#include "qemu/aio-wait.h"
+#include "hw/virtio/virtio-bus.h"
+#include "system/memory.h"
+#ifdef CONFIG_SDL
+#include <SDL.h>
+#endif
 
 #define VIRTIO_SOUND_VM_VERSION 1
 #define VIRTIO_SOUND_JACK_DEFAULT 0
@@ -36,6 +44,14 @@ static void virtio_snd_process_cmdq(VirtIOSound *s);
 static void virtio_snd_pcm_flush(VirtIOSoundPCMStream *stream);
 static void virtio_snd_pcm_in_cb(void *data, int available);
 static void virtio_snd_unrealize(DeviceState *dev);
+static void vsnd_lab_note_tx(size_t size);   /* TEMP lab (QEMU_VSND_EARLY_PCT) */
+static void vsnd_lab_jitter_admit(VirtIOSoundPCMStream *stream);   /* TEMP lab (QEMU_VSND_JITTER_MS) */
+static unsigned vsnd_lab_jitter_ms(void);
+static void vsnd_lab_sdl_open(VirtIOSoundPCMStream *stream);    /* TEMP lab (QEMU_VSND_DIRECT) */
+static void vsnd_lab_sdl_close(VirtIOSoundPCMStream *stream);
+static void vsnd_lab_sdl_pause(VirtIOSoundPCMStream *stream, bool pause);
+static bool vsnd_direct_on(void);
+static size_t vsnd_lab_ms_bytes(VirtIOSoundPCMStream *stream, unsigned ms);
 
 static uint32_t supported_formats = BIT(VIRTIO_SND_PCM_FMT_S8)
                                   | BIT(VIRTIO_SND_PCM_FMT_U8)
@@ -289,6 +305,11 @@ uint32_t virtio_snd_set_pcm_params(VirtIOSound *s,
     st_params->channels = params->channels;
     st_params->format = params->format;
     st_params->rate = params->rate;
+    /* TEMP lab (2026-10-13, audio clicks): how much the guest queues ahead. */
+    fprintf(stderr, "virtio-snd: stream %u params: buffer %u bytes, period %u bytes, "
+            "%u ch, format %u, rate idx %u\n", stream_id, st_params->buffer_bytes,
+            st_params->period_bytes, st_params->channels, st_params->format,
+            st_params->rate);
 
     return cpu_to_le32(VIRTIO_SND_S_OK);
 }
@@ -400,6 +421,7 @@ static void virtio_snd_get_qemu_audsettings(audsettings *as,
 static void virtio_snd_pcm_close(VirtIOSoundPCMStream *stream)
 {
     if (stream) {
+        vsnd_lab_sdl_close(stream);   /* TEMP lab (QEMU_VSND_DIRECT): its callback reads the queue */
         virtio_snd_pcm_flush(stream);
         if (stream->info.direction == VIRTIO_SND_D_OUTPUT) {
             audio_be_close_out(stream->s->audio_be, stream->voice.out);
@@ -475,6 +497,10 @@ static uint32_t virtio_snd_pcm_prepare(VirtIOSound *s, uint32_t stream_id)
                                          virtio_snd_pcm_out_cb,
                                          &as);
         audio_be_set_volume_out_lr(s->audio_be, stream->voice.out, 0, 255, 255);
+        if (s->lab_direct) {   /* TEMP lab (QEMU_VSND_DIRECT): played from its own SDL device */
+            vsnd_lab_sdl_close(stream);
+            vsnd_lab_sdl_open(stream);
+        }
     } else {
         stream->voice.in = audio_be_open_in(s->audio_be,
                                         stream->voice.in,
@@ -570,9 +596,14 @@ static void virtio_snd_handle_pcm_start_stop(VirtIOSound *s,
     if (stream) {
         WITH_QEMU_LOCK_GUARD(&stream->queue_mutex) {
             stream->active = start;
+            stream->lab_primed = false;   /* TEMP lab (QEMU_VSND_JITTER_MS) */
         }
         if (stream->info.direction == VIRTIO_SND_D_OUTPUT) {
             audio_be_set_active_out(s->audio_be, stream->voice.out, start);
+            if (stream->lab_direct) {   /* TEMP lab (QEMU_VSND_DIRECT) */
+                vsnd_lab_sdl_pause(stream, !start);
+                qemu_bh_schedule(stream->lab_bh);   /* a stop gives the queued periods back */
+            }
         } else {
             audio_be_set_active_in(s->audio_be, stream->voice.in, start);
         }
@@ -863,6 +894,9 @@ static void virtio_snd_handle_tx_xfer(VirtIODevice *vdev, VirtQueue *vq)
         return;
     }
     trace_virtio_snd_handle_tx_xfer();
+    if (vsnd->lab_direct) {
+        qemu_mutex_lock(&vsnd->lab_tx_mutex);   /* TEMP lab (QEMU_VSND_DIRECT): this runs in the IOThread */
+    }
 
     for (;;) {
         VirtIOSoundPCMStream *stream;
@@ -900,10 +934,13 @@ static void virtio_snd_handle_tx_xfer(VirtIODevice *vdev, VirtQueue *vq)
             buffer->populated = false;
             buffer->vq = vq;
             buffer->size = size;
+            buffer->full = size;
             buffer->offset = 0;
             stream->latency_bytes += size;
+            vsnd_lab_note_tx(size);   /* TEMP lab (QEMU_VSND_EARLY_PCT) */
 
             QSIMPLEQ_INSERT_TAIL(&stream->queue, buffer, entry);
+            vsnd_lab_jitter_admit(stream);   /* TEMP lab (QEMU_VSND_JITTER_MS): back to the guest at once */
         }
         continue;
 
@@ -917,6 +954,9 @@ tx_err:
 
     if (must_empty_invalid_queue) {
         empty_invalid_queue(vdev, vq);
+    }
+    if (vsnd->lab_direct) {
+        qemu_mutex_unlock(&vsnd->lab_tx_mutex);
     }
 }
 
@@ -945,6 +985,9 @@ static void virtio_snd_handle_rx_xfer(VirtIODevice *vdev, VirtQueue *vq)
         return;
     }
     trace_virtio_snd_handle_rx_xfer();
+    if (vsnd->lab_direct) {
+        qemu_mutex_lock(&vsnd->lab_tx_mutex);   /* TEMP lab (QEMU_VSND_DIRECT): `invalid` is shared with TX */
+    }
 
     for (;;) {
         VirtIOSoundPCMStream *stream;
@@ -995,6 +1038,9 @@ rx_err:
 
     if (must_empty_invalid_queue) {
         empty_invalid_queue(vdev, vq);
+    }
+    if (vsnd->lab_direct) {
+        qemu_mutex_unlock(&vsnd->lab_tx_mutex);
     }
 }
 
@@ -1089,6 +1135,26 @@ static void virtio_snd_realize(DeviceState *dev, Error **errp)
     qemu_mutex_init(&vsnd->cmdq_mutex);
     QTAILQ_INIT(&vsnd->cmdq);
     QSIMPLEQ_INIT(&vsnd->invalid);
+    if (vsnd_direct_on()) {   /* TEMP lab (QEMU_VSND_DIRECT) */
+        Error *lab_err = NULL;
+
+        vsnd->lab_io = iothread_create("virtio-snd-io", &lab_err);
+        if (!vsnd->lab_io) {
+            warn_report_err(lab_err);
+        } else {
+            vsnd->lab_ctx = iothread_get_aio_context(vsnd->lab_io);
+            qemu_mutex_init(&vsnd->lab_tx_mutex);
+#ifdef CONFIG_SDL
+            if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
+                vsnd->lab_direct = true;
+                fprintf(stderr, "virtio-snd: direct - TX queue in its own IOThread, output streams on their own "
+                        "SDL devices (QEMU_VSND_DIRECT)\n");
+            } else {
+                warn_report("virtio-snd: QEMU_VSND_DIRECT: SDL audio init failed: %s", SDL_GetError());
+            }
+#endif
+        }
+    }
 
     for (uint32_t i = 0; i < vsnd->snd_conf.streams; i++) {
         status = virtio_snd_set_pcm_params(vsnd, i, &default_params);
@@ -1113,6 +1179,142 @@ error_cleanup:
     virtio_snd_unrealize(dev);
 }
 
+/*
+ * TEMP lab (QEMU_VSND_EARLY_PCT=N, 2026-10-14): macOS's AppleVirtIOSound keeps one TX period (85 ms) out and hands
+ * the next only after that one completes, so a device that completes a period when its last byte reaches the audio
+ * backend starves while the guest turns around (journal 2026-10-07-devices, b380-b384). Its bytes are copied into
+ * `data` before any of them play, so the element can go back to the guest early: once no more than N % of the
+ * period is left unplayed, the guest gets it back and its next period arrives while this one still plays from the
+ * copy. 0 (default) keeps the stock behaviour. The device's latency report counts the copy until it has played.
+ */
+static unsigned vsnd_lab_early_pct(void)
+{
+    static int pct = -1;
+
+    if (pct < 0) {
+        const char *e = getenv("QEMU_VSND_EARLY_PCT");
+        pct = e ? MIN(100, MAX(0, atoi(e))) : 0;
+        fprintf(stderr, "virtio-snd: early return at %d %% of a period left (QEMU_VSND_EARLY_PCT)\n", pct);
+    }
+    return pct;
+}
+
+/* TEMP lab: TX periods, early returns, starvations and the guest's turnaround, one line every 5 s. */
+static struct {
+    QemuMutex lock;
+    int64_t window_ns, last_return_ns;
+    uint64_t tx, tx_bytes, early, final, starved, turn_n, turn_ns, turn_max_ns;
+} vsnd_lab;
+
+static void vsnd_lab_report_locked(int64_t now)
+{
+    if (!vsnd_lab.window_ns) {
+        vsnd_lab.window_ns = now;
+        return;
+    }
+    if (now - vsnd_lab.window_ns < 5 * NANOSECONDS_PER_SECOND) {
+        return;
+    }
+    fprintf(stderr, "virtio-snd-lab win_ms=%" PRId64 " tx=%" PRIu64 " tx_kb=%" PRIu64 " early=%" PRIu64
+            " final=%" PRIu64 " starved=%" PRIu64 " turn_avg_us=%" PRIu64 " turn_max_us=%" PRIu64 "\n",
+            (now - vsnd_lab.window_ns) / SCALE_MS, vsnd_lab.tx, vsnd_lab.tx_bytes >> 10, vsnd_lab.early,
+            vsnd_lab.final, vsnd_lab.starved,
+            vsnd_lab.turn_n ? vsnd_lab.turn_ns / vsnd_lab.turn_n / SCALE_US : 0, vsnd_lab.turn_max_ns / SCALE_US);
+    vsnd_lab.window_ns = now;
+    vsnd_lab.tx = vsnd_lab.tx_bytes = vsnd_lab.early = vsnd_lab.final = vsnd_lab.starved = 0;
+    vsnd_lab.turn_n = vsnd_lab.turn_ns = vsnd_lab.turn_max_ns = 0;
+}
+
+static void vsnd_lab_lock(void)
+{
+    static gsize done;
+
+    if (g_once_init_enter(&done)) {
+        qemu_mutex_init(&vsnd_lab.lock);
+        g_once_init_leave(&done, 1);
+    }
+    qemu_mutex_lock(&vsnd_lab.lock);
+}
+
+static void vsnd_lab_note_tx(size_t size)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+    vsnd_lab_lock();
+    vsnd_lab.tx++;
+    vsnd_lab.tx_bytes += size;
+    if (vsnd_lab.last_return_ns) {
+        int64_t turn = now - vsnd_lab.last_return_ns;
+
+        vsnd_lab.turn_n++;
+        vsnd_lab.turn_ns += turn;
+        vsnd_lab.turn_max_ns = MAX(vsnd_lab.turn_max_ns, (uint64_t)turn);
+        vsnd_lab.last_return_ns = 0;
+    }
+    vsnd_lab_report_locked(now);
+    qemu_mutex_unlock(&vsnd_lab.lock);
+}
+
+static void vsnd_lab_note_return(bool early)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+    vsnd_lab_lock();
+    if (early) {
+        vsnd_lab.early++;
+    } else {
+        vsnd_lab.final++;
+    }
+    vsnd_lab.last_return_ns = now;
+    vsnd_lab_report_locked(now);
+    qemu_mutex_unlock(&vsnd_lab.lock);
+}
+
+static void vsnd_lab_note_starved(void)
+{
+    vsnd_lab_lock();
+    vsnd_lab.starved++;
+    qemu_mutex_unlock(&vsnd_lab.lock);
+}
+
+/*
+ * TEMP lab (QEMU_VSND_LATENCY=0): the latency each TX status reports. b440: returning a period early made the guest
+ * wait that much longer before its next one (turnaround ~30 -> ~50 ms), as if it paces by the queued bytes this field
+ * reports; 0 tells it nothing is queued. Unset: the bytes still to play (stock).
+ */
+static uint32_t vsnd_lab_latency(VirtIOSoundPCMStream *s)
+{
+    static int report = -1;
+
+    if (report < 0) {
+        const char *e = getenv("QEMU_VSND_LATENCY");
+        report = !(e && !strcmp(e, "0"));
+        fprintf(stderr, "virtio-snd: TX latency report %s (QEMU_VSND_LATENCY)\n", report ? "queued bytes" : "0");
+    }
+    if (report && vsnd_lab_jitter_ms() && s->info.direction == VIRTIO_SND_D_OUTPUT) {
+        /*
+         * TEMP lab (QEMU_VSND_JITTER_HIDE=1): the cushion is the device's, not the guest's to spend. b455: macOS
+         * paces its next period by the latency each status reports, so a truthful report of the jitter buffer made
+         * it send that much later and the cushion drained (starved 73-91 per 5 s against 237-264 stock). Hidden,
+         * it sends as if the queue were short and the held-back period (no room: not returned) is the brake.
+         */
+        static int hide = -1;
+
+        if (hide < 0) {
+            const char *e = getenv("QEMU_VSND_JITTER_HIDE");
+            hide = e && !strcmp(e, "1");
+            fprintf(stderr, "virtio-snd: jitter cushion %s the latency report (QEMU_VSND_JITTER_HIDE)\n",
+                    hide ? "hidden from" : "counted in");
+        }
+        if (hide) {
+            size_t c = vsnd_lab_ms_bytes(s, vsnd_lab_jitter_ms());
+
+            return s->latency_bytes > c ? s->latency_bytes - c : 0;
+        }
+    }
+    return report ? s->latency_bytes : 0;
+}
+
 static inline void update_latency(VirtIOSoundPCMStream *s, size_t used)
 {
     s->latency_bytes = s->latency_bytes > used ?
@@ -1123,9 +1325,18 @@ static inline void return_tx_buffer(VirtIOSoundPCMStream *stream,
                                     VirtIOSoundPCMBuffer *buffer)
 {
     virtio_snd_pcm_status resp = { 0 };
+
+    if (buffer->returned) {
+        /* TEMP lab (QEMU_VSND_EARLY_PCT): the guest has had the element back; only the copy is left. */
+        update_latency(stream, buffer->size);
+        QSIMPLEQ_REMOVE(&stream->queue, buffer, VirtIOSoundPCMBuffer, entry);
+        virtio_snd_pcm_buffer_free(buffer);
+        return;
+    }
+    vsnd_lab_note_return(false);
     resp.status = cpu_to_le32(VIRTIO_SND_S_OK);
     update_latency(stream, buffer->size);
-    resp.latency_bytes = cpu_to_le32(stream->latency_bytes);
+    resp.latency_bytes = cpu_to_le32(vsnd_lab_latency(stream));
     iov_from_buf(buffer->elem->in_sg,
                  buffer->elem->in_num,
                  0,
@@ -1143,6 +1354,103 @@ static inline void return_tx_buffer(VirtIOSoundPCMStream *stream,
 }
 
 /*
+ * TEMP lab (QEMU_VSND_EARLY_PCT): give a populated TX element back to the guest while its copy in `data` still has
+ * `buffer->size` bytes to play; the buffer stays queued until they have.
+ */
+static inline void return_tx_buffer_early(VirtIOSoundPCMStream *stream,
+                                          VirtIOSoundPCMBuffer *buffer)
+{
+    virtio_snd_pcm_status resp = { 0 };
+
+    resp.status = cpu_to_le32(VIRTIO_SND_S_OK);
+    resp.latency_bytes = cpu_to_le32(vsnd_lab_latency(stream));
+    iov_from_buf(buffer->elem->in_sg, buffer->elem->in_num, 0, &resp, sizeof(virtio_snd_pcm_status));
+    virtqueue_push(buffer->vq, buffer->elem, sizeof(virtio_snd_pcm_status));
+    virtio_notify(VIRTIO_DEVICE(stream->s), buffer->vq);
+    g_free(buffer->elem);
+    buffer->elem = NULL;
+    buffer->returned = true;
+    vsnd_lab_note_return(true);
+}
+
+/*
+ * TEMP lab (QEMU_VSND_JITTER_MS=C, 2026-10-15): a jitter buffer in the device. macOS's AppleVirtIOSound keeps one
+ * 85 ms TX period out at a time and paces the next by its own clock and the latency we report, so a stock device
+ * that completes a period when its last byte reaches the backend runs dry on every turnaround, and any late vCPU
+ * (a UI transition stalls them 30-150 ms) is a gap. Here a TX period is copied and given back as it arrives, while
+ * at most C ms plus one period sit copied but unplayed (more waits in the queue, un-returned, until there is room);
+ * playback starts only once C ms are buffered, and again after an underrun. The latency report stays truthful: the
+ * copied bytes still to play. QEMU_VSND_JITTER_MS=0: stock (default 120 ms, b459).
+ */
+static unsigned vsnd_lab_jitter_ms(void)
+{
+    static int ms = -1;
+
+    if (ms < 0) {
+        const char *e = getenv("QEMU_VSND_JITTER_MS");
+        /*
+         * 120 ms by default since b459 (SDL backend into a real-time sink, canvas 5K + full-screen exit): usb-audio
+         * 5 gaps of 32-626 ms; virtio-sound with this cushion 0 gaps and 0 starvations after the start. 0: stock.
+         */
+        ms = e ? MIN(1000, MAX(0, atoi(e))) : 120;
+        fprintf(stderr, "virtio-snd: jitter buffer %d ms (QEMU_VSND_JITTER_MS)\n", ms);
+    }
+    return ms;
+}
+
+static size_t vsnd_lab_ms_bytes(VirtIOSoundPCMStream *stream, unsigned ms)
+{
+    size_t bps;
+
+    switch (stream->as.fmt) {
+    case AUDIO_FORMAT_U8:
+    case AUDIO_FORMAT_S8:
+        bps = 1;
+        break;
+    case AUDIO_FORMAT_U16:
+    case AUDIO_FORMAT_S16:
+        bps = 2;
+        break;
+    default:
+        bps = 4;
+        break;
+    }
+    return (size_t)stream->as.freq * stream->as.nchannels * bps * ms / 1000;
+}
+
+/* Give queued TX periods back to the guest while the unplayed copies stay within the cap. `queue_mutex` held. */
+static void vsnd_lab_jitter_admit(VirtIOSoundPCMStream *stream)
+{
+    VirtIOSoundPCMBuffer *buffer;
+    size_t held = 0, cap;
+    unsigned ms = vsnd_lab_jitter_ms();
+
+    if (!ms || !stream->active || stream->info.direction != VIRTIO_SND_D_OUTPUT) {
+        return;
+    }
+    cap = vsnd_lab_ms_bytes(stream, ms);
+    QSIMPLEQ_FOREACH(buffer, &stream->queue, entry) {
+        if (buffer->returned) {
+            held += buffer->size;
+            continue;
+        }
+        if (!virtio_queue_ready(buffer->vq)) {
+            return;
+        }
+        if (held > cap) {
+            return;   /* the oldest un-returned period waits for room; the ones behind it too */
+        }
+        if (!buffer->populated) {
+            iov_to_buf(buffer->elem->out_sg, buffer->elem->out_num, sizeof(virtio_snd_pcm_xfer),
+                       buffer->data, buffer->size);
+            buffer->populated = true;
+        }
+        return_tx_buffer_early(stream, buffer);
+        held += buffer->size;
+    }
+}
+
+/*
  * audio_be_* output callback.
  *
  * @data: VirtIOSoundPCMStream stream
@@ -1154,7 +1462,44 @@ static void virtio_snd_pcm_out_cb(void *data, int available)
     VirtIOSoundPCMBuffer *buffer;
     size_t size;
 
+    if (stream->lab_direct) {
+        return;   /* TEMP lab (QEMU_VSND_DIRECT): its own SDL device plays it, not the QEMU audio timer */
+    }
     WITH_QEMU_LOCK_GUARD(&stream->queue_mutex) {
+        /* TEMP lab (2026-10-13, audio clicks): the guest left nothing queued. */
+        if (QSIMPLEQ_EMPTY(&stream->queue) && stream->active && available > 0) {
+            static uint64_t starved;
+            uint64_t n = ++starved;
+            if (!(n & (n - 1))) {
+                fprintf(stderr, "virtio-snd: stream %u starved %" PRIu64 " (backend wants %d bytes)\n",
+                        stream->id, n, available);
+            }
+            vsnd_lab_note_starved();
+            stream->lab_primed = false;   /* TEMP lab (QEMU_VSND_JITTER_MS): build the cushion again */
+        }
+        if (vsnd_lab_jitter_ms() && stream->active && !stream->lab_primed) {
+            /*
+             * TEMP lab (QEMU_VSND_JITTER_MS): nothing plays until the cushion is buffered - and the backend gets
+             * silence meanwhile, as from a real card: given nothing, its rate control counts the time as owed and
+             * takes the next bytes as one catch-up burst, which drained the cushion at once (b455: 16 starvations a
+             * second with a 120 ms cushion and the guest exactly on time).
+             */
+            static const uint8_t zeros[4096];
+
+            vsnd_lab_jitter_admit(stream);
+            if (stream->latency_bytes < vsnd_lab_ms_bytes(stream, vsnd_lab_jitter_ms())) {
+                while (available > 0) {
+                    size_t z = audio_be_write(stream->s->audio_be, stream->voice.out, (void *)zeros,
+                                              MIN((size_t)available, sizeof(zeros)));
+                    if (!z) {
+                        break;
+                    }
+                    available -= z;
+                }
+                return;
+            }
+            stream->lab_primed = true;
+        }
         while (!QSIMPLEQ_EMPTY(&stream->queue)) {
             buffer = QSIMPLEQ_FIRST(&stream->queue);
             if (!virtio_queue_ready(buffer->vq)) {
@@ -1172,6 +1517,10 @@ static void virtio_snd_pcm_out_cb(void *data, int available)
                            buffer->data,
                            buffer->size);
                 buffer->populated = true;
+            }
+            if (!buffer->returned &&
+                (uint64_t)buffer->size * 100 <= (uint64_t)buffer->full * vsnd_lab_early_pct()) {
+                return_tx_buffer_early(stream, buffer);   /* TEMP lab (QEMU_VSND_EARLY_PCT=100: at once) */
             }
             for (;;) {
                 size = audio_be_write(stream->s->audio_be,
@@ -1192,6 +1541,10 @@ static void virtio_snd_pcm_out_cb(void *data, int available)
                     return_tx_buffer(stream, buffer);
                     break;
                 }
+                if (!buffer->returned &&
+                    (uint64_t)buffer->size * 100 <= (uint64_t)buffer->full * vsnd_lab_early_pct()) {
+                    return_tx_buffer_early(stream, buffer);   /* TEMP lab (QEMU_VSND_EARLY_PCT) */
+                }
                 if (!available) {
                     break;
                 }
@@ -1200,6 +1553,7 @@ static void virtio_snd_pcm_out_cb(void *data, int available)
                 break;
             }
         }
+        vsnd_lab_jitter_admit(stream);   /* TEMP lab (QEMU_VSND_JITTER_MS): room made, the next periods go back */
     }
 }
 
@@ -1315,13 +1669,293 @@ static inline void virtio_snd_pcm_flush(VirtIOSoundPCMStream *stream)
         (stream->info.direction == VIRTIO_SND_D_OUTPUT) ? return_tx_buffer :
         return_rx_buffer;
 
+    if (stream->s->lab_direct) {
+        qemu_mutex_lock(&stream->s->lab_tx_mutex);   /* TEMP lab (QEMU_VSND_DIRECT) */
+    }
     WITH_QEMU_LOCK_GUARD(&stream->queue_mutex) {
         while (!QSIMPLEQ_EMPTY(&stream->queue)) {
             buffer = QSIMPLEQ_FIRST(&stream->queue);
             cb(stream, buffer);
         }
     }
+    if (stream->s->lab_direct) {
+        qemu_mutex_unlock(&stream->s->lab_tx_mutex);
+    }
 }
+
+
+/* ---- TEMP lab (Opus 2026-10-18, QEMU_VSND_DIRECT=1) ------------------------------------------------------------
+ * Mish: "only graphics on QEMU's main thread, everything else in its own thread; the sound in its own thread". The
+ * stock path fed the backend from QEMU's audio timer in the main loop and took the TX kicks there too, so every
+ * main-loop stall (AMD work VM: 16-110 ms holds in virtio_queue_host_notifier_read) delayed the period returns, the
+ * guest (AppleVirtIOSound keeps one 85 ms period out) ran dry and restarted its stream - the dropouts. Here:
+ *  - the TX virtqueue's host notifier lives in the device's own IOThread (start/stop_ioeventfd below), so a period
+ *    is copied and given back as it arrives (the QEMU_VSND_JITTER_MS cushion rule) without the main loop;
+ *  - each output stream plays from its own SDL device whose audio thread takes the copies straight from the queue;
+ *  - the periods it consumes go back through a BH in the IOThread; interrupts from there take WHPX's lockless MSI
+ *    path (virtio.c QEMU_VIRTIO_DIRECT_MSI).
+ * Every TX virtqueue access holds lab_tx_mutex (IOThread, and the main loop's flush), then queue_mutex.
+ */
+static bool vsnd_direct_on(void)
+{
+#ifdef CONFIG_SDL
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("QEMU_VSND_DIRECT");
+        on = e && strcmp(e, "1") == 0;
+    }
+    return on;
+#else
+    return false;
+#endif
+}
+
+/* IOThread: give consumed periods back, return everything once stopped, then admit more within the cushion. */
+static void vsnd_lab_admit_bh(void *opaque)
+{
+    VirtIOSoundPCMStream *stream = opaque;
+    VirtIOSoundPCMBuffer *buffer, *next;
+
+    qemu_mutex_lock(&stream->s->lab_tx_mutex);
+    WITH_QEMU_LOCK_GUARD(&stream->queue_mutex) {
+        QSIMPLEQ_FOREACH_SAFE(buffer, &stream->queue, entry, next) {
+            if (!virtio_queue_ready(buffer->vq)) {
+                break;
+            }
+            if (!stream->active || buffer->size == 0) {
+                return_tx_buffer(stream, buffer);
+            } else {
+                break;   /* in order: the first period still playing stops the walk */
+            }
+        }
+        vsnd_lab_jitter_admit(stream);
+    }
+    qemu_mutex_unlock(&stream->s->lab_tx_mutex);
+}
+
+#ifdef CONFIG_SDL
+/* SDL's audio thread: the copies straight from the queue; silence while priming the cushion or starved. */
+static void vsnd_lab_sdl_cb(void *opaque, Uint8 *out, int len)
+{
+    VirtIOSoundPCMStream *stream = opaque;
+    VirtIOSoundPCMBuffer *buffer, *next;
+
+    qemu_mutex_lock(&stream->queue_mutex);
+    if (!stream->active) {
+        memset(out, stream->lab_silence, len);
+        qemu_mutex_unlock(&stream->queue_mutex);
+        return;
+    }
+    if (!stream->lab_primed) {
+        size_t queued = 0;
+
+        QSIMPLEQ_FOREACH(buffer, &stream->queue, entry) {
+            queued += buffer->size;
+        }
+        if (queued < vsnd_lab_ms_bytes(stream, MAX(vsnd_lab_jitter_ms(), 20))) {
+            memset(out, stream->lab_silence, len);
+            qemu_mutex_unlock(&stream->queue_mutex);
+            return;
+        }
+        stream->lab_primed = true;
+    }
+    buffer = QSIMPLEQ_FIRST(&stream->queue);
+    while (len > 0 && buffer) {
+        next = QSIMPLEQ_NEXT(buffer, entry);
+        if (buffer->size > 0) {
+            size_t n;
+
+            if (!buffer->populated) {
+                iov_to_buf(buffer->elem->out_sg, buffer->elem->out_num, sizeof(virtio_snd_pcm_xfer),
+                           buffer->data, buffer->size);
+                buffer->populated = true;
+            }
+            n = MIN((size_t)len, buffer->size);
+            memcpy(out, buffer->data + buffer->offset, n);
+            out += n;
+            len -= n;
+            buffer->offset += n;
+            buffer->size -= n;
+            update_latency(stream, n);
+        }
+        if (buffer->size == 0 && buffer->returned) {
+            /* The guest has had the element back already: only the copy was left. */
+            QSIMPLEQ_REMOVE(&stream->queue, buffer, VirtIOSoundPCMBuffer, entry);
+            virtio_snd_pcm_buffer_free(buffer);
+        }
+        buffer = next;
+    }
+    if (len > 0) {
+        memset(out, stream->lab_silence, len);
+        stream->lab_primed = false;   /* build the cushion again */
+        vsnd_lab_note_starved();
+    }
+    qemu_mutex_unlock(&stream->queue_mutex);
+    qemu_bh_schedule(stream->lab_bh);   /* thread-safe; coalesces */
+}
+
+static void vsnd_lab_sdl_open(VirtIOSoundPCMStream *stream)
+{
+    SDL_AudioSpec want = { 0 }, have = { 0 };
+    SDL_AudioDeviceID dev;
+
+    switch (stream->as.fmt) {
+    case AUDIO_FORMAT_U8:
+        want.format = AUDIO_U8;
+        break;
+    case AUDIO_FORMAT_S8:
+        want.format = AUDIO_S8;
+        break;
+    case AUDIO_FORMAT_U16:
+        want.format = AUDIO_U16LSB;
+        break;
+    case AUDIO_FORMAT_S16:
+        want.format = AUDIO_S16LSB;
+        break;
+    case AUDIO_FORMAT_S32:
+        want.format = AUDIO_S32LSB;
+        break;
+    case AUDIO_FORMAT_F32:
+        want.format = AUDIO_F32LSB;
+        break;
+    default:
+        fprintf(stderr, "virtio-snd: stream %u format %d has no SDL format - QEMU audio path\n", stream->id,
+                stream->as.fmt);
+        return;
+    }
+    want.freq = stream->as.freq;
+    want.channels = stream->as.nchannels;
+    want.samples = 512;
+    want.callback = vsnd_lab_sdl_cb;
+    want.userdata = stream;
+    if (!stream->lab_bh) {
+        stream->lab_bh = aio_bh_new(stream->s->lab_ctx, vsnd_lab_admit_bh, stream);
+    }
+    dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+    if (!dev) {
+        fprintf(stderr, "virtio-snd: stream %u: SDL_OpenAudioDevice failed (%s) - QEMU audio path\n", stream->id,
+                SDL_GetError());
+        return;
+    }
+    stream->lab_sdl_dev = dev;
+    stream->lab_silence = have.silence;
+    stream->lab_direct = true;
+    if (stream->active) {
+        SDL_PauseAudioDevice(dev, 0);
+    }
+    fprintf(stderr, "virtio-snd: stream %u on its own SDL device %u: %d Hz, %d ch, %u-frame period\n", stream->id,
+            dev, have.freq, have.channels, have.samples);
+}
+
+static void vsnd_lab_sdl_close(VirtIOSoundPCMStream *stream)
+{
+    if (stream->lab_sdl_dev) {
+        SDL_CloseAudioDevice(stream->lab_sdl_dev);   /* waits for a callback in flight */
+        stream->lab_sdl_dev = 0;
+    }
+    stream->lab_direct = false;
+}
+
+static void vsnd_lab_sdl_pause(VirtIOSoundPCMStream *stream, bool pause)
+{
+    if (stream->lab_sdl_dev) {
+        SDL_PauseAudioDevice(stream->lab_sdl_dev, pause ? 1 : 0);
+    }
+}
+#else
+static void vsnd_lab_sdl_open(VirtIOSoundPCMStream *stream) { }
+static void vsnd_lab_sdl_close(VirtIOSoundPCMStream *stream) { }
+static void vsnd_lab_sdl_pause(VirtIOSoundPCMStream *stream, bool pause) { }
+#endif
+
+static void vsnd_lab_stop_vq_bh(void *opaque)
+{
+    VirtQueue *vq = opaque;
+
+    virtio_queue_aio_detach_host_notifier(vq, qemu_get_current_aio_context());
+    virtio_queue_host_notifier_read(virtio_queue_get_host_notifier(vq));
+}
+
+/* The device's own ioeventfd start: the TX queue's host notifier in the IOThread, the others in the main loop. */
+static int vsnd_lab_start_ioeventfd(VirtIODevice *vdev)
+{
+    VirtIOSound *s = VIRTIO_SND(vdev);
+    BusState *qbus = BUS(qdev_get_parent_bus(DEVICE(vdev)));
+    VirtioBusClass *k = VIRTIO_BUS_GET_CLASS(qbus);
+    int i, r;
+
+    if (!s->lab_direct) {
+        return -ENOSYS;
+    }
+    if (s->lab_ioeventfd_started) {
+        return 0;
+    }
+    r = k->set_guest_notifiers(qbus->parent, VIRTIO_SND_VQ_MAX, true);
+    if (r != 0) {
+        error_report("virtio-snd: QEMU_VSND_DIRECT: guest notifiers failed (%d)", r);
+        return -ENOSYS;
+    }
+    memory_region_transaction_begin();
+    for (i = 0; i < VIRTIO_SND_VQ_MAX; i++) {
+        r = virtio_bus_set_host_notifier(VIRTIO_BUS(qbus), i, true);
+        if (r != 0) {
+            int j = i;
+
+            error_report("virtio-snd: QEMU_VSND_DIRECT: host notifier %d failed (%d)", i, r);
+            while (i--) {
+                virtio_bus_set_host_notifier(VIRTIO_BUS(qbus), i, false);
+            }
+            memory_region_transaction_commit();
+            while (j--) {
+                virtio_bus_cleanup_host_notifier(VIRTIO_BUS(qbus), j);
+            }
+            k->set_guest_notifiers(qbus->parent, VIRTIO_SND_VQ_MAX, false);
+            return -ENOSYS;
+        }
+    }
+    memory_region_transaction_commit();
+    s->lab_ioeventfd_started = true;
+    smp_wmb();
+    for (i = 0; i < VIRTIO_SND_VQ_MAX; i++) {
+        virtio_queue_aio_attach_host_notifier(virtio_get_queue(vdev, i),
+                                              i == VIRTIO_SND_VQ_TX ? s->lab_ctx : qemu_get_aio_context());
+    }
+    return 0;
+}
+
+static void vsnd_lab_stop_ioeventfd(VirtIODevice *vdev)
+{
+    VirtIOSound *s = VIRTIO_SND(vdev);
+    BusState *qbus = BUS(qdev_get_parent_bus(DEVICE(vdev)));
+    VirtioBusClass *k = VIRTIO_BUS_GET_CLASS(qbus);
+    int i;
+
+    if (!s->lab_ioeventfd_started) {
+        return;
+    }
+    for (i = 0; i < VIRTIO_SND_VQ_MAX; i++) {
+        VirtQueue *vq = virtio_get_queue(vdev, i);
+
+        if (i == VIRTIO_SND_VQ_TX) {
+            aio_wait_bh_oneshot(s->lab_ctx, vsnd_lab_stop_vq_bh, vq);
+        } else {
+            virtio_queue_aio_detach_host_notifier(vq, qemu_get_aio_context());
+            virtio_queue_host_notifier_read(virtio_queue_get_host_notifier(vq));
+        }
+    }
+    memory_region_transaction_begin();
+    for (i = 0; i < VIRTIO_SND_VQ_MAX; i++) {
+        virtio_bus_set_host_notifier(VIRTIO_BUS(qbus), i, false);
+    }
+    memory_region_transaction_commit();
+    for (i = 0; i < VIRTIO_SND_VQ_MAX; i++) {
+        virtio_bus_cleanup_host_notifier(VIRTIO_BUS(qbus), i);
+    }
+    k->set_guest_notifiers(qbus->parent, VIRTIO_SND_VQ_MAX, false);
+    s->lab_ioeventfd_started = false;
+}
+/* ---- end TEMP lab QEMU_VSND_DIRECT ---- */
 
 static void virtio_snd_unrealize(DeviceState *dev)
 {
@@ -1338,6 +1972,9 @@ static void virtio_snd_unrealize(DeviceState *dev)
             if (stream) {
                 virtio_snd_process_cmdq(stream->s);
                 virtio_snd_pcm_close(stream);
+                if (stream->lab_bh) {
+                    qemu_bh_delete(stream->lab_bh);   /* TEMP lab (QEMU_VSND_DIRECT) */
+                }
                 qemu_mutex_destroy(&stream->queue_mutex);
                 g_free(stream);
             }
@@ -1391,6 +2028,10 @@ static void virtio_snd_class_init(ObjectClass *klass, const void *data)
     vdc->get_config = virtio_snd_get_config;
     vdc->get_features = get_features;
     vdc->reset = virtio_snd_reset;
+    if (vsnd_direct_on()) {   /* TEMP lab (QEMU_VSND_DIRECT): the TX queue in the device's own IOThread */
+        vdc->start_ioeventfd = vsnd_lab_start_ioeventfd;
+        vdc->stop_ioeventfd = vsnd_lab_stop_ioeventfd;
+    }
     vdc->legacy_features = 0;
 }
 

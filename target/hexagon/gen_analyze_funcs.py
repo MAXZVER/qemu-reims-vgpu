@@ -22,6 +22,7 @@ import re
 import string
 import hex_common
 
+
 ##
 ## Generate the code to analyze the instruction
 ##     For A2_add: Rd32=add(Rs32,Rt32), { RdV=RsV+RtV;}
@@ -41,13 +42,6 @@ def gen_analyze_func(f, tag, regs, imms):
     f.write(f"static void analyze_{tag}(DisasContext *ctx)\n")
     f.write("{\n")
 
-    if hex_common.tag_ignore(tag):
-        f.write("}\n\n")
-        return
-
-    if hex_common.is_sysemu_tag(tag):
-        f.write("#ifndef CONFIG_USER_ONLY\n")
-
     f.write("    Insn *insn G_GNUC_UNUSED = ctx->insn;\n")
     if (hex_common.is_hvx_insn(tag)):
         if hex_common.has_hvx_helper(tag):
@@ -64,8 +58,7 @@ def gen_analyze_func(f, tag, regs, imms):
     for regno, register in enumerate(regs):
         reg_type, reg_id = register
         reg = hex_common.get_register(tag, reg_type, reg_id)
-        if reg.is_read() or reg.is_written():
-            reg.decl_reg_num(f, regno)
+        reg.decl_reg_num(f, regno)
 
     ## Analyze the register reads
     for regno, register in enumerate(regs):
@@ -84,9 +77,6 @@ def gen_analyze_func(f, tag, regs, imms):
             reg.analyze_write(f, tag, regno)
 
     f.write("    mark_implicit_writes(ctx);\n")
-
-    if hex_common.is_sysemu_tag(tag):
-        f.write("#endif /* !CONFIG_USER_ONLY */\n")
 
     f.write("}\n\n")
 

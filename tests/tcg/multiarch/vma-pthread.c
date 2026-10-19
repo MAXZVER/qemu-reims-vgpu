@@ -11,7 +11,6 @@
  * pages, which are guaranteed to have the respective protection bit set.
  * Two mutator threads change the non-fixed protection bits randomly.
  */
-#define _GNU_SOURCE
 #include <assert.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -122,7 +121,7 @@ static void *thread_mutate(void *arg)
     unsigned int seed;
     int prot, ret;
 
-    seed = (unsigned int)time(NULL) + (unsigned int)gettid();
+    seed = (unsigned int)time(NULL);
     for (i = 0; i < 10000; i++) {
         start_idx = rand_r(&seed) & PAGE_IDX_MASK;
         end_idx = rand_r(&seed) & PAGE_IDX_MASK;

@@ -125,6 +125,7 @@ static void gdb_vm_state_change(void *opaque, bool running, RunState state)
     CPUState *cpu = gdbserver_state.c_cpu;
     g_autoptr(GString) buf = g_string_new(NULL);
     g_autoptr(GString) tid = g_string_new(NULL);
+    const char *type;
     int ret;
 
     if (running || gdbserver_state.state == RS_INACTIVE) {
@@ -150,8 +151,6 @@ static void gdb_vm_state_change(void *opaque, bool running, RunState state)
     switch (state) {
     case RUN_STATE_DEBUG:
         if (cpu->watchpoint_hit) {
-            const char *type;
-
             switch (cpu->watchpoint_hit->flags & BP_MEM_ACCESS) {
             case BP_MEM_READ:
                 type = "r";
@@ -344,7 +343,7 @@ bool gdbserver_start(const char *device, Error **errp)
         return false;
     }
 
-    if (!accel_supports_guest_debug(current_accel())) {
+    if (!gdb_supports_guest_debug()) {
         error_setg(errp, "gdbstub: current accelerator doesn't "
                    "support guest debugging");
         return false;
@@ -390,7 +389,7 @@ bool gdbserver_start(const char *device, Error **errp)
         /* Initialize a monitor terminal for gdb */
         mon_chr = qemu_chardev_new(NULL, TYPE_CHARDEV_GDB,
                                    NULL, NULL, &error_abort);
-        monitor_new_hmp(NULL, mon_chr->label, false, &error_abort);
+        monitor_init_hmp(mon_chr, false, &error_abort);
     } else {
         qemu_chr_fe_deinit(&gdbserver_system_state.chr, true);
         mon_chr = gdbserver_system_state.mon_chr;
@@ -476,6 +475,11 @@ unsigned int gdb_get_max_cpus(void)
 {
     MachineState *ms = MACHINE(qdev_get_machine());
     return ms->smp.max_cpus;
+}
+
+bool gdb_can_reverse(void)
+{
+    return replay_mode == REPLAY_MODE_PLAY;
 }
 
 /*
@@ -623,22 +627,29 @@ int gdb_signal_to_target(int sig)
  * Break/Watch point helpers
  */
 
-int gdb_breakpoint_insert(CPUState *cs, GdbBreakpointType type,
-                          vaddr addr, vaddr len)
+bool gdb_supports_guest_debug(void)
 {
     const AccelOpsClass *ops = cpus_get_accel();
-    if (ops->insert_gdbstub_breakpoint) {
-        return ops->insert_gdbstub_breakpoint(cs, type, addr, len);
+    if (ops->supports_guest_debug) {
+        return ops->supports_guest_debug();
+    }
+    return false;
+}
+
+int gdb_breakpoint_insert(CPUState *cs, int type, vaddr addr, vaddr len)
+{
+    const AccelOpsClass *ops = cpus_get_accel();
+    if (ops->insert_breakpoint) {
+        return ops->insert_breakpoint(cs, type, addr, len);
     }
     return -ENOSYS;
 }
 
-int gdb_breakpoint_remove(CPUState *cs, GdbBreakpointType type,
-                          vaddr addr, vaddr len)
+int gdb_breakpoint_remove(CPUState *cs, int type, vaddr addr, vaddr len)
 {
     const AccelOpsClass *ops = cpus_get_accel();
-    if (ops->remove_gdbstub_breakpoint) {
-        return ops->remove_gdbstub_breakpoint(cs, type, addr, len);
+    if (ops->remove_breakpoint) {
+        return ops->remove_breakpoint(cs, type, addr, len);
     }
     return -ENOSYS;
 }
@@ -646,8 +657,8 @@ int gdb_breakpoint_remove(CPUState *cs, GdbBreakpointType type,
 void gdb_breakpoint_remove_all(CPUState *cs)
 {
     const AccelOpsClass *ops = cpus_get_accel();
-    if (ops->remove_all_gdbstub_breakpoints) {
-        ops->remove_all_gdbstub_breakpoints(cs);
+    if (ops->remove_all_breakpoints) {
+        ops->remove_all_breakpoints(cs);
     }
 }
 

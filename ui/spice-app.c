@@ -119,17 +119,16 @@ static const TypeInfo char_vc_type_info = {
     .class_size = sizeof(VCChardevClass),
 };
 
-static void spice_app_cleanup(void)
+static void spice_app_atexit(void)
 {
     if (sock_path) {
         unlink(sock_path);
-        g_clear_pointer(&sock_path, g_free);
     }
     if (tmp_dir) {
         rmdir(tmp_dir);
-        tmp_dir = NULL;
     }
-    g_clear_pointer(&app_dir, g_free);
+    g_free(sock_path);
+    g_free(app_dir);
 }
 
 static void spice_app_display_early_init(DisplayOptions *opts)
@@ -146,6 +145,8 @@ static void spice_app_display_early_init(DisplayOptions *opts)
         error_report("spice-app window-close isn't supported yet.");
         exit(1);
     }
+
+    atexit(spice_app_atexit);
 
     if (qemu_name) {
         app_dir = g_build_filename(g_get_user_runtime_dir(),
@@ -217,7 +218,6 @@ static QemuDisplay qemu_display_spice_app = {
     .type       = DISPLAY_TYPE_SPICE_APP,
     .early_init = spice_app_display_early_init,
     .init       = spice_app_display_init,
-    .cleanup    = spice_app_cleanup,
     .vc         = "vc",
 };
 

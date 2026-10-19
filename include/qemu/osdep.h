@@ -81,6 +81,16 @@ QEMU_EXTERN_C int daemon(int, int);
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0602 /* Windows 8 API (should be >= the one from glib) */
 #endif
+/*
+ * TEMP lab (2026-10-16): the main loop polls every socket through select()
+ * (util/main-loop.c os_host_main_loop_wait), and winsock's FD_SET silently
+ * drops a socket past FD_SETSIZE, 64 by default. Each guest TCP connection of
+ * -netdev user is one host socket: a browser past 64 open connections had its
+ * newest ones never polled, and new sites stopped loading in the work VM.
+ */
+#ifndef FD_SETSIZE
+#define FD_SETSIZE 1024
+#endif
 /* reduces the number of implicitly included headers */
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -538,6 +548,35 @@ void *qemu_anon_ram_alloc(size_t size, uint64_t *align, bool shared,
                           bool noreserve);
 void qemu_anon_ram_free(void *ptr, size_t size);
 int qemu_shm_alloc(size_t size, Error **errp);
+#ifdef _WIN32
+/*
+ * TEMP (lab, QEMU_WHPX_WP_VIEW): the hypervisor's view of guest RAM at `host` (a pointer the RAM allocator
+ * returned, or into it): the same pages through a second view whose protection is the guest's write
+ * protection; `host` itself when the RAM has no such view.
+ */
+void *qemu_win_ram_hv_view(void *host, size_t len);
+/*
+ * TEMP (lab, WP_VIEW): alias `count` guest-RAM pages (QEMU-view pointers, each `page` bytes and page aligned)
+ * into one linear read/write window, or NULL with the Windows error in `err` and the page that failed in
+ * `failed_index` (SIZE_MAX when the window itself could not be reserved). Every page must lie in a WP_VIEW
+ * RAM section. Maximal runs of pages that are consecutive in their section become one view each - one
+ * MapViewOfFile3 per run, not per 4 KiB page (b610: the per-page form collapsed the whole VM: every page
+ * cost a VirtualFree split plus a MapViewOfFile3 against the one pagefile section the WP dirty machinery
+ * reprotects ~10k times a scene, and a 5K surface is 14400 pages; the drain ground out zero draws a second
+ * and the vCPUs queued 1-13 s outside the hypervisor behind the BQL). `*runs_out`/`*runs_n_out` (either may
+ * be NULL to decline the table) receive that run table, g_free'd by the caller after
+ * qemu_win_ram_alias_free, which unmaps one view per run.
+ */
+typedef struct QemuWinRamAliasRun {
+    size_t first_page;   /* window page index of the run's first page */
+    size_t pages;        /* run length in pages */
+} QemuWinRamAliasRun;
+
+void *qemu_win_ram_alias_pages(void *const *hosts, size_t count, size_t page, unsigned long *err,
+                               size_t *failed_index, QemuWinRamAliasRun **runs_out, size_t *runs_n_out);
+void qemu_win_ram_alias_free(void *view, size_t count, size_t page,
+                             const QemuWinRamAliasRun *runs, size_t runs_n);
+#endif
 
 #ifdef _WIN32
 #define HAVE_CHARDEV_SERIAL 1

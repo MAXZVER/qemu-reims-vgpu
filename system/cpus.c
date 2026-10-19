@@ -23,6 +23,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/timer.h"
+#include "qemu/lab-slow.h"
 #include "monitor/monitor.h"
 #include "qemu/coroutine-tls.h"
 #include "qapi/error.h"
@@ -43,7 +45,6 @@
 #include "system/physmem.h"
 #include "system/replay.h"
 #include "system/runstate.h"
-#include "migration/misc.h"
 #include "system/cpu-timers.h"
 #include "system/whpx.h"
 #include "hw/core/boards.h"
@@ -344,7 +345,7 @@ bool cpu_can_run(CPUState *cpu)
 void cpu_handle_guest_debug(CPUState *cpu)
 {
     if (replay_running_debug()) {
-        if (!cpu_single_stepping(cpu)) {
+        if (!cpu->singlestep_enabled) {
             /*
              * Report about the breakpoint and
              * make a single step to skip it
@@ -572,29 +573,57 @@ void rust_bql_mock_lock(void)
  * The BQL is taken from so many places that it is worth profiling the
  * callers directly, instead of funneling them all through a single function.
  */
+/* TEMP lab: the current BQL holder (QEMU_LAB_SLOW_MS); only it writes these. */
+static int64_t lab_bql_t;
+static const char *lab_bql_file;
+static int lab_bql_line;
+
 void bql_lock_impl(const char *file, int line)
 {
     QemuMutexLockFunc bql_lock_fn = qatomic_read(&bql_mutex_lock_func);
 
     g_assert(!bql_locked());
     bql_lock_fn(&bql, file, line);
+    lab_bql_t = qemu_lab_slow_begin();
+    lab_bql_file = file;
+    lab_bql_line = line;
+}
+
+static void lab_bql_release(void)
+{
+    if (lab_bql_t) {
+        char where[96];
+
+        snprintf(where, sizeof(where), "%s:%d", lab_bql_file, lab_bql_line);
+        qemu_lab_slow_end("bql", where, NULL, lab_bql_t);
+        lab_bql_t = 0;
+    }
 }
 
 void bql_unlock(void)
 {
     g_assert(bql_locked());
     g_assert(!bql_unlock_blocked);
+    lab_bql_release();
     qemu_mutex_unlock(&bql);
 }
 
 void qemu_cond_wait_bql(QemuCond *cond)
 {
+    lab_bql_release();
     qemu_cond_wait(cond, &bql);
+    lab_bql_t = qemu_lab_slow_begin();
+    lab_bql_file = "cond_wait";
+    lab_bql_line = 0;
 }
 
 void qemu_cond_timedwait_bql(QemuCond *cond, int ms)
 {
+    lab_bql_release();
     qemu_cond_timedwait(cond, &bql, ms);
+    lab_bql_t = qemu_lab_slow_begin();
+    lab_bql_file = "cond_timedwait";
+    lab_bql_line = 0;
 }
 
 /* signal CPU creation */
@@ -844,11 +873,6 @@ void qmp_memsave(uint64_t addr, uint64_t size, const char *filename,
     uint8_t buf[1024];
     uint64_t orig_addr = addr, orig_size = size;
 
-    if (migration_guest_ram_loading()) {
-        error_setg(errp, "Guest memory access not allowed during migration");
-        return;
-    }
-
     if (!has_cpu) {
         cpu_index = 0;
     }
@@ -894,11 +918,6 @@ void qmp_pmemsave(uint64_t addr, uint64_t size, const char *filename,
     FILE *f;
     uint64_t l;
     uint8_t buf[1024];
-
-    if (migration_guest_ram_loading()) {
-        error_setg(errp, "Guest memory access not allowed during migration");
-        return;
-    }
 
     f = fopen(filename, "wb");
     if (!f) {

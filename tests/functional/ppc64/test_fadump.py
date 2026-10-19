@@ -53,7 +53,7 @@ class QEMUFadump(LinuxKernelTest):
             self.require_accelerator("tcg")
 
         if is_powernv:
-            self.set_machine("powernv")
+            self.set_machine("powernv10")
         else:
             # SLOF takes upto >20s in startup time, use VOF
             self.set_machine("pseries")

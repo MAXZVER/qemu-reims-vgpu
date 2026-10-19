@@ -237,7 +237,9 @@ struct HvSintRoute {
 
 static CPUState *hyperv_find_vcpu(uint32_t vp_index)
 {
-    return qemu_get_cpu(vp_index);
+    CPUState *cs = qemu_get_cpu(vp_index);
+    assert(hyperv_vp_index(cs) == vp_index);
+    return cs;
 }
 
 /*

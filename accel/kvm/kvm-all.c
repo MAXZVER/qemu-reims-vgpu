@@ -104,6 +104,8 @@ bool kvm_readonly_mem_allowed;
 bool kvm_vm_attributes_allowed;
 bool kvm_msi_use_devid;
 bool kvm_pre_fault_memory_supported;
+static bool kvm_has_guest_debug;
+static int kvm_sstep_flags;
 static bool kvm_immediate_exit;
 static uint64_t kvm_supported_memory_attributes;
 static bool kvm_guest_memfd_supported;
@@ -1158,8 +1160,174 @@ static void kvm_dirty_ring_flush(void)
  * @kml: the KVM memory listener object
  * @section: the memory section to sync the dirty bitmap with
  */
+/*
+ * TEMP lab: the slot holding all of [start_addr, start_addr + size), for a
+ * ranged sync's sub-section (kvm_lookup_matching_slot wants the whole slot).
+ */
+static KVMSlot *kvm_lookup_containing_slot(KVMMemoryListener *kml,
+                                           hwaddr start_addr, hwaddr size)
+{
+    int i;
+
+    for (i = 0; i < kml->nr_slots_allocated; i++) {
+        KVMSlot *mem = &kml->slots[i];
+
+        if (mem->memory_size && start_addr >= mem->start_addr &&
+            start_addr + size <= mem->start_addr + mem->memory_size) {
+            return mem;
+        }
+    }
+    return NULL;
+}
+
+/*
+ * TEMP lab: a ranged sync (the reims dirty tracker asks for a surface's pages,
+ * thousands of times a second). KVM_GET_DIRTY_LOG only fetches whole slots,
+ * and with manual protect the kernel's bitmap keeps every page the guest
+ * dirtied anywhere until someone clears it, so merging the whole slot each
+ * time cost milliseconds (~22 GiB of mostly-set bits on a 24 GiB guest). The
+ * slot's bitmap goes to dirty_scratch, and only the range - widened to 64-page
+ * words - is copied into dirty_bmap and merged into QEMU's bitmaps. Bits
+ * outside it stay set in the kernel (manual protect clears nothing on GET) and
+ * dirty_bmap keeps exactly the bits QEMU was given, so kvm_log_clear_one_slot
+ * still clears only merged pages.
+ */
+/*
+ * TEMP lab: where a tracker sync's time goes under KVM - the slots_lock wait,
+ * KVM_GET_DIRTY_LOG, the merge into QEMU's bitmaps, KVM_CLEAR_DIRTY_LOG. All
+ * updated under kvm_slots_lock except the lock waits (atomics); one stderr
+ * line a second.
+ */
+static struct {
+    uint64_t get_n, get_shared, get_us, merge_us, merge_pages, clear_n, clear_us,
+             clear_pages, last_us;
+    uint64_t lock_n, lock_us, lock_max_us;
+} kvm_lab_dirty;
+
+static void kvm_lab_dirty_lock_wait(int64_t t0)
+{
+    uint64_t us = g_get_monotonic_time() - t0;
+
+    qatomic_inc(&kvm_lab_dirty.lock_n);
+    qatomic_add(&kvm_lab_dirty.lock_us, us);
+    if (us > qatomic_read(&kvm_lab_dirty.lock_max_us)) {
+        qatomic_set(&kvm_lab_dirty.lock_max_us, us);
+    }
+}
+
+static void kvm_lab_dirty_report(void)
+{
+    uint64_t now = g_get_monotonic_time();
+
+    if (!kvm_lab_dirty.last_us) {
+        kvm_lab_dirty.last_us = now;
+        return;
+    }
+    if (now - kvm_lab_dirty.last_us < 1000000) {
+        return;
+    }
+    fprintf(stderr, "kvm-dirty get=%" PRIu64 " get_shared=%" PRIu64
+            " get_us=%" PRIu64
+            " merge_us=%" PRIu64 " merge_pages=%" PRIu64
+            " clear=%" PRIu64 " clear_us=%" PRIu64 " clear_pages=%" PRIu64
+            " lock=%" PRIu64 " lock_us=%" PRIu64 " lock_max_us=%" PRIu64 "\n",
+            kvm_lab_dirty.get_n, kvm_lab_dirty.get_shared,
+            kvm_lab_dirty.get_us, kvm_lab_dirty.merge_us,
+            kvm_lab_dirty.merge_pages, kvm_lab_dirty.clear_n,
+            kvm_lab_dirty.clear_us, kvm_lab_dirty.clear_pages,
+            qatomic_xchg(&kvm_lab_dirty.lock_n, 0),
+            qatomic_xchg(&kvm_lab_dirty.lock_us, 0),
+            qatomic_xchg(&kvm_lab_dirty.lock_max_us, 0));
+    kvm_lab_dirty.get_n = kvm_lab_dirty.get_us = kvm_lab_dirty.merge_us = 0;
+    kvm_lab_dirty.get_shared = 0;
+    kvm_lab_dirty.merge_pages = kvm_lab_dirty.clear_n = 0;
+    kvm_lab_dirty.clear_us = kvm_lab_dirty.clear_pages = 0;
+    kvm_lab_dirty.last_us = now;
+}
+
+static int kvm_log_clear_one_slot(KVMSlot *mem, int as_id, uint64_t start,
+                                  uint64_t size);
+
+/*
+ * TEMP lab: one ranged sync of [offset, offset + size) inside @mem, with the
+ * query-and-reset meaning a WHPX range query has:
+ *
+ * - KVM_GET_DIRTY_LOG lands in dirty_scratch, and is skipped when a GET that
+ *   began after this request (@req_us, taken before kvm_slots_lock) already
+ *   filled it - the concurrent syncs of the tracker's threads share one;
+ * - only the range, widened to 64-page words, is copied into dirty_bmap and
+ *   merged into QEMU's bitmaps, and the scratch words are then zeroed (merged
+ *   once; a later reuse sees only what a newer GET adds);
+ * - the merged bits are cleared in the kernel (KVM_CLEAR_DIRTY_LOG
+ *   write-protects them again). The tracker reads the VGA bitmap itself and
+ *   never reaches log_clear, so without this the kernel's bitmap stayed set
+ *   forever and every sync reported every page ever written. Clearing here is
+ *   safe because the bits are in QEMU's bitmap and the page contents are read
+ *   after this sync returns: a store between the GET and the clear lands on a
+ *   page already reported dirty.
+ */
+static void kvm_slot_sync_dirty_range(KVMState *s, KVMSlot *mem,
+                                      hwaddr offset, hwaddr size,
+                                      int64_t req_us)
+{
+    int64_t t0, t1;
+    uint64_t psize = qemu_real_host_page_size();
+    uint64_t npages = mem->memory_size / psize;
+    uint64_t p0 = (offset / psize) & ~(uint64_t)63;
+    uint64_t p1 = MIN(ROUND_UP(DIV_ROUND_UP(offset + size, psize), 64), npages);
+    uint64_t w0 = p0 / 64, nw = DIV_ROUND_UP(p1 - p0, 64), w;
+    uint64_t *bm, *sc, any = 0;
+    struct kvm_dirty_log d = {};
+    int ret;
+
+    if (!mem->dirty_bmap || p1 <= p0) {
+        return;
+    }
+    if (!mem->dirty_scratch) {
+        mem->dirty_scratch = g_malloc0(mem->dirty_bmap_size);
+        mem->scratch_us = 0;
+    }
+    t0 = g_get_monotonic_time();
+    if (!mem->scratch_us || mem->scratch_us < req_us) {
+        d.dirty_bitmap = mem->dirty_scratch;
+        d.slot = mem->slot | (mem->as_id << 16);
+        ret = kvm_vm_ioctl(s, KVM_GET_DIRTY_LOG, &d);
+        kvm_lab_dirty.get_n++;
+        if (ret == -ENOENT) {
+            return;
+        }
+        if (ret) {
+            error_report_once("%s: KVM_GET_DIRTY_LOG failed with %d",
+                              __func__, ret);
+            return;
+        }
+        mem->scratch_us = t0;
+    } else {
+        kvm_lab_dirty.get_shared++;
+    }
+    t1 = g_get_monotonic_time();
+    kvm_lab_dirty.get_us += t1 - t0;
+    bm = (uint64_t *)mem->dirty_bmap + w0;
+    sc = (uint64_t *)mem->dirty_scratch + w0;
+    for (w = 0; w < nw; w++) {
+        bm[w] = sc[w];
+        any |= sc[w];
+        sc[w] = 0;
+    }
+    if (any) {
+        physical_memory_set_dirty_lebitmap((unsigned long *)bm,
+                                           mem->ram_start_offset + p0 * psize,
+                                           p1 - p0);
+        kvm_lab_dirty.merge_us += g_get_monotonic_time() - t1;
+        kvm_lab_dirty.merge_pages += p1 - p0;
+        kvm_log_clear_one_slot(mem, mem->as_id, p0 * psize, (p1 - p0) * psize);
+    }
+    kvm_lab_dirty_report();
+}
+
 static void kvm_physical_sync_dirty_bitmap(KVMMemoryListener *kml,
-                                           MemoryRegionSection *section)
+                                           MemoryRegionSection *section,
+                                           int64_t req_us)
 {
     KVMState *s = kvm_state;
     KVMSlot *mem;
@@ -1167,6 +1335,29 @@ static void kvm_physical_sync_dirty_bitmap(KVMMemoryListener *kml,
     hwaddr slot_size;
 
     size = kvm_align_section(section, &start_addr);
+    /* TEMP lab: a sub-section of a slot (log_sync_ranged) */
+    if (size && !kvm_lookup_matching_slot(kml, start_addr,
+                                          MIN(kvm_max_slot_size, size))) {
+        hwaddr end = start_addr + size, piece;
+
+        while (start_addr < end) {
+            mem = kvm_lookup_containing_slot(kml, start_addr,
+                                             qemu_real_host_page_size());
+            if (!mem) {
+                return;
+            }
+            piece = MIN(end, mem->start_addr + mem->memory_size) - start_addr;
+            if (s->manual_dirty_log_protect) {
+                kvm_slot_sync_dirty_range(s, mem, start_addr - mem->start_addr,
+                                          piece, req_us);
+            } else if (kvm_slot_get_dirty_log(s, mem)) {
+                /* the GET cleared the kernel's bitmap: QEMU takes it all */
+                kvm_slot_sync_dirty_pages(mem);
+            }
+            start_addr += piece;
+        }
+        return;
+    }
     while (size) {
         slot_size = MIN(kvm_max_slot_size, size);
         mem = kvm_lookup_matching_slot(kml, start_addr, slot_size);
@@ -1270,7 +1461,14 @@ static int kvm_log_clear_one_slot(KVMSlot *mem, int as_id, uint64_t start,
     d.num_pages = bmap_npages;
     d.slot = mem->slot | (as_id << 16);
 
-    ret = kvm_vm_ioctl(s, KVM_CLEAR_DIRTY_LOG, &d);
+    {
+        int64_t t0 = g_get_monotonic_time();
+
+        ret = kvm_vm_ioctl(s, KVM_CLEAR_DIRTY_LOG, &d);
+        kvm_lab_dirty.clear_n++;
+        kvm_lab_dirty.clear_us += g_get_monotonic_time() - t0;
+        kvm_lab_dirty.clear_pages += bmap_npages;
+    }
     if (ret < 0 && ret != -ENOENT) {
         error_report("%s: KVM_CLEAR_DIRTY_LOG failed, slot=%d, "
                      "start=0x%"PRIx64", size=0x%"PRIx32", errno=%d",
@@ -1698,6 +1896,8 @@ static void kvm_set_phys_mem(KVMMemoryListener *kml,
             /* unregister the slot */
             g_free(mem->dirty_bmap);
             mem->dirty_bmap = NULL;
+            g_free(mem->dirty_scratch);
+            mem->dirty_scratch = NULL;
             mem->memory_size = 0;
             mem->flags = 0;
             err = kvm_set_user_memory_region(kml, mem, false);
@@ -1958,9 +2158,11 @@ static void kvm_log_sync(MemoryListener *listener,
                          MemoryRegionSection *section)
 {
     KVMMemoryListener *kml = container_of(listener, KVMMemoryListener, listener);
+    int64_t t0 = g_get_monotonic_time();
 
     kvm_slots_lock();
-    kvm_physical_sync_dirty_bitmap(kml, section);
+    kvm_lab_dirty_lock_wait(t0);
+    kvm_physical_sync_dirty_bitmap(kml, section, t0);
     kvm_slots_unlock();
 }
 
@@ -2110,6 +2312,8 @@ void kvm_memory_listener_register(KVMState *s, KVMMemoryListener *kml,
     } else {
         kml->listener.log_sync = kvm_log_sync;
         kml->listener.log_clear = kvm_log_clear;
+        /* TEMP lab: sub-sections, see kvm_slot_sync_dirty_range */
+        kml->listener.log_sync_ranged = true;
     }
 
     memory_listener_register(&kml->listener, as);
@@ -2357,11 +2561,11 @@ int kvm_irqchip_send_msi(KVMState *s, MSIMessage msg)
     return kvm_vm_ioctl(s, KVM_SIGNAL_MSI, &msi);
 }
 
-int kvm_irqchip_add_msi_route(AccelRouteChange *c, int vector, PCIDevice *dev)
+int kvm_irqchip_add_msi_route(KVMRouteChange *c, int vector, PCIDevice *dev)
 {
     struct kvm_irq_routing_entry kroute = {};
     int virq;
-    KVMState *s = KVM_STATE(c->accel);
+    KVMState *s = c->s;
     MSIMessage msg = {0, 0};
 
     if (pci_available && dev) {
@@ -2504,7 +2708,7 @@ int kvm_irqchip_send_msi(KVMState *s, MSIMessage msg)
     abort();
 }
 
-int kvm_irqchip_add_msi_route(AccelRouteChange *c, int vector, PCIDevice *dev)
+int kvm_irqchip_add_msi_route(KVMRouteChange *c, int vector, PCIDevice *dev)
 {
     return -ENOSYS;
 }
@@ -2757,6 +2961,19 @@ static int kvm_setup_dirty_ring(KVMState *s)
         dirty_log_manual_caps &= (KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE |
                                   KVM_DIRTY_LOG_INITIALLY_SET);
         s->manual_dirty_log_protect = dirty_log_manual_caps;
+        /*
+         * TEMP lab: RAM in 1 GiB memslots (REIMS_KVM_SLOT_MB, 0 = one slot
+         * per region): a ranged sync's KVM_GET_DIRTY_LOG copies its slot's
+         * bitmap, 32 KiB, instead of the whole RAM's.
+         */
+        {
+            const char *e = getenv("REIMS_KVM_SLOT_MB");
+            uint64_t mb = e ? strtoull(e, NULL, 0) : 1024;
+
+            if (mb) {
+                kvm_set_max_memslot_size(mb << 20);
+            }
+        }
         if (dirty_log_manual_caps) {
             ret = kvm_vm_enable_cap(s, KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2, 0,
                                     dirty_log_manual_caps);
@@ -3036,17 +3253,23 @@ static int kvm_init(AccelState *as, MachineState *ms)
         (kvm_check_extension(s, KVM_CAP_VM_ATTRIBUTES) > 0);
 
 #ifdef TARGET_KVM_HAVE_GUEST_DEBUG
-    if (kvm_check_extension(s, KVM_CAP_SET_GUEST_DEBUG) > 0) {
-        as->gdbstub.sstep_flags = SSTEP_ENABLE;
+    kvm_has_guest_debug =
+        (kvm_check_extension(s, KVM_CAP_SET_GUEST_DEBUG) > 0);
+#endif
 
+    kvm_sstep_flags = 0;
+    if (kvm_has_guest_debug) {
+        kvm_sstep_flags = SSTEP_ENABLE;
+
+#if defined TARGET_KVM_HAVE_GUEST_DEBUG
         int guest_debug_flags =
             kvm_check_extension(s, KVM_CAP_SET_GUEST_DEBUG2);
 
         if (guest_debug_flags & KVM_GUESTDBG_BLOCKIRQ) {
-            as->gdbstub.sstep_flags |= SSTEP_NOIRQ;
+            kvm_sstep_flags |= SSTEP_NOIRQ;
         }
-    }
 #endif
+    }
 
     kvm_state = s;
 
@@ -3414,7 +3637,7 @@ int kvm_convert_memory(hwaddr start, hwaddr size, bool to_private)
              */
             goto out_unref;
         }
-        ret = ram_block_discard_shared_range(rb, offset, size);
+        ret = ram_block_discard_range(rb, offset, size);
     } else {
         ret = ram_block_discard_guest_memfd_range(rb, offset, size);
     }
@@ -3812,10 +4035,10 @@ int kvm_update_guest_debug(CPUState *cpu, unsigned long reinject_trap)
 
     data.dbg.control = reinject_trap;
 
-    if (cpu_single_stepping(cpu)) {
+    if (cpu->singlestep_enabled) {
         data.dbg.control |= KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_SINGLESTEP;
 
-        if (cpu->singlestep_flags & SSTEP_NOIRQ) {
+        if (cpu->singlestep_enabled & SSTEP_NOIRQ) {
             data.dbg.control |= KVM_GUESTDBG_BLOCKIRQ;
         }
     }
@@ -3826,8 +4049,13 @@ int kvm_update_guest_debug(CPUState *cpu, unsigned long reinject_trap)
     return data.err;
 }
 
-int kvm_insert_gdbstub_breakpoint(CPUState *cpu, GdbBreakpointType type,
-                                  vaddr addr, vaddr len)
+bool kvm_supports_guest_debug(void)
+{
+    /* probed during kvm_init() */
+    return kvm_has_guest_debug;
+}
+
+int kvm_insert_breakpoint(CPUState *cpu, int type, vaddr addr, vaddr len)
 {
     struct kvm_sw_breakpoint *bp;
     int err;
@@ -3850,7 +4078,7 @@ int kvm_insert_gdbstub_breakpoint(CPUState *cpu, GdbBreakpointType type,
 
         QTAILQ_INSERT_HEAD(&cpu->kvm_state->kvm_sw_breakpoints, bp, entry);
     } else {
-        err = kvm_arch_insert_gdbstub_hw_breakpoint(addr, len, type);
+        err = kvm_arch_insert_hw_breakpoint(addr, len, type);
         if (err) {
             return err;
         }
@@ -3865,8 +4093,7 @@ int kvm_insert_gdbstub_breakpoint(CPUState *cpu, GdbBreakpointType type,
     return 0;
 }
 
-int kvm_remove_gdbstub_breakpoint(CPUState *cpu, GdbBreakpointType type,
-                                  vaddr addr, vaddr len)
+int kvm_remove_breakpoint(CPUState *cpu, int type, vaddr addr, vaddr len)
 {
     struct kvm_sw_breakpoint *bp;
     int err;
@@ -3890,7 +4117,7 @@ int kvm_remove_gdbstub_breakpoint(CPUState *cpu, GdbBreakpointType type,
         QTAILQ_REMOVE(&cpu->kvm_state->kvm_sw_breakpoints, bp, entry);
         g_free(bp);
     } else {
-        err = kvm_arch_remove_gdbstub_hw_breakpoint(addr, len, type);
+        err = kvm_arch_remove_hw_breakpoint(addr, len, type);
         if (err) {
             return err;
         }
@@ -3905,7 +4132,7 @@ int kvm_remove_gdbstub_breakpoint(CPUState *cpu, GdbBreakpointType type,
     return 0;
 }
 
-void kvm_remove_all_gdbstub_breakpoints(CPUState *cpu)
+void kvm_remove_all_breakpoints(CPUState *cpu)
 {
     struct kvm_sw_breakpoint *bp, *next;
     KVMState *s = cpu->kvm_state;
@@ -3923,7 +4150,7 @@ void kvm_remove_all_gdbstub_breakpoints(CPUState *cpu)
         QTAILQ_REMOVE(&s->kvm_sw_breakpoints, bp, entry);
         g_free(bp);
     }
-    kvm_arch_remove_all_gdbstub_hw_breakpoints();
+    kvm_arch_remove_all_hw_breakpoints();
 
     CPU_FOREACH(cpu) {
         kvm_update_guest_debug(cpu, 0);
@@ -4269,6 +4496,17 @@ static void kvm_accel_instance_init(Object *obj)
     s->honor_guest_pat = ON_OFF_AUTO_OFF;
 }
 
+/**
+ * kvm_gdbstub_sstep_flags():
+ *
+ * Returns: SSTEP_* flags that KVM supports for guest debug. The
+ * support is probed during kvm_init()
+ */
+static int kvm_gdbstub_sstep_flags(AccelState *as)
+{
+    return kvm_sstep_flags;
+}
+
 static void kvm_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -4277,6 +4515,7 @@ static void kvm_accel_class_init(ObjectClass *oc, const void *data)
     ac->rebuild_guest = kvm_reset_vmfd;
     ac->has_memory = kvm_accel_has_memory;
     ac->allowed = &kvm_allowed;
+    ac->gdbstub_supported_sstep_flags = kvm_gdbstub_sstep_flags;
 
     object_class_property_add(oc, "kernel-irqchip", "on|off|split",
         NULL, kvm_set_kernel_irqchip,

@@ -32,6 +32,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/usb/usb.h"
 #include "hw/arm/boot.h"
+#include "hw/arm/machines-qom.h"
 #include "hw/char/pl011.h"
 #include "hw/intc/arm_gic.h"
 #include "hw/intc/arm_gicv3_common.h"
@@ -68,6 +69,7 @@ struct VMAppleMachineState {
     MemoryRegion fw_mr;
     MemoryRegion ecam_alias;
     uint64_t uuid;
+    char *gfx_device;
 };
 
 #define TYPE_VMAPPLE_MACHINE   MACHINE_TYPE_NAME("vmapple")
@@ -82,6 +84,7 @@ enum {
     VMAPPLE_MEM,
     VMAPPLE_GIC_DIST,
     VMAPPLE_GIC_REDIST,
+    VMAPPLE_GICV2M,
     VMAPPLE_UART,
     VMAPPLE_RTC,
     VMAPPLE_PCIE,
@@ -103,6 +106,7 @@ static const MemMapEntry memmap[] = {
 
     [VMAPPLE_GIC_DIST] =           { 0x10000000, 0x00010000 },
     [VMAPPLE_GIC_REDIST] =         { 0x10010000, 0x00400000 },
+    [VMAPPLE_GICV2M] =             { 0x1FFF0000, 0x00010000 },
 
     [VMAPPLE_UART] =               { 0x20010000, 0x00010000 },
     [VMAPPLE_RTC] =                { 0x20050000, 0x00001000 },
@@ -128,6 +132,7 @@ static const int irqmap[] = {
     [VMAPPLE_APV_GFX] = 0x11,
     [VMAPPLE_AES_1] = 0x12,
     [VMAPPLE_PCIE] = 0x20,
+    [VMAPPLE_GICV2M] = 0x80
 };
 
 #define GPEX_NUM_IRQS 16
@@ -207,9 +212,18 @@ static void create_gfx(VMAppleMachineState *vms, MemoryRegion *mem)
 {
     int irq_gfx = vms->irqmap[VMAPPLE_APV_GFX];
     int irq_iosfc = vms->irqmap[VMAPPLE_APV_IOSFC];
+    DeviceState *gfx_dev;
     SysBusDevice *gfx;
 
-    gfx = SYS_BUS_DEVICE(qdev_new("apple-gfx-mmio"));
+    /*
+     * The platform's fixed REIMS_VGPU_GFX/REIMS_VGPU_IOSFC slots are backed by either
+     * apple-gfx-mmio (ParavirtualizedGraphics.framework host side, reference)
+     * or reims-vgpu-mmio (product: thin C → crates/reims-vgpu Rust staticlib).
+     * Sysbus layout: mmio 0/irq 0 = gfx window, mmio 1/irq 1 = IOSurface mapper.
+     */
+    gfx_dev = qdev_new(vms->gfx_device);
+    gfx_dev->id = g_strdup("reims-vgpu-gfx");
+    gfx = SYS_BUS_DEVICE(gfx_dev);
     sysbus_mmio_map(gfx, 0, vms->memmap[VMAPPLE_APV_GFX].base);
     sysbus_mmio_map(gfx, 1, vms->memmap[VMAPPLE_APV_IOSFC].base);
     sysbus_connect_irq(gfx, 0, qdev_get_gpio_in(vms->gic, irq_gfx));
@@ -282,6 +296,27 @@ static void create_gic(VMAppleMachineState *vms, MemoryRegion *mem)
         sysbus_connect_irq(gicbusdev, i, qdev_get_gpio_in(cpudev, ARM_CPU_IRQ));
         sysbus_connect_irq(gicbusdev, i + smp_cpus,
                            qdev_get_gpio_in(cpudev, ARM_CPU_FIQ));
+    }
+}
+
+#define NUM_GICV2M_SPIS       128
+
+static void create_gicv2m(VMAppleMachineState *vms)
+{
+    int i;
+    int irq = vms->irqmap[VMAPPLE_GICV2M];
+    DeviceState *dev;
+
+    dev = qdev_new("arm-gicv2m");
+    qdev_prop_set_uint32(dev, "base-spi", irq);
+    qdev_prop_set_uint32(dev, "num-spi", NUM_GICV2M_SPIS);
+    qdev_prop_set_uint32(dev, "macos-compat", 1);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, vms->memmap[VMAPPLE_GICV2M].base);
+
+    for (i = 0; i < NUM_GICV2M_SPIS; i++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), i,
+                           qdev_get_gpio_in(vms->gic, irq + i));
     }
 }
 
@@ -495,6 +530,7 @@ static void mach_vmapple_init(MachineState *machine)
                                 machine->ram);
 
     create_gic(vms, sysmem);
+    create_gicv2m(vms);
     create_bdif(vms, sysmem);
     create_pvpanic(vms, sysmem);
     create_aes(vms, sysmem);
@@ -561,6 +597,14 @@ static const CPUArchIdList *vmapple_possible_cpu_arch_ids(MachineState *ms)
     return ms->possible_cpus;
 }
 
+static bool vmapple_get_vgic_bases(const MachineState *ms,
+                                   uint64_t *dist_base, uint64_t *redist_base)
+{
+    *dist_base = memmap[VMAPPLE_GIC_DIST].base;
+    *redist_base = memmap[VMAPPLE_GIC_REDIST].base;
+    return true;
+}
+
 static GlobalProperty vmapple_compat_defaults[] = {
     { TYPE_VIRTIO_PCI, "disable-legacy", "on" },
     /*
@@ -585,6 +629,7 @@ static void vmapple_machine_class_init(ObjectClass *oc, const void *data)
     mc->cpu_index_to_instance_props = vmapple_cpu_index_to_props;
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("host");
     mc->get_default_cpu_node_id = vmapple_get_default_cpu_node_id;
+    mc->get_vgic_bases = vmapple_get_vgic_bases;
     mc->default_ram_id = "mach-vmapple.ram";
     mc->desc = "Apple aarch64 Virtual Machine";
 
@@ -592,15 +637,52 @@ static void vmapple_machine_class_init(ObjectClass *oc, const void *data)
                      G_N_ELEMENTS(vmapple_compat_defaults));
 }
 
+static char *vmapple_get_gfx_device(Object *obj, Error **errp)
+{
+    VMAppleMachineState *vms = VMAPPLE_MACHINE(obj);
+
+    return g_strdup(vms->gfx_device);
+}
+
+static void vmapple_set_gfx_device(Object *obj, const char *value,
+                                   Error **errp)
+{
+    VMAppleMachineState *vms = VMAPPLE_MACHINE(obj);
+
+    if (strcmp(value, "apple-gfx-mmio") != 0 &&
+        strcmp(value, "reims-vgpu-mmio") != 0) {
+        error_setg(errp,
+                   "invalid gfx-device '%s' (valid: apple-gfx-mmio, reims-vgpu-mmio)",
+                   value);
+        return;
+    }
+
+    g_free(vms->gfx_device);
+    vms->gfx_device = g_strdup(value);
+}
+
 static void vmapple_instance_init(Object *obj)
 {
     VMAppleMachineState *vms = VMAPPLE_MACHINE(obj);
 
     vms->irqmap = irqmap;
+    vms->gfx_device = g_strdup("apple-gfx-mmio");
 
     object_property_add_uint64_ptr(obj, "uuid", &vms->uuid,
                                    OBJ_PROP_FLAG_READWRITE);
     object_property_set_description(obj, "uuid", "Machine UUID (SDOM)");
+    object_property_add_str(obj, "gfx-device", vmapple_get_gfx_device,
+                            vmapple_set_gfx_device);
+    object_property_set_description(obj, "gfx-device",
+                                    "Paravirt GPU device backing the Reims VGPU "
+                                    "slots (apple-gfx-mmio | reims-vgpu-mmio)");
+}
+
+static void vmapple_instance_finalize(Object *obj)
+{
+    VMAppleMachineState *vms = VMAPPLE_MACHINE(obj);
+
+    g_free(vms->gfx_device);
 }
 
 static const TypeInfo vmapple_machine_info = {
@@ -609,6 +691,8 @@ static const TypeInfo vmapple_machine_info = {
     .instance_size = sizeof(VMAppleMachineState),
     .class_init    = vmapple_machine_class_init,
     .instance_init = vmapple_instance_init,
+    .instance_finalize = vmapple_instance_finalize,
+    .interfaces    = aarch64_machine_interfaces
 };
 
 static void machvmapple_machine_init(void)
@@ -616,4 +700,3 @@ static void machvmapple_machine_init(void)
     type_register_static(&vmapple_machine_info);
 }
 type_init(machvmapple_machine_init);
-

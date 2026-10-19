@@ -19,7 +19,6 @@
 #include "monitor/hmp.h"
 #include "monitor/hmp-completion.h"
 #include "monitor/monitor.h"
-#include "monitor/monitor-internal.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-migration.h"
 #include "qapi/qapi-visit-migration.h"
@@ -96,7 +95,7 @@ static void migration_dump_blocktime(Monitor *mon, MigrationInfo *info)
     }
 
     if (info->has_postcopy_non_vcpu_latency) {
-        monitor_printf(mon, "Postcopy non-vCPU Latency (ns): %" PRIu64 "\n",
+        monitor_printf(mon, "Postcopy non-vCPU Latencies (ns): %" PRIu64 "\n",
                        info->postcopy_non_vcpu_latency);
     }
 
@@ -854,14 +853,12 @@ void hmp_migrate(Monitor *mon, const QDict *qdict)
 
     if (!detach) {
         HMPMigrationStatus *status;
-        MonitorHMP *hmp = MONITOR_HMP(mon);
 
-        if (!hmp->use_readline) {
+        if (monitor_suspend(mon) < 0) {
             monitor_printf(mon, "terminal does not allow synchronous "
                            "migration, continuing detached\n");
             return;
         }
-        monitor_suspend(mon);
 
         status = g_malloc0(sizeof(*status));
         status->mon = mon;

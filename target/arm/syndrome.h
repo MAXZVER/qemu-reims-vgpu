@@ -345,37 +345,21 @@ static inline uint32_t syn_cp15_rrt_trap(int cv, int cond, int opc1, int crm,
 
 /*
  * ISS encoding for an exception from an access to a register of
- * instruction resulting from the FPEN or TFP traps. Note that
- * the TA and COPROC fields are only valid when an AArch32 insn
- * traps to AArch32 EL2; they are RES0 for traps to AArch64.
+ * instruction resulting from the FPEN or TFP traps.
  */
-FIELD(FP_ISS, COPROC, 0, 4)
-FIELD(FP_ISS, TA, 5, 1)
+FIELD(FP_ISS, COPROC, 0, 4) /* ARMv7 only */
 FIELD(FP_ISS, COND, 20, 4)
 FIELD(FP_ISS, CV, 24, 1)
 
-static inline uint32_t syn_a64_fp_access_trap(int cv, int cond)
+static inline uint32_t syn_fp_access_trap(int cv, int cond, bool is_16bit,
+                                          int coproc)
 {
-    /* AArch64 FP/SIMD trap: TA and coproc are RES0, insn is 64 bits */
+    /* AArch32 FP trap or any AArch64 FP/SIMD trap: TA == 0 */
     uint32_t res = syn_set_ec(0, EC_ADVSIMDFPACCESSTRAP);
-    res = FIELD_DP32(res, SYNDROME, IL, 1);
+    res = FIELD_DP32(res, SYNDROME, IL, !is_16bit);
 
     res = FIELD_DP32(res, FP_ISS, CV, cv);
     res = FIELD_DP32(res, FP_ISS, COND, cond);
-
-    return res;
-}
-
-static inline uint32_t syn_a32_fp_access_trap(int cv, int cond,
-                                              int ta, int coproc)
-{
-    /* AArch32 VFP or Neon trap: TA and coproc valid, insn is 64 bits */
-    uint32_t res = syn_set_ec(0, EC_ADVSIMDFPACCESSTRAP);
-    res = FIELD_DP32(res, SYNDROME, IL, 1);
-
-    res = FIELD_DP32(res, FP_ISS, CV, cv);
-    res = FIELD_DP32(res, FP_ISS, COND, cond);
-    res = FIELD_DP32(res, FP_ISS, TA, ta);
     res = FIELD_DP32(res, FP_ISS, COPROC, coproc);
 
     return res;

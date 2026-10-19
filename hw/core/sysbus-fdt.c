@@ -36,7 +36,6 @@
 #include "hw/display/ramfb.h"
 #include "hw/uefi/var-service-api.h"
 #include "hw/arm/fdt.h"
-#include "hw/watchdog/sbsa_gwdt.h"
 
 /*
  * internal struct that contains the information to create dynamic
@@ -141,7 +140,6 @@ static const BindingEntry bindings[] = {
     TYPE_BINDING(TYPE_ARM_SMMUV3, no_fdt_node),
     TYPE_BINDING(TYPE_RAMFB_DEVICE, no_fdt_node),
     TYPE_BINDING(TYPE_UEFI_VARS_SYSBUS, add_uefi_vars_node),
-    TYPE_BINDING(TYPE_WDT_SBSA, no_fdt_node),
     TYPE_BINDING("", NULL), /* last element */
 };
 

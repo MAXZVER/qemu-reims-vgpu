@@ -1525,12 +1525,14 @@ static VMBusChannel *find_channel(VMBus *vmbus, uint32_t id)
 static int enqueue_incoming_message(VMBus *vmbus,
                                     const struct hyperv_post_message_input *msg)
 {
+    int ret = 0;
     uint8_t idx, prev_size;
 
-    QEMU_LOCK_GUARD(&vmbus->rx_queue_lock);
+    qemu_mutex_lock(&vmbus->rx_queue_lock);
 
     if (vmbus->rx_queue_size == HV_MSG_QUEUE_LEN) {
-        return -ENOBUFS;
+        ret = -ENOBUFS;
+        goto out;
     }
 
     prev_size = vmbus->rx_queue_size;
@@ -1542,7 +1544,9 @@ static int enqueue_incoming_message(VMBus *vmbus,
     if (!prev_size) {
         vmbus_resched(vmbus);
     }
-    return 0;
+out:
+    qemu_mutex_unlock(&vmbus->rx_queue_lock);
+    return ret;
 }
 
 static uint16_t vmbus_recv_message(const struct hyperv_post_message_input *msg,
@@ -2093,10 +2097,10 @@ static void process_message(VMBus *vmbus)
     void *msgdata;
     uint32_t msglen;
 
-    QEMU_LOCK_GUARD(&vmbus->rx_queue_lock);
+    qemu_mutex_lock(&vmbus->rx_queue_lock);
 
     if (!vmbus->rx_queue_size) {
-        return;
+        goto unlock;
     }
 
     hv_msg = &vmbus->rx_queue[vmbus->rx_queue_head];
@@ -2145,6 +2149,8 @@ out:
     vmbus->rx_queue_head %= HV_MSG_QUEUE_LEN;
 
     vmbus_resched(vmbus);
+unlock:
+    qemu_mutex_unlock(&vmbus->rx_queue_lock);
 }
 
 static const struct {

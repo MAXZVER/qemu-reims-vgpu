@@ -404,9 +404,6 @@ control_statement : frame_check
                   ;
 
 frame_check : FCHK '(' rvalue ',' rvalue ')' ';'
-              {
-                  gen_framecheck(c, &@1, &$3, &$5);
-              }
             ;
 
 cancel_statement : LOAD_CANCEL
@@ -872,7 +869,7 @@ int main(int argc, char **argv)
     context.header_str = g_string_new(NULL);
     context.ternary = g_array_new(FALSE, TRUE, sizeof(Ternary));
     /* Read input file */
-    FILE *input_file = fopen(argv[ARG_INDEX_IDEFS], "rb");
+    FILE *input_file = fopen(argv[ARG_INDEX_IDEFS], "r");
     fseek(input_file, 0L, SEEK_END);
     long input_size = ftell(input_file);
     context.input_buffer = (char *) calloc(input_size + 1, sizeof(char));

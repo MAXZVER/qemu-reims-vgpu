@@ -17,25 +17,17 @@
 typedef struct JSONLexer {
     int start_state, state;
     GString *token;
-    int cur_x, cur_y;
     int x, y;
 } JSONLexer;
-
-typedef struct JSONParserContext {
-    Error *err;
-    GQueue *stack;
-    va_list *ap;
-} JSONParserContext;
 
 typedef struct JSONMessageParser {
     void (*emit)(void *opaque, QObject *json, Error *err);
     void *opaque;
+    va_list *ap;
     JSONLexer lexer;
-    JSONParserContext parser;
-    unsigned int brace_count;
-    unsigned int bracket_count;
-    unsigned int token_count;
-    bool error;
+    int brace_count;
+    int bracket_count;
+    GQueue tokens;
     uint64_t token_size;
 } JSONMessageParser;
 

@@ -839,12 +839,12 @@ found:
     /* It is safe to write mru_block outside the BQL.  This
      * is what happens:
      *
-     *     qatomic_set(&mru_block, xxx)
+     *     mru_block = xxx
      *     rcu_read_unlock()
      *                                        xxx removed from list
      *                  rcu_read_lock()
      *                  read mru_block
-     *                                        qatomic_set(&mru_block, NULL);
+     *                                        mru_block = NULL;
      *                                        call_rcu(reclaim_ramblock, xxx);
      *                  rcu_read_unlock()
      *
@@ -852,7 +852,7 @@ found:
      * when it was placed into the list.  Here we're just making an extra
      * copy of the pointer.
      */
-    qatomic_set(&ram_list.mru_block, block);
+    ram_list.mru_block = block;
     return block;
 }
 
@@ -1217,7 +1217,15 @@ uint64_t physical_memory_set_dirty_lebitmap(unsigned long *bitmap,
     hwaddr addr;
     ram_addr_t ram_addr;
     uint64_t num_dirty = 0;
-    unsigned long len = (pages + HOST_LONG_BITS - 1) / HOST_LONG_BITS;
+    /*
+     * The bitmap is an array of unsigned long, so its word width is
+     * BITS_PER_LONG. HOST_LONG_BITS is the pointer width, which differs on an
+     * LLP64 host (Windows: 32-bit long, 64-bit pointer): there the slow path
+     * below walked only the first half of the words and put bit j of word i on
+     * page i * 64 + j, so every page past the first 32 of an unaligned range
+     * was dropped or landed on the wrong page (WHPX ranged dirty sync).
+     */
+    unsigned long len = (pages + BITS_PER_LONG - 1) / BITS_PER_LONG;
     unsigned long hpratio = qemu_real_host_page_size() / TARGET_PAGE_SIZE;
     unsigned long page = BIT_WORD(start >> TARGET_PAGE_BITS);
 
@@ -1299,7 +1307,7 @@ uint64_t physical_memory_set_dirty_lebitmap(unsigned long *bitmap,
                 do {
                     j = ctzl(c);
                     c &= ~(1ul << j);
-                    page_number = (i * HOST_LONG_BITS + j) * hpratio;
+                    page_number = (i * BITS_PER_LONG + j) * hpratio;
                     addr = page_number * TARGET_PAGE_SIZE;
                     ram_addr = start + addr;
                     physical_memory_set_dirty_range(ram_addr,
@@ -1732,7 +1740,13 @@ static void *file_ram_alloc(RAMBlock *block,
         return NULL;
     }
     block->mr->align = MAX(block->page_size, block->mr->align);
-#if defined(__s390x__)
+    /*
+     * TEMP lab: on Linux too, so a memfd's shmem huge pages can be PMD-mapped
+     * (THPeligible needs the mapping 2 MiB-aligned like its file offset) and
+     * KVM maps the guest with 2 MiB EPT entries; 4 KiB-aligned, every page of
+     * the reims Tahoe guest's RAM stayed a 4 KiB mapping.
+     */
+#if defined(__s390x__) || defined(__linux__)
     if (kvm_enabled()) {
         block->mr->align = MAX(block->mr->align, QEMU_VMALLOC_ALIGN);
     }
@@ -2260,10 +2274,11 @@ static void ram_block_add(RAMBlock *new_block, Error **errp)
     } else { /* list is empty */
         QLIST_INSERT_HEAD_RCU(&ram_list.blocks, new_block, next);
     }
-    qatomic_set(&ram_list.mru_block, NULL);
+    ram_list.mru_block = NULL;
 
     /* Write list before version */
-    qatomic_store_release(&ram_list.version, ram_list.version + 1);
+    smp_wmb();
+    ram_list.version++;
     qemu_mutex_unlock_ramlist();
 
     physical_memory_set_dirty_range(new_block->offset,
@@ -2582,6 +2597,7 @@ static void reclaim_ramblock(RAMBlock *block)
     }
 
     if (block->guest_memfd >= 0) {
+        ram_block_attributes_destroy(block->attributes);
         close(block->guest_memfd);
         ram_block_coordinated_discard_require(false);
     }
@@ -2606,10 +2622,10 @@ void qemu_ram_free(RAMBlock *block)
     name = cpr_name(block->mr);
     cpr_delete_fd(name, 0);
     QLIST_REMOVE_RCU(block, next);
-    qatomic_set(&ram_list.mru_block, NULL);
+    ram_list.mru_block = NULL;
     /* Write list before version */
-    qatomic_store_release(&ram_list.version, ram_list.version + 1);
-    g_clear_pointer(&block->attributes, ram_block_attributes_destroy);
+    smp_wmb();
+    ram_list.version++;
     call_rcu(block, reclaim_ramblock, rcu);
     qemu_mutex_unlock_ramlist();
 }
@@ -4093,7 +4109,7 @@ int qemu_ram_foreach_block(RAMBlockIterFunc func, void *opaque)
  * Returns: 0 on success, none-0 on failure
  *
  */
-int ram_block_discard_shared_range(RAMBlock *rb, uint64_t offset, size_t length)
+int ram_block_discard_range(RAMBlock *rb, uint64_t offset, size_t length)
 {
     int ret = -1;
 
@@ -4142,7 +4158,7 @@ int ram_block_discard_shared_range(RAMBlock *rb, uint64_t offset, size_t length)
              * have a MAP_PRIVATE mapping, possibly messing with other
              * MAP_PRIVATE/MAP_SHARED mappings. There is no easy way to
              * change that behavior whithout violating the promised
-             * semantics of ram_block_discard_shared_range().
+             * semantics of ram_block_discard_range().
              *
              * Only warn, because it works as long as nobody else uses that
              * file.
@@ -4198,31 +4214,14 @@ int ram_block_discard_shared_range(RAMBlock *rb, uint64_t offset, size_t length)
             goto err;
 #endif
         }
-        trace_ram_block_discard_shared_range(rb->idstr, host_startaddr, length,
-                                             need_madvise, need_fallocate,
-                                             ret);
+        trace_ram_block_discard_range(rb->idstr, host_startaddr, length,
+                                      need_madvise, need_fallocate, ret);
     } else {
         error_report("%s: Overrun block '%s' (%" PRIu64 "/%zx/" RAM_ADDR_FMT")",
                      __func__, rb->idstr, offset, length, rb->max_length);
     }
 
 err:
-    return ret;
-}
-
-int ram_block_discard_range(RAMBlock *rb, uint64_t offset, size_t length)
-{
-    int ret;
-
-    ret = ram_block_discard_shared_range(rb, offset, length);
-    if (ret) {
-        return ret;
-    }
-
-    if (rb->guest_memfd >= 0) {
-        ret = ram_block_discard_guest_memfd_range(rb, offset, length);
-    }
-
     return ret;
 }
 

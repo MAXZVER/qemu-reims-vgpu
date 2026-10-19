@@ -62,15 +62,7 @@ static MemTxResult lasi_chip_read_with_attrs(void *opaque, hwaddr addr,
 
     switch (addr) {
     case LASI_IRR:
-        /*
-         * The interrupt request register reports the interrupts that are both
-         * pending and unmasked, derived live from IPR and IMR rather than
-         * latched, so masking or deasserting a source removes it immediately.
-         * The parisc core I/O interrupt dispatcher reads IRR; a latched bit
-         * that never cleared would be redelivered forever as a phantom
-         * "unexpected" interrupt.
-         */
-        val = s->ipr & s->imr;
+        val = s->irr;
         break;
     case LASI_IMR:
         val = s->imr;
@@ -242,18 +234,13 @@ static void lasi_set_irq(void *opaque, int irq, int level)
 
     if (level) {
         s->ipr |= bit;
-        if ((bit & s->imr) && (s->icr & ICR_BUS_ERROR_BIT) == 0) {
+        if (bit & s->imr) {
             uint32_t iar = s->iar;
-            stl_be_phys(&address_space_memory, iar & -32, iar & 31);
+            s->irr |= bit;
+            if ((s->icr & ICR_BUS_ERROR_BIT) == 0) {
+                stl_be_phys(&address_space_memory, iar & -32, iar & 31);
+            }
         }
-    } else {
-        /*
-         * The interrupt sources are level triggered, so a source that drops
-         * its request must clear its pending bit.  Otherwise the bit stays set
-         * in IPR (and hence IRR) and is redelivered as a phantom "unexpected"
-         * core I/O interrupt on every later interrupt.
-         */
-        s->ipr &= ~bit;
     }
 }
 

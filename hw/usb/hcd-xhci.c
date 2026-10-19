@@ -20,7 +20,9 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/core/cpu.h"
 #include "qemu/timer.h"
+#include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/queue.h"
@@ -39,6 +41,8 @@
 #else
 #define DPRINTF(...) do {} while (0)
 #endif
+#define FIXME(_msg) do { fprintf(stderr, "FIXME %s:%d %s\n", \
+                                 __func__, __LINE__, _msg); abort(); } while (0)
 
 #define TRB_LINK_LIMIT  32
 #define COMMAND_LIMIT   256
@@ -550,6 +554,21 @@ static XHCIPort *xhci_lookup_port(XHCIState *xhci, struct USBPort *uport)
     return &xhci->ports[index];
 }
 
+/* TEMP lab (QEMU_XHCI_NOBQL): the interrupter lock, a no-op in the stock mode. */
+static inline void xhci_ilock(XHCIState *xhci)
+{
+    if (xhci->lab_nobql) {
+        qemu_mutex_lock(&xhci->ilock);
+    }
+}
+
+static inline void xhci_iunlock(XHCIState *xhci)
+{
+    if (xhci->lab_nobql) {
+        qemu_mutex_unlock(&xhci->ilock);
+    }
+}
+
 static void xhci_intr_update(XHCIState *xhci, int v)
 {
     int level = 0;
@@ -572,6 +591,70 @@ static void xhci_intr_update(XHCIState *xhci, int v)
     }
 }
 
+/*
+ * TEMP lab (QEMU_XHCI_IMOD_MIN_US, 2026-10-14): interrupt moderation. This model raised an interrupt for every event
+ * and ignored the guest's IMOD; with usb-audio playing, macOS's xHCI driver then took thousands of interrupts a
+ * second, each a handful of MMIO exits under the BQL (work VM, YouTube: ~26k exits/s, ~144 ms/s of vCPU BQL wait;
+ * paused 1.4k / 2 ms). An interrupter now waits max(the guest's IMODI x 250 ns, the floor) after its last
+ * interrupt; events keep landing in the event ring meanwhile and the held interrupt reports them all. 0 (default)
+ * keeps the stock behaviour.
+ */
+static int64_t xhci_lab_imod_floor_ns(void)
+{
+    static int64_t floor_ns = -1;
+
+    if (floor_ns < 0) {
+        const char *e = getenv("QEMU_XHCI_IMOD_MIN_US");
+        floor_ns = e ? MAX(0, atoi(e)) * SCALE_US : 0;
+        fprintf(stderr, "xhci: interrupt moderation floor %" PRId64 " us (QEMU_XHCI_IMOD_MIN_US)\n",
+                floor_ns / SCALE_US);
+    }
+    return floor_ns;
+}
+
+static void xhci_intr_send(XHCIState *xhci, int v)
+{
+    xhci->intr[v].mod_last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (xhci->intr_raise) {
+        if (xhci->intr_raise(xhci, v, true)) {
+            xhci->intr[v].iman &= ~IMAN_IP;
+        }
+    }
+}
+
+static void xhci_intr_mod_timer(void *opaque)
+{
+    XHCIInterrupter *intr = opaque;
+    XHCIState *xhci = intr->mod_xhci;
+    int v = intr - xhci->intr;
+
+    xhci_ilock(xhci);
+    if ((intr->iman & IMAN_IP) && (intr->iman & IMAN_IE) && (xhci->usbcmd & USBCMD_INTE)) {
+        xhci_intr_send(xhci, v);
+    }
+    xhci_iunlock(xhci);
+}
+
+/* True when the interrupt was held back for the moderation interval (the timer sends it). */
+static bool xhci_intr_moderated(XHCIState *xhci, int v)
+{
+    XHCIInterrupter *intr = &xhci->intr[v];
+    int64_t floor_ns = xhci_lab_imod_floor_ns(), interval, now;
+
+    if (!floor_ns || !intr->mod_timer) {
+        return false;
+    }
+    interval = MAX(floor_ns, (int64_t)(intr->imod & 0xffff) * 250);
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (now - intr->mod_last_ns >= interval) {
+        return false;
+    }
+    if (!timer_pending(intr->mod_timer)) {
+        timer_mod(intr->mod_timer, intr->mod_last_ns + interval);
+    }
+    return true;
+}
+
 static void xhci_intr_raise(XHCIState *xhci, int v)
 {
     bool pending = (xhci->intr[v].erdp_low & ERDP_EHB);
@@ -590,6 +673,10 @@ static void xhci_intr_raise(XHCIState *xhci, int v)
     if (!(xhci->usbcmd & USBCMD_INTE)) {
         return;
     }
+    if (xhci_intr_moderated(xhci, v)) {
+        return;
+    }
+    xhci->intr[v].mod_last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     if (xhci->intr_raise) {
         if (xhci->intr_raise(xhci, v, true)) {
             xhci->intr[v].iman &= ~IMAN_IP;
@@ -636,7 +723,7 @@ static void xhci_write_event(XHCIState *xhci, XHCIEvent *event, int v)
     }
 }
 
-static void xhci_event(XHCIState *xhci, XHCIEvent *event, int v)
+static void xhci_event_locked(XHCIState *xhci, XHCIEvent *event, int v)
 {
     XHCIInterrupter *intr;
     dma_addr_t erdp;
@@ -677,6 +764,14 @@ static void xhci_event(XHCIState *xhci, XHCIEvent *event, int v)
     }
 
     xhci_intr_raise(xhci, v);
+}
+
+/* Every event goes through here, under the BQL; TEMP lab (QEMU_XHCI_NOBQL): and under `ilock`. */
+static void xhci_event(XHCIState *xhci, XHCIEvent *event, int v)
+{
+    xhci_ilock(xhci);
+    xhci_event_locked(xhci, event, v);
+    xhci_iunlock(xhci);
 }
 
 static void xhci_ring_init(XHCIState *xhci, XHCIRing *ring,
@@ -963,13 +1058,11 @@ static TRBCCode xhci_alloc_device_streams(XHCIState *xhci, unsigned int slotid,
          * together and make an usb_device_alloc_streams call per group.
          */
         if (epctxs[i]->nr_pstreams != req_nr_streams) {
-            qemu_log_mask(LOG_UNIMP,
-                          "guest streams config not identical for all eps\n");
+            FIXME("guest streams config not identical for all eps");
             return CC_RESOURCE_ERROR;
         }
         if (eps[i]->max_streams != dev_max_streams) {
-            qemu_log_mask(LOG_UNIMP,
-                          "device streams config not identical for all eps\n");
+            FIXME("device streams config not identical for all eps");
             return CC_RESOURCE_ERROR;
         }
     }
@@ -1009,12 +1102,7 @@ static XHCIStreamContext *xhci_find_stream(XHCIEPContext *epctx,
     dma_addr_t base;
     uint32_t ctx[2], sct;
 
-    if (!streamid) {
-        qemu_log_mask(LOG_GUEST_ERROR, "xhci: stream ID is zero\n");
-        *cc_error = CC_INVALID_STREAM_ID_ERROR;
-        return NULL;
-    }
-
+    assert(streamid != 0);
     if (epctx->lsa) {
         if (streamid >= epctx->nr_pstreams) {
             *cc_error = CC_INVALID_STREAM_ID_ERROR;
@@ -1022,8 +1110,7 @@ static XHCIStreamContext *xhci_find_stream(XHCIEPContext *epctx,
         }
         sctx = epctx->pstreams + streamid;
     } else {
-        qemu_log_mask(LOG_UNIMP,
-                      "xhci: secondary streams not implemented yet\n");
+        fprintf(stderr, "xhci: FIXME: secondary streams not implemented yet");
         *cc_error = CC_INVALID_STREAM_TYPE_ERROR;
         return NULL;
     }
@@ -1126,7 +1213,7 @@ static void xhci_init_epctx(XHCIEPContext *epctx,
         epctx->ring.ccs = ctx[2] & 1;
     }
 
-    epctx->interval = 1u << MIN((ctx[0] >> 16) & 0xffu, 18u);
+    epctx->interval = 1 << ((ctx[0] >> 16) & 0xff);
 }
 
 static TRBCCode xhci_enable_ep(XHCIState *xhci, unsigned int slotid,
@@ -1677,7 +1764,9 @@ static int xhci_try_complete_packet(XHCITransfer *xfer)
         xhci_stall_ep(xfer);
         break;
     default:
-        g_assert_not_reached();
+        DPRINTF("%s: FIXME: status = %d\n", __func__,
+                xfer->packet.status);
+        FIXME("unhandled USB_RET_*");
     }
     return 0;
 }
@@ -2721,9 +2810,14 @@ static void xhci_reset(DeviceState *dev)
         xhci_port_update(xhci->ports + i, 0);
     }
 
+    xhci_ilock(xhci);   /* TEMP lab (QEMU_XHCI_NOBQL) */
     for (i = 0; i < xhci->numintrs; i++) {
         xhci->intr[i].iman = 0;
         xhci->intr[i].imod = 0;
+        if (xhci->intr[i].mod_timer) {   /* TEMP lab (QEMU_XHCI_IMOD_MIN_US) */
+            timer_del(xhci->intr[i].mod_timer);
+        }
+        xhci->intr[i].mod_last_ns = 0;
         xhci->intr[i].erstsz = 0;
         xhci->intr[i].erstba_low = 0;
         xhci->intr[i].erstba_high = 0;
@@ -2734,6 +2828,11 @@ static void xhci_reset(DeviceState *dev)
         xhci->intr[i].er_pcs = 1;
         xhci->intr[i].ev_buffer_put = 0;
         xhci->intr[i].ev_buffer_get = 0;
+    }
+    xhci_iunlock(xhci);
+    if (xhci->lab_nobql) {   /* doorbells rung before the reset are void */
+        memset(xhci->db_pending, 0, sizeof(xhci->db_pending));
+        qatomic_set(&xhci->db_cmd, 0);
     }
 
     xhci->mfindex_start = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -2985,13 +3084,17 @@ static void xhci_oper_write(void *ptr, hwaddr reg,
         if (val & USBCMD_HCRST) {
             xhci_reset(DEVICE(xhci));
         }
+        xhci_ilock(xhci);
         xhci_intr_update(xhci, 0);
+        xhci_iunlock(xhci);
         break;
 
     case 0x04: /* USBSTS */
         /* these bits are write-1-to-clear */
         xhci->usbsts &= ~(val & (USBSTS_HSE|USBSTS_EINT|USBSTS_PCD|USBSTS_SRE));
+        xhci_ilock(xhci);
         xhci_intr_update(xhci, 0);
+        xhci_iunlock(xhci);
         break;
 
     case 0x14: /* DNCTRL */
@@ -3044,13 +3147,8 @@ static uint64_t xhci_runtime_read(void *ptr, hwaddr reg,
         }
     } else {
         int v = (reg - 0x20) / 0x20;
-
-        if (v >= xhci->numintrs) {
-            qemu_log_mask(LOG_GUEST_ERROR,
-                          "xhci: read from nonexistent interrupter %i\n", v);
-            goto out_trace;
-        }
         XHCIInterrupter *intr = &xhci->intr[v];
+        xhci_ilock(xhci);   /* TEMP lab (QEMU_XHCI_NOBQL): may run without the BQL */
         switch (reg & 0x1f) {
         case 0x00: /* IMAN */
             ret = intr->iman;
@@ -3074,33 +3172,23 @@ static uint64_t xhci_runtime_read(void *ptr, hwaddr reg,
             ret = intr->erdp_high;
             break;
         }
+        xhci_iunlock(xhci);
     }
 
-out_trace:
     trace_usb_xhci_runtime_read(reg, ret);
     return ret;
 }
 
-static void xhci_runtime_write(void *ptr, hwaddr reg,
-                               uint64_t val, unsigned size)
+static void xhci_runtime_write_locked(XHCIState *xhci, hwaddr reg, uint64_t val)
 {
-    XHCIState *xhci = ptr;
     XHCIInterrupter *intr;
     int v;
-
-    trace_usb_xhci_runtime_write(reg, val);
 
     if (reg < 0x20) {
         trace_usb_xhci_unimplemented("runtime write", reg);
         return;
     }
-
     v = (reg - 0x20) / 0x20;
-    if (v >= xhci->numintrs) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "xhci: write to nonexistent interrupter %i\n", v);
-        return;
-    }
     intr = &xhci->intr[v];
 
     switch (reg & 0x1f) {
@@ -3153,12 +3241,150 @@ static void xhci_runtime_write(void *ptr, hwaddr reg,
     }
 }
 
+/*
+ * TEMP lab (QEMU_XHCI_NOBQL=on): this handler is reached from a vCPU without the BQL (WHPX's lab fast store). The
+ * writes a busy guest makes - IMAN acknowledging an interrupt with its enable unchanged under MSI-X, IMOD, ERDP and
+ * ERDP high - need only `ilock`; an ERDP write that leaves events behind re-raises, and IMAN changing the enable,
+ * the legacy INTx line and the event ring base are rare: those take the BQL first, then `ilock`, as every other path.
+ */
+static bool xhci_runtime_write_needs_bql(XHCIState *xhci, hwaddr reg, uint64_t val)
+{
+    XHCIInterrupter *intr;
+
+    if (reg < 0x20) {
+        return false;
+    }
+    intr = &xhci->intr[(reg - 0x20) / 0x20];
+    switch (reg & 0x1f) {
+    case 0x00: /* IMAN: an ack that leaves IP set would re-send the MSI-X message */
+        return (intr->iman & IMAN_IE) != (val & IMAN_IE) || !intr->msix_used ||
+               ((intr->iman & IMAN_IP) && !(val & IMAN_IP));
+    case 0x14: /* ERSTBA high: the event ring is read from guest memory */
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool xhci_erdp_left_events(XHCIState *xhci, int v)
+{
+    XHCIInterrupter *intr = &xhci->intr[v];
+    dma_addr_t erdp = xhci_addr64(intr->erdp_low, intr->erdp_high);
+    unsigned int dp_idx = (erdp - intr->er_start) / TRB_SIZE;
+
+    return !(intr->erdp_low & ERDP_EHB) && erdp >= intr->er_start &&
+           erdp < (intr->er_start + TRB_SIZE * intr->er_size) && dp_idx != intr->er_ep_idx;
+}
+
+static void xhci_runtime_write(void *ptr, hwaddr reg,
+                               uint64_t val, unsigned size)
+{
+    XHCIState *xhci = ptr;
+    bool took_bql = false;
+
+    trace_usb_xhci_runtime_write(reg, val);
+
+    if (!xhci->lab_nobql) {
+        xhci_runtime_write_locked(xhci, reg, val);
+        return;
+    }
+    if (!bql_locked()) {
+        qemu_mutex_lock(&xhci->ilock);
+        if (!xhci_runtime_write_needs_bql(xhci, reg, val)) {
+            bool erdp = reg >= 0x20 && (reg & 0x1f) == 0x18 && (val & ERDP_EHB);
+            int v = (reg - 0x20) / 0x20;
+
+            if (erdp) {
+                /* The ack alone; a re-raise for events left behind needs the BQL (MSI-X delivery). */
+                XHCIInterrupter *intr = &xhci->intr[v];
+
+                intr->erdp_low = (val & ~ERDP_EHB);
+                if (!xhci_erdp_left_events(xhci, v)) {
+                    qemu_mutex_unlock(&xhci->ilock);
+                    return;
+                }
+                qemu_mutex_unlock(&xhci->ilock);
+                bql_lock();
+                qemu_mutex_lock(&xhci->ilock);
+                if (xhci_erdp_left_events(xhci, v)) {
+                    xhci_intr_raise(xhci, v);
+                }
+                qemu_mutex_unlock(&xhci->ilock);
+                bql_unlock();
+                return;
+            }
+            xhci_runtime_write_locked(xhci, reg, val);
+            qemu_mutex_unlock(&xhci->ilock);
+            return;
+        }
+        qemu_mutex_unlock(&xhci->ilock);
+        bql_lock();
+        took_bql = true;
+    }
+    qemu_mutex_lock(&xhci->ilock);
+    xhci_runtime_write_locked(xhci, reg, val);
+    qemu_mutex_unlock(&xhci->ilock);
+    if (took_bql) {
+        bql_unlock();
+    }
+}
+
 static uint64_t xhci_doorbell_read(void *ptr, hwaddr reg,
                                    unsigned size)
 {
     /* doorbells always read as 0 */
     trace_usb_xhci_doorbell_read(reg, 0);
     return 0;
+}
+
+/*
+ * TEMP lab (QEMU_XHCI_NOBQL): the doorbells rung without the BQL, kicked here in the main loop. A doorbell is only
+ * a "look at this ring" - the guest wrote its TRBs before ringing - so a kick a little later is the same kick.
+ */
+static void xhci_db_bh(void *opaque)
+{
+    XHCIState *xhci = opaque;
+    unsigned int slot, epid;
+
+    if (qatomic_xchg(&xhci->db_cmd, 0) && xhci_running(xhci)) {
+        xhci_process_commands(xhci);
+    }
+    for (slot = 1; slot <= xhci->numslots; slot++) {
+        uint32_t eps = qatomic_xchg(&xhci->db_pending[slot], 0);
+
+        while (eps && xhci_running(xhci)) {
+            epid = ctz32(eps);
+            eps &= eps - 1;
+            xhci_kick_ep(xhci, slot, epid, 0);
+        }
+    }
+}
+
+/*
+ * TEMP lab (QEMU_XHCI_LAB_DBGAP=1, 2026-10-14): guest audio drops 30-190 ms under a 5K canvas with no BQL hold,
+ * BH or timer >= 8 ms in QEMU (b445). Who went quiet - the guest's iso doorbells, or QEMU after them? Logs a doorbell
+ * that comes more than 25 ms after the previous one on an endpoint already rung 500 times (a stream).
+ */
+static void xhci_lab_note_doorbell(XHCIState *xhci, unsigned int slot, unsigned int epid)
+{
+    static int on = -1;
+    int64_t now, last, gap;
+
+    if (on < 0) {
+        const char *e = getenv("QEMU_XHCI_LAB_DBGAP");
+        on = e && !strcmp(e, "1");
+    }
+    if (!on || slot < 1 || slot > XHCI_MAXSLOTS || epid > 31) {
+        return;
+    }
+    now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    last = qatomic_xchg(&xhci->lab_db_last[slot][epid], now);
+    gap = last ? now - last : 0;
+    if (qatomic_fetch_inc(&xhci->lab_db_n[slot][epid]) >= 500 && gap > 25 * SCALE_MS) {
+        fprintf(stderr, "xhci-lab dbgap %s slot %u ep %u gap %" PRId64 " ms at %" PRId64 "\n",
+                object_get_canonical_path_component(OBJECT(xhci->hostOpaque)) ?: "?", slot, epid,
+                gap / SCALE_MS, (int64_t)(g_get_real_time() / 1000));
+    }
 }
 
 static void xhci_doorbell_write(void *ptr, hwaddr reg,
@@ -3168,6 +3394,36 @@ static void xhci_doorbell_write(void *ptr, hwaddr reg,
     unsigned int epid, streamid;
 
     trace_usb_xhci_doorbell_write(reg, val);
+    if (reg) {
+        xhci_lab_note_doorbell(xhci, reg >> 2, val & 0xff);
+    }
+    if (xhci->lab_nobql && !bql_locked()) {
+        unsigned int slot = reg >> 2;
+
+        epid = val & 0xff;
+        streamid = (val >> 16) & 0xffff;
+        if (slot == 0 && val == 0) {
+            qatomic_set(&xhci->db_cmd, 1);
+            qemu_bh_schedule(xhci->db_bh);
+            return;
+        }
+        if (slot >= 1 && slot <= xhci->numslots && epid >= 1 && epid <= 31 && streamid == 0) {
+            qatomic_or(&xhci->db_pending[slot], 1u << epid);
+            qemu_bh_schedule(xhci->db_bh);
+            return;
+        }
+        /* streams and malformed doorbells: the stock path, under the BQL */
+        bql_lock();
+        xhci_doorbell_write(ptr, reg, val, size);
+        bql_unlock();
+        return;
+    }
+    if (usb_lab_trace_on() && reg) {
+        usb_lab_trace("D %s s%d e%d cpu%d",
+                      object_get_canonical_path_component(OBJECT(xhci->hostOpaque)),
+                      (int)(reg >> 2), (int)(val & 0xff),
+                      current_cpu ? current_cpu->cpu_index : -1);
+    }
 
     if (!xhci_running(xhci)) {
         DPRINTF("xhci: wrote doorbell while xHC stopped or paused\n");
@@ -3429,6 +3685,11 @@ static void usb_xhci_realize(DeviceState *dev, Error **errp)
 
     usb_xhci_init(xhci);
     xhci->mfwrap_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, xhci_mfwrap_timer, xhci);
+    for (i = 0; i < xhci->numintrs; i++) {   /* TEMP lab (QEMU_XHCI_IMOD_MIN_US) */
+        xhci->intr[i].mod_xhci = xhci;
+        xhci->intr[i].mod_last_ns = 0;
+        xhci->intr[i].mod_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, xhci_intr_mod_timer, &xhci->intr[i]);
+    }
 
     memory_region_init(&xhci->mem, OBJECT(dev), "xhci", XHCI_LEN_REGS);
     memory_region_init_io(&xhci->mem_cap, OBJECT(dev), &xhci_cap_ops, xhci,
@@ -3444,6 +3705,26 @@ static void usb_xhci_realize(DeviceState *dev, Error **errp)
     memory_region_add_subregion(&xhci->mem, OFF_OPER,     &xhci->mem_oper);
     memory_region_add_subregion(&xhci->mem, OFF_RUNTIME,  &xhci->mem_runtime);
     memory_region_add_subregion(&xhci->mem, OFF_DOORBELL, &xhci->mem_doorbell);
+
+    /*
+     * TEMP lab (QEMU_XHCI_NOBQL=on, 2026-10-14): usb-audio playing put ~20k MMIO exits a second on this controller,
+     * every one waiting for the BQL (work VM, YouTube: ~144 ms/s of vCPU BQL wait, the UI and the sound stuttered).
+     * The interrupter registers and the doorbells - nearly all of those exits - now run without it (see
+     * xhci_runtime_write, xhci_doorbell_write); the operational and port registers keep it.
+     */
+    {
+        const char *e = getenv("QEMU_XHCI_NOBQL");
+
+        xhci->lab_nobql = e && (!strcmp(e, "on") || !strcmp(e, "1"));
+        if (xhci->lab_nobql) {
+            qemu_mutex_init(&xhci->ilock);
+            xhci->db_bh = qemu_bh_new(xhci_db_bh, xhci);
+            memory_region_enable_lab_fast_store(&xhci->mem_runtime);
+            memory_region_enable_lab_fast_store(&xhci->mem_doorbell);
+            info_report("xhci %s: runtime registers and doorbells without the BQL (QEMU_XHCI_NOBQL)",
+                        object_get_canonical_path_component(OBJECT(dev)) ?: "?");
+        }
+    }
 
     for (i = 0; i < xhci->numports; i++) {
         XHCIPort *port = &xhci->ports[i];
@@ -3469,6 +3750,16 @@ static void usb_xhci_unrealize(DeviceState *dev)
     if (xhci->mfwrap_timer) {
         timer_free(xhci->mfwrap_timer);
         xhci->mfwrap_timer = NULL;
+    }
+    for (i = 0; i < xhci->numintrs; i++) {   /* TEMP lab (QEMU_XHCI_IMOD_MIN_US) */
+        if (xhci->intr[i].mod_timer) {
+            timer_free(xhci->intr[i].mod_timer);
+            xhci->intr[i].mod_timer = NULL;
+        }
+    }
+    if (xhci->lab_nobql && xhci->db_bh) {   /* TEMP lab (QEMU_XHCI_NOBQL) */
+        qemu_bh_delete(xhci->db_bh);
+        xhci->db_bh = NULL;
     }
 
     memory_region_del_subregion(&xhci->mem, &xhci->mem_cap);

@@ -30,4 +30,3 @@ Contents:
    target-sparc64
    target-i386
    target-xtensa
-   target-hexagon

@@ -34,7 +34,6 @@
 #include "hw/core/qdev-properties.h"
 #include "kvm/kvm_i386.h"
 #include "qemu/iova-tree.h"
-#include "hw/core/registerfields.h"
 
 struct AMDVIAddressSpace {
     PCIBus *bus;                /* PCIBus (for bus number)              */
@@ -88,49 +87,6 @@ typedef struct AMDVIIOTLBKey {
     uint64_t gfn;
     uint16_t devid;
 } AMDVIIOTLBKey;
-
-typedef struct AMDVIIrteGA {
-    uint64_t ga_lo;
-    uint64_t ga_hi;
-} AMDVIIrteGA;
-
-/* XT IOMMU General Interrupt Control Register layout */
-FIELD(AMDVI_XT_GEN_INTR, DEST_MODE, 2, 1)
-FIELD(AMDVI_XT_GEN_INTR, DEST_LO, 8, 24)
-FIELD(AMDVI_XT_GEN_INTR, VECTOR, 32, 8)
-FIELD(AMDVI_XT_GEN_INTR, DELIVERY_MODE, 40, 1)
-FIELD(AMDVI_XT_GEN_INTR, DEST_HI, 56, 8)
-
-/* Interrupt Remapping Table Fields Formats */
-
-/* Basic 32-bit IRTE layout (GAEn=0) */
-FIELD(AMDVI_IRTE, VALID, 0, 1)
-FIELD(AMDVI_IRTE, SUP_IOPF, 1, 1)
-FIELD(AMDVI_IRTE, INT_TYPE, 2, 3)
-FIELD(AMDVI_IRTE, RQ_EOI, 5, 1)
-FIELD(AMDVI_IRTE, DM, 6, 1)
-FIELD(AMDVI_IRTE, GUEST_MODE, 7, 1)
-FIELD(AMDVI_IRTE, DESTINATION, 8, 8)
-FIELD(AMDVI_IRTE, VECTOR, 16, 8)
-
-/* 128-bit IRTE layout (GAEn=1) */
-FIELD(AMDVI_IRTE_GA_LO, VALID, 0, 1)
-FIELD(AMDVI_IRTE_GA_LO, SUP_IOPF, 1, 1)
-FIELD(AMDVI_IRTE_GA_LO, INT_TYPE, 2, 3)
-FIELD(AMDVI_IRTE_GA_LO, RQ_EOI, 5, 1)
-FIELD(AMDVI_IRTE_GA_LO, DM, 6, 1)
-FIELD(AMDVI_IRTE_GA_LO, GUEST_MODE, 7, 1)
-/*
- * In the 128-bit IRTE format, XT mode uses IRTE_GA_LOW.Destination[23:0]
- * together with IRTE_GA_HI.DestinationHi[7:0] to construct a 32-bit x2APIC
- * destination.
- * Without XTEn (i.e. when x2APIC support is not enabled), only
- * IRTE_GA_LOW.Destination[7:0] is used.
- */
-FIELD(AMDVI_IRTE_GA_LO, DESTINATION, 8, 24)
-
-FIELD(AMDVI_IRTE_GA_HI, VECTOR, 0, 8)
-FIELD(AMDVI_IRTE_GA_HI, DESTINATION_HI, 56, 8)
 
 uint64_t amdvi_extended_feature_register(AMDVIState *s)
 {
@@ -238,17 +194,17 @@ static void amdvi_assign_andq(AMDVIState *s, hwaddr addr, uint64_t val)
 
 static void amdvi_build_xt_msi_msg(AMDVIState *s, MSIMessage *msg)
 {
-    uint64_t xt_reg = amdvi_readq(s, AMDVI_MMIO_XT_GEN_INTR);
+    union mmio_xt_intr xt_reg;
+    struct X86IOMMUIrq irq;
 
-    X86IOMMUIrq irq = {
-        .vector = FIELD_EX64(xt_reg, AMDVI_XT_GEN_INTR, VECTOR),
-        .delivery_mode = FIELD_EX64(xt_reg, AMDVI_XT_GEN_INTR, DELIVERY_MODE),
-        .dest_mode = FIELD_EX64(xt_reg, AMDVI_XT_GEN_INTR, DEST_MODE),
-        .dest = (FIELD_EX64(xt_reg, AMDVI_XT_GEN_INTR, DEST_HI) << 24) |
-                 FIELD_EX64(xt_reg, AMDVI_XT_GEN_INTR, DEST_LO),
-        .trigger_mode = 0,
-        .redir_hint = 0,
-    };
+    xt_reg.val = amdvi_readq(s, AMDVI_MMIO_XT_GEN_INTR);
+
+    irq.vector = xt_reg.vector;
+    irq.delivery_mode = xt_reg.delivery_mode;
+    irq.dest_mode = xt_reg.destination_mode;
+    irq.dest = (xt_reg.destination_hi << 24) | xt_reg.destination_lo;
+    irq.trigger_mode = 0;
+    irq.redir_hint = 0;
 
     x86_iommu_irq_to_msi_message(&irq, msg);
 }
@@ -278,7 +234,6 @@ static uint32_t get_next_eventlog_entry(AMDVIState *s)
 
 static void amdvi_log_event(AMDVIState *s, uint64_t *evt)
 {
-    uint64_t le_evt[2];
     uint32_t evtlog_tail_next;
 
     /* event logging not enabled */
@@ -299,14 +254,8 @@ static void amdvi_log_event(AMDVIState *s, uint64_t *evt)
         return;
     }
 
-    /*
-     * Convert event buffer to little-endian before writing it to guest memory.
-     */
-    le_evt[0] = cpu_to_le64(evt[0]);
-    le_evt[1] = cpu_to_le64(evt[1]);
-
     if (dma_memory_write(&address_space_memory, s->evtlog + s->evtlog_tail,
-                         le_evt, AMDVI_EVENT_LEN, MEMTXATTRS_UNSPECIFIED)) {
+                         evt, AMDVI_EVENT_LEN, MEMTXATTRS_UNSPECIFIED)) {
         trace_amdvi_evntlog_fail(s->evtlog, s->evtlog_tail);
     }
 
@@ -552,18 +501,15 @@ static void amdvi_update_iotlb(AMDVIState *s, uint16_t devid,
 static void amdvi_completion_wait(AMDVIState *s, uint64_t *cmd)
 {
     /* pad the last 3 bits */
-    hwaddr addr = extract64(cmd[0], 3, 49) << 3;
-    uint64_t data = cmd[1];
-
-    /* Format the data to be written to guest memory as little-endian */
-    uint64_t le_data = cpu_to_le64(data);
+    hwaddr addr = cpu_to_le64(extract64(cmd[0], 3, 49)) << 3;
+    uint64_t data = cpu_to_le64(cmd[1]);
 
     if (extract64(cmd[0], 52, 8)) {
         amdvi_log_illegalcom_error(s, extract64(cmd[0], 60, 4),
                                    s->cmdbuf + s->cmdbuf_head);
     }
     if (extract64(cmd[0], 0, 1)) {
-        if (dma_memory_write(&address_space_memory, addr, &le_data,
+        if (dma_memory_write(&address_space_memory, addr, &data,
                              AMDVI_COMPLETION_DATA_SIZE,
                              MEMTXATTRS_UNSPECIFIED)) {
             trace_amdvi_completion_wait_fail(addr);
@@ -713,7 +659,7 @@ static uint64_t large_pte_page_size(uint64_t pte)
  *   - IOVA exceeds the address width supported by DTE[Mode]
  * In all such cases a page walk must be aborted.
  */
-static int amdvi_get_top_pt_level_and_perms(hwaddr address, uint64_t dte,
+static uint64_t amdvi_get_top_pt_level_and_perms(hwaddr address, uint64_t dte,
                                                  uint8_t *top_level,
                                                  IOMMUAccessFlags *dte_perms)
 {
@@ -756,7 +702,7 @@ static int amdvi_get_top_pt_level_and_perms(hwaddr address, uint64_t dte,
  *      page table walk. This means that the DTE has valid data, but one of the
  *      lower level entries in the Page Table could not be read.
  */
-static int fetch_pte(AMDVIAddressSpace *as, hwaddr address, uint64_t dte,
+static uint64_t fetch_pte(AMDVIAddressSpace *as, hwaddr address, uint64_t dte,
                           uint64_t *pte, hwaddr *page_size)
 {
     uint64_t pte_addr;
@@ -1291,7 +1237,7 @@ static void amdvi_update_addr_translation_mode(AMDVIState *s, uint16_t devid)
 /* log error without aborting since linux seems to be using reserved bits */
 static void amdvi_inval_devtab_entry(AMDVIState *s, uint64_t *cmd)
 {
-    uint16_t devid = extract64(cmd[0], 0, 16);
+    uint16_t devid = cpu_to_le16((uint16_t)extract64(cmd[0], 0, 16));
 
     trace_amdvi_devtab_inval(PCI_BUS_NUM(devid), PCI_SLOT(devid),
                              PCI_FUNC(devid));
@@ -1458,9 +1404,9 @@ static void amdvi_sync_domain(AMDVIState *s, uint16_t domid, uint64_t addr,
 /* we don't have devid - we can't remove pages by address */
 static void amdvi_inval_pages(AMDVIState *s, uint64_t *cmd)
 {
-    uint16_t domid = extract64(cmd[0], 32, 16);
-    uint64_t addr = extract64(cmd[1], 12, 52) << 12;
-    uint16_t flags = extract64(cmd[1], 0, 3);
+    uint16_t domid = cpu_to_le16((uint16_t)extract64(cmd[0], 32, 16));
+    uint64_t addr = cpu_to_le64(extract64(cmd[1], 12, 52)) << 12;
+    uint16_t flags = cpu_to_le16((uint16_t)extract64(cmd[1], 0, 3));
 
     if (extract64(cmd[0], 20, 12) || extract64(cmd[0], 48, 12) ||
         extract64(cmd[1], 3, 9)) {
@@ -1507,7 +1453,7 @@ static void amdvi_inval_inttable(AMDVIState *s, uint64_t *cmd)
 static void iommu_inval_iotlb(AMDVIState *s, uint64_t *cmd)
 {
 
-    uint16_t devid = extract64(cmd[0], 0, 16);
+    uint16_t devid = cpu_to_le16(extract64(cmd[0], 0, 16));
     if (extract64(cmd[1], 1, 1) || extract64(cmd[1], 3, 1) ||
         extract64(cmd[1], 6, 6)) {
         amdvi_log_illegalcom_error(s, extract64(cmd[0], 60, 4),
@@ -1519,7 +1465,7 @@ static void iommu_inval_iotlb(AMDVIState *s, uint64_t *cmd)
         g_hash_table_foreach_remove(s->iotlb, amdvi_iotlb_remove_by_devid,
                                     &devid);
     } else {
-        amdvi_iotlb_remove_page(s, extract64(cmd[1], 12, 52) << 12,
+        amdvi_iotlb_remove_page(s, cpu_to_le64(extract64(cmd[1], 12, 52)) << 12,
                                 devid);
     }
     trace_amdvi_iotlb_inval();
@@ -1536,15 +1482,6 @@ static void amdvi_cmdbuf_exec(AMDVIState *s)
         amdvi_log_command_error(s, s->cmdbuf + s->cmdbuf_head);
         return;
     }
-
-    /*
-     * Commands in guest memory are little-endian. Convert once after reading
-     * so that command handlers can decode values in host native endianness.
-     * Convert back to little-endian only when writing data to guest memory via
-     * dma_memory_write().
-     */
-    cmd[0] = le64_to_cpu(cmd[0]);
-    cmd[1] = le64_to_cpu(cmd[1]);
 
     switch (extract64(cmd[0], 60, 4)) {
     case AMDVI_CMD_COMPLETION_WAIT:
@@ -1572,9 +1509,9 @@ static void amdvi_cmdbuf_exec(AMDVIState *s)
         amdvi_inval_all(s, cmd);
         break;
     default:
-        trace_amdvi_unhandled_command(extract64(cmd[0], 60, 4));
+        trace_amdvi_unhandled_command(extract64(cmd[1], 60, 4));
         /* log illegal command */
-        amdvi_log_illegalcom_error(s, extract64(cmd[0], 60, 4),
+        amdvi_log_illegalcom_error(s, extract64(cmd[1], 60, 4),
                                    s->cmdbuf + s->cmdbuf_head);
     }
 }
@@ -2038,7 +1975,7 @@ static IOMMUTLBEntry amdvi_translate(IOMMUMemoryRegion *iommu, hwaddr addr,
 }
 
 static int amdvi_get_irte(AMDVIState *s, MSIMessage *origin, uint64_t *dte,
-                          uint32_t *irte, uint16_t devid)
+                          union irte *irte, uint16_t devid)
 {
     uint64_t irte_root, offset;
 
@@ -2053,8 +1990,7 @@ static int amdvi_get_irte(AMDVIState *s, MSIMessage *origin, uint64_t *dte,
         return -AMDVI_IR_GET_IRTE;
     }
 
-    *irte = le32_to_cpu(*irte);
-    trace_amdvi_ir_irte_val(*irte);
+    trace_amdvi_ir_irte_val(irte->val);
 
     return 0;
 }
@@ -2066,9 +2002,8 @@ static int amdvi_int_remap_legacy(AMDVIState *iommu,
                                   X86IOMMUIrq *irq,
                                   uint16_t sid)
 {
-    uint8_t int_type;
-    uint32_t irte;
     int ret;
+    union irte irte;
 
     /* get interrupt remapping table */
     ret = amdvi_get_irte(iommu, origin, dte, &irte, sid);
@@ -2076,33 +2011,32 @@ static int amdvi_int_remap_legacy(AMDVIState *iommu,
         return ret;
     }
 
-    if (!FIELD_EX32(irte, AMDVI_IRTE, VALID)) {
+    if (!irte.fields.valid) {
         trace_amdvi_ir_target_abort("RemapEn is disabled");
         return -AMDVI_IR_TARGET_ABORT;
     }
 
-    if (FIELD_EX32(irte, AMDVI_IRTE, GUEST_MODE)) {
+    if (irte.fields.guest_mode) {
         error_report_once("guest mode is not zero");
         return -AMDVI_IR_ERR;
     }
 
-    int_type = FIELD_EX32(irte, AMDVI_IRTE, INT_TYPE);
-    if (int_type > AMDVI_IOAPIC_INT_TYPE_ARBITRATED) {
+    if (irte.fields.int_type > AMDVI_IOAPIC_INT_TYPE_ARBITRATED) {
         error_report_once("reserved int_type");
         return -AMDVI_IR_ERR;
     }
 
-    irq->delivery_mode = int_type;
-    irq->vector = FIELD_EX32(irte, AMDVI_IRTE, VECTOR);
-    irq->dest_mode = FIELD_EX32(irte, AMDVI_IRTE, DM);
-    irq->redir_hint = FIELD_EX32(irte, AMDVI_IRTE, RQ_EOI);
-    irq->dest = FIELD_EX32(irte, AMDVI_IRTE, DESTINATION);
+    irq->delivery_mode = irte.fields.int_type;
+    irq->vector = irte.fields.vector;
+    irq->dest_mode = irte.fields.dm;
+    irq->redir_hint = irte.fields.rq_eoi;
+    irq->dest = irte.fields.destination;
 
     return 0;
 }
 
 static int amdvi_get_irte_ga(AMDVIState *s, MSIMessage *origin, uint64_t *dte,
-                             AMDVIIrteGA *irte, uint16_t devid)
+                             struct irte_ga *irte, uint16_t devid)
 {
     uint64_t irte_root, offset;
 
@@ -2116,9 +2050,7 @@ static int amdvi_get_irte_ga(AMDVIState *s, MSIMessage *origin, uint64_t *dte,
         return -AMDVI_IR_GET_IRTE;
     }
 
-    irte->ga_lo = le64_to_cpu(irte->ga_lo);
-    irte->ga_hi = le64_to_cpu(irte->ga_hi);
-    trace_amdvi_ir_irte_ga_val(irte->ga_hi, irte->ga_lo);
+    trace_amdvi_ir_irte_ga_val(irte->hi.val, irte->lo.val);
     return 0;
 }
 
@@ -2129,9 +2061,8 @@ static int amdvi_int_remap_ga(AMDVIState *iommu,
                               X86IOMMUIrq *irq,
                               uint16_t sid)
 {
-    AMDVIIrteGA irte;
-    uint8_t int_type;
     int ret;
+    struct irte_ga irte;
 
     /* get interrupt remapping table */
     ret = amdvi_get_irte_ga(iommu, origin, dte, &irte, sid);
@@ -2139,33 +2070,30 @@ static int amdvi_int_remap_ga(AMDVIState *iommu,
         return ret;
     }
 
-    if (!FIELD_EX64(irte.ga_lo, AMDVI_IRTE_GA_LO, VALID)) {
+    if (!irte.lo.fields_remap.valid) {
         trace_amdvi_ir_target_abort("RemapEn is disabled");
         return -AMDVI_IR_TARGET_ABORT;
     }
 
-    if (FIELD_EX64(irte.ga_lo, AMDVI_IRTE_GA_LO, GUEST_MODE)) {
+    if (irte.lo.fields_remap.guest_mode) {
         error_report_once("guest mode is not zero");
         return -AMDVI_IR_ERR;
     }
 
-    int_type = FIELD_EX64(irte.ga_lo, AMDVI_IRTE_GA_LO, INT_TYPE);
-    if (int_type > AMDVI_IOAPIC_INT_TYPE_ARBITRATED) {
+    if (irte.lo.fields_remap.int_type > AMDVI_IOAPIC_INT_TYPE_ARBITRATED) {
         error_report_once("reserved int_type is set");
         return -AMDVI_IR_ERR;
     }
 
-    irq->delivery_mode = int_type;
-    irq->vector = FIELD_EX64(irte.ga_hi, AMDVI_IRTE_GA_HI, VECTOR);
-    irq->dest_mode = FIELD_EX64(irte.ga_lo, AMDVI_IRTE_GA_LO, DM);
-    irq->redir_hint = FIELD_EX64(irte.ga_lo, AMDVI_IRTE_GA_LO, RQ_EOI);
+    irq->delivery_mode = irte.lo.fields_remap.int_type;
+    irq->vector = irte.hi.fields.vector;
+    irq->dest_mode = irte.lo.fields_remap.dm;
+    irq->redir_hint = irte.lo.fields_remap.rq_eoi;
     if (iommu->xten) {
-        irq->dest = FIELD_EX64(irte.ga_lo, AMDVI_IRTE_GA_LO, DESTINATION) |
-                    (FIELD_EX64(irte.ga_hi, AMDVI_IRTE_GA_HI, DESTINATION_HI)
-                    << 24);
+        irq->dest = irte.lo.fields_remap.destination |
+                    (irte.hi.fields.destination_hi << 24);
     } else {
-        irq->dest = FIELD_EX64(irte.ga_lo, AMDVI_IRTE_GA_LO, DESTINATION) &
-                    0xff;
+        irq->dest = irte.lo.fields_remap.destination & 0xff;
     }
 
     return 0;

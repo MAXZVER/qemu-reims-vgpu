@@ -530,7 +530,10 @@ static void ufs_lu_unrealize(DeviceState *dev)
 {
     UfsLu *lu = DO_UPCAST(UfsLu, qdev, dev);
 
-    lu->scsi_dev = NULL;
+    if (lu->scsi_dev) {
+        object_unref(OBJECT(lu->scsi_dev));
+        lu->scsi_dev = NULL;
+    }
 }
 
 static void ufs_lu_class_init(ObjectClass *oc, const void *data)

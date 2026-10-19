@@ -19,6 +19,7 @@
 #include "system/whpx-internal.h"
 #include "system/whpx-all.h"
 #include "system/whpx-accel-ops.h"
+#include "system/whpx-wp.h"
 
 static void *whpx_cpu_thread_fn(void *arg)
 {
@@ -32,6 +33,24 @@ static void *whpx_cpu_thread_fn(void *arg)
     cpu->thread_id = qemu_get_thread_id();
     current_cpu = cpu;
 
+    whpx_lab_pin_pcores("vcpu");
+    {
+        /*
+         * TEMP lab QEMU_LAB_VCPU_PRIO=<Windows thread priority, -2..2, 15>: the vCPU threads above the device's
+         * threads. b449: at a UI transition a guest TLB shootdown waits 8-32 ms for a vCPU to answer its IPI - a
+         * halted vCPU's host thread woken but not running while the drain, recorder, lane and helper threads
+         * (normal priority, spinning between jobs) hold the cores.
+         */
+        const char *e = getenv("QEMU_LAB_VCPU_PRIO");
+
+        if (e && *e) {
+            int p = atoi(e);
+
+            if (SetThreadPriority(GetCurrentThread(), p) && cpu->cpu_index == 0) {
+                fprintf(stderr, "whpx: vCPU thread priority %d (QEMU_LAB_VCPU_PRIO)\n", p);
+            }
+        }
+    }
     r = whpx_init_vcpu(cpu);
     if (r < 0) {
         fprintf(stderr, "whpx_init_vcpu failed: %s\n", strerror(-r));
@@ -82,6 +101,11 @@ static bool whpx_vcpu_thread_is_idle(CPUState *cpu)
     return !whpx_irqchip_in_kernel();
 }
 
+static bool whpx_supports_guest_debug(void)
+{
+    return whpx_arch_supports_guest_debug();
+}
+
 
 static void whpx_accel_ops_class_init(ObjectClass *oc, const void *data)
 {
@@ -91,6 +115,7 @@ static void whpx_accel_ops_class_init(ObjectClass *oc, const void *data)
     ops->kick_vcpu_thread = whpx_kick_vcpu_thread;
     ops->cpu_thread_is_idle = whpx_vcpu_thread_is_idle;
     ops->handle_interrupt = generic_handle_interrupt;
+    ops->supports_guest_debug = whpx_supports_guest_debug;
 
     ops->synchronize_post_reset = whpx_cpu_synchronize_post_reset;
     ops->synchronize_post_init = whpx_cpu_synchronize_post_init;

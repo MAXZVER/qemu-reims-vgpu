@@ -27,13 +27,12 @@
 
 /*
  * Allow some level of source compatibility with softmmu.
- * INVALID is set when the page does not have requested permissions.
- * FORCE_SLOW is set when we want the target helper to use the functional
+ * Invalid is set when the page does not have requested permissions.
+ * MMIO is set when we want the target helper to use the functional
  * interface for load/store so that plugins see the access.
  */
 #define TLB_INVALID_MASK     (1 << 0)
-#define TLB_FORCE_SLOW       (1 << 1)
-#define TLB_MMIO             0
+#define TLB_MMIO             (1 << 1)
 #define TLB_WATCHPOINT       0
 
 #else

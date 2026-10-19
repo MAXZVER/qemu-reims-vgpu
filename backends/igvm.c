@@ -26,10 +26,6 @@
 #include <igvm/igvm.h>
 #include <igvm/igvm_defs.h>
 
-#ifdef CONFIG_FDT
-#include <libfdt.h>
-#endif
-
 #ifndef IGVM_VHT_OPTIONAL_BIT
 #define IGVM_VHT_OPTIONAL_BIT (1U << 31)
 #endif
@@ -85,8 +81,7 @@ struct QEMU_PACKED sev_id_authentication {
 #define IGVM_SEV_ID_BLOCK_VERSION 1
 
 QIgvmParameterData*
-qigvm_find_param_entry(QIgvm *igvm, uint32_t parameter_area_index,
-                       Error **errp)
+qigvm_find_param_entry(QIgvm *igvm, uint32_t parameter_area_index)
 {
     QIgvmParameterData *param_entry;
     QTAILQ_FOREACH(param_entry, &igvm->parameter_data, next)
@@ -95,8 +90,7 @@ qigvm_find_param_entry(QIgvm *igvm, uint32_t parameter_area_index,
             return param_entry;
         }
     }
-    error_setg(errp, "IGVM: parameter area index %u not found",
-                   parameter_area_index);
+    warn_report("IGVM: No parameter area for index %u", parameter_area_index);
     return NULL;
 }
 
@@ -125,10 +119,6 @@ static int qigvm_directive_snp_id_block(QIgvm *ctx, const uint8_t *header_data,
 static int qigvm_initialization_guest_policy(QIgvm *ctx,
                                        const uint8_t *header_data,
                                        Error **errp);
-#ifdef CONFIG_FDT
-static int qigvm_directive_device_tree(QIgvm *ctx, const uint8_t *header_data,
-                                       Error **errp);
-#endif
 
 struct QIGVMHandler {
     IgvmVariableHeaderType type;
@@ -159,10 +149,6 @@ static struct QIGVMHandler handlers[] = {
       qigvm_initialization_guest_policy },
     { IGVM_VHT_MADT, IGVM_HEADER_SECTION_DIRECTIVE,
       qigvm_directive_madt },
-#ifdef CONFIG_FDT
-    { IGVM_VHT_DEVICE_TREE, IGVM_HEADER_SECTION_DIRECTIVE,
-      qigvm_directive_device_tree },
-#endif
 };
 
 static int qigvm_handler(QIgvm *ctx, IgvmVariableHeaderType raw_type,
@@ -542,10 +528,9 @@ static int qigvm_directive_parameter_insert(QIgvm *ctx,
         return 0;
     }
 
-    param_entry = qigvm_find_param_entry(ctx,
-                                         param->parameter_area_index, errp);
+    param_entry = qigvm_find_param_entry(ctx, param->parameter_area_index);
     if (param_entry == NULL) {
-        return -1;
+        return 0;
     }
 
     region = qigvm_prepare_memory(ctx, param->gpa, param_entry->size,
@@ -616,10 +601,9 @@ static int qigvm_directive_memory_map(QIgvm *ctx, const uint8_t *header_data,
     }
 
     /* Find the parameter area that should hold the memory map */
-    param_entry = qigvm_find_param_entry(ctx,
-                                         param->parameter_area_index, errp);
+    param_entry = qigvm_find_param_entry(ctx, param->parameter_area_index);
     if (param_entry == NULL) {
-        return -1;
+        return 0;
     }
 
     max_entry_count = param_entry->size / sizeof(IGVM_VHS_MEMORY_MAP_ENTRY);
@@ -676,10 +660,9 @@ static int qigvm_directive_vp_count(QIgvm *ctx, const uint8_t *header_data,
     uint32_t *vp_count;
     CPUState *cpu;
 
-    param_entry = qigvm_find_param_entry(ctx,
-                                         param->parameter_area_index, errp);
+    param_entry = qigvm_find_param_entry(ctx, param->parameter_area_index);
     if (param_entry == NULL) {
-        return -1;
+        return 0;
     }
 
     vp_count = (uint32_t *)(param_entry->data + param->byte_offset);
@@ -700,10 +683,9 @@ static int qigvm_directive_environment_info(QIgvm *ctx,
     QIgvmParameterData *param_entry;
     IgvmEnvironmentInfo *environmental_state;
 
-    param_entry = qigvm_find_param_entry(ctx,
-                                         param->parameter_area_index, errp);
+    param_entry = qigvm_find_param_entry(ctx, param->parameter_area_index);
     if (param_entry == NULL) {
-        return -1;
+        return 0;
     }
 
     environmental_state =
@@ -797,48 +779,6 @@ static int qigvm_directive_snp_id_block(QIgvm *ctx, const uint8_t *header_data,
 
     return 0;
 }
-
-#ifdef CONFIG_FDT
-static int qigvm_directive_device_tree(QIgvm *ctx, const uint8_t *header_data,
-                                       Error **errp)
-{
-    const IGVM_VHS_PARAMETER *param = (const IGVM_VHS_PARAMETER *)header_data;
-    g_autofree void *fdt_packed = NULL;
-    QIgvmParameterData *param_entry;
-    uint32_t fdt_size;
-
-    param_entry = qigvm_find_param_entry(ctx,
-                                         param->parameter_area_index, errp);
-    if (param_entry == NULL) {
-        return -1;
-    }
-
-    if (ctx->machine_state->fdt == NULL) {
-        error_setg(errp, "IGVM: device tree not available");
-        return -1;
-    }
-
-    fdt_size = fdt_totalsize(ctx->machine_state->fdt);
-    fdt_packed = g_memdup2(ctx->machine_state->fdt, fdt_size);
-
-    if (fdt_pack(fdt_packed)) {
-        error_setg(errp, "IGVM: failed to pack device tree");
-        return -1;
-    }
-
-    fdt_size = fdt_totalsize(fdt_packed);
-    if (fdt_size > param_entry->size) {
-        error_setg(errp,
-                   "IGVM: device tree size exceeds parameter area"
-                   " defined in IGVM file");
-        return -1;
-    }
-
-    memcpy(param_entry->data, fdt_packed, fdt_size);
-
-    return 0;
-}
-#endif
 
 static int qigvm_initialization_guest_policy(QIgvm *ctx,
                                        const uint8_t *header_data, Error **errp)

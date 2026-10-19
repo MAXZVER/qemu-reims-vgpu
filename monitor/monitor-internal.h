@@ -28,7 +28,6 @@
 #include "chardev/char-fe.h"
 #include "monitor/monitor.h"
 #include "qapi/qapi-types-control.h"
-#include "qapi/qapi-types-qom.h"
 #include "qapi/qmp-registry.h"
 #include "qobject/json-parser.h"
 #include "qemu/readline.h"
@@ -102,40 +101,13 @@ typedef struct HMPCommand {
     bool coroutine;
 } HMPCommand;
 
-
-struct MonitorClass {
-    ObjectClass parent_class;
-
-    /*
-     * If non-NULL, the monitor is able to print messages
-     * for attention of the client user
-     */
-    int (*vprintf)(Monitor *mon, const char *fmt, va_list ap)
-        G_GNUC_PRINTF(2, 0);
-    /*
-     * If non-NULL, the monitor is able to send event
-     * notifications back to the client
-     */
-    void (*emit_event)(Monitor *mon, QAPIEvent event, QDict *qdict);
-    /*
-     * If non-NULL, perform any actions needed to prepare
-     * the monitor to accept further client input
-     */
-    void (*accept_input)(Monitor *mon);
-
-    /*
-     * If non-NULL and returns true, then an I/O thread
-     * is required for processing the monitor
-     */
-    bool (*requires_iothread)(const Monitor *mon);
-};
-
 struct Monitor {
-    Object parent;
-    char *chardev_id;
     CharFrontend chr;
     int suspend_cnt;            /* Needs to be accessed atomically */
-    QEMUBH *accept_input_bh;    /* persistent BH for monitor_accept_input */
+    bool is_qmp;
+    bool skip_flush;
+    bool use_io_thread;
+
     char *mon_cpu_path;
     QTAILQ_ENTRY(Monitor) entry;
 
@@ -155,33 +127,23 @@ struct Monitor {
     int reset_seen;
 };
 
-struct MonitorHMPClass {
-    MonitorClass parent_class;
-};
-
 struct MonitorHMP {
-    Monitor parent_obj;
+    Monitor common;
     bool use_readline;
     /*
      * State used only in the thread "owning" the monitor.
-     * This is currently always the main thread, since
-     * HMP does not allow use of the I/O thread at this time.
+     * If @use_io_thread, this is @mon_iothread. (This does not actually happen
+     * in the current state of the code.)
+     * Else, it's the main thread.
      * These members can be safely accessed without locks.
      */
     ReadLineState *rs;
 };
 
-struct MonitorQMPClass {
-    MonitorClass parent_class;
-};
-
-struct MonitorQMP {
-    Monitor parent_obj;
+typedef struct {
+    Monitor common;
     JSONMessageParser parser;
     bool pretty;
-    MonitorQMPCloseAction close_action;
-    bool setup_pending; /* iothread BH has not yet set up chardev handlers */
-    bool delete_pending; /* close_action has started 'delete' process */
     /*
      * When a client connects, we're in capabilities negotiation mode.
      * @commands is &qmp_cap_negotiation_commands then.  When command
@@ -198,7 +160,15 @@ struct MonitorQMP {
     QemuMutex qmp_queue_lock;
     /* Input queue that holds all the parsed QMP requests */
     GQueue *qmp_requests;
-};
+} MonitorQMP;
+
+/**
+ * Is @mon a QMP monitor?
+ */
+static inline bool monitor_is_qmp(const Monitor *mon)
+{
+    return mon->is_qmp;
+}
 
 typedef QTAILQ_HEAD(MonitorList, Monitor) MonitorList;
 extern IOThread *mon_iothread;
@@ -208,9 +178,10 @@ extern QmpCommandList qmp_commands, qmp_cap_negotiation_commands;
 extern QemuMutex monitor_lock;
 extern MonitorList mon_list;
 
-bool monitor_requires_iothread(const Monitor *mon);
+void monitor_data_init(Monitor *mon, bool is_qmp, bool skip_flush,
+                       bool use_io_thread);
+void monitor_data_destroy(Monitor *mon);
 int monitor_can_read(void *opaque);
-void monitor_cancel_out_watch(Monitor *mon);
 void monitor_list_append(Monitor *mon);
 void monitor_fdsets_cleanup(void);
 int monitor_set_cpu(Monitor *mon, int cpu_index);

@@ -85,13 +85,13 @@ static void event_loop_base_complete(UserCreatable *uc, Error **errp)
     }
 }
 
-static bool event_loop_base_prepare_delete(UserCreatable *uc, Error **errp)
+static bool event_loop_base_can_be_deleted(UserCreatable *uc)
 {
     EventLoopBaseClass *bc = EVENT_LOOP_BASE_GET_CLASS(uc);
     EventLoopBase *backend = EVENT_LOOP_BASE(uc);
 
-    if (bc->prepare_delete) {
-        return bc->prepare_delete(backend, errp);
+    if (bc->can_be_deleted) {
+        return bc->can_be_deleted(backend);
     }
 
     return true;
@@ -102,7 +102,7 @@ static void event_loop_base_class_init(ObjectClass *klass,
 {
     UserCreatableClass *ucc = USER_CREATABLE_CLASS(klass);
     ucc->complete = event_loop_base_complete;
-    ucc->prepare_delete = event_loop_base_prepare_delete;
+    ucc->can_be_deleted = event_loop_base_can_be_deleted;
 
     object_class_property_add(klass, "aio-max-batch", "int",
                               event_loop_base_get_param,

@@ -32,7 +32,6 @@
 #include "vmsr_energy.h"
 #include "system/system.h"
 #include "system/hw_accel.h"
-#include "system/accel-irq.h"
 #include "system/kvm_int.h"
 #include "system/runstate.h"
 #include "system/ramblock.h"
@@ -6159,12 +6158,12 @@ int kvm_arch_remove_sw_breakpoint(CPUState *cs, struct kvm_sw_breakpoint *bp)
 static struct {
     target_ulong addr;
     int len;
-    GdbBreakpointType type;
+    int type;
 } hw_breakpoint[4];
 
 static int nb_hw_breakpoint;
 
-static int find_hw_breakpoint(target_ulong addr, int len, GdbBreakpointType type)
+static int find_hw_breakpoint(target_ulong addr, int len, int type)
 {
     int n;
 
@@ -6177,8 +6176,7 @@ static int find_hw_breakpoint(target_ulong addr, int len, GdbBreakpointType type
     return -1;
 }
 
-int kvm_arch_insert_gdbstub_hw_breakpoint(vaddr addr, vaddr len,
-                                          GdbBreakpointType type)
+int kvm_arch_insert_hw_breakpoint(vaddr addr, vaddr len, int type)
 {
     switch (type) {
     case GDB_BREAKPOINT_HW:
@@ -6218,8 +6216,7 @@ int kvm_arch_insert_gdbstub_hw_breakpoint(vaddr addr, vaddr len,
     return 0;
 }
 
-int kvm_arch_remove_gdbstub_hw_breakpoint(vaddr addr, vaddr len,
-                                          GdbBreakpointType type)
+int kvm_arch_remove_hw_breakpoint(vaddr addr, vaddr len, int type)
 {
     int n;
 
@@ -6233,7 +6230,7 @@ int kvm_arch_remove_gdbstub_hw_breakpoint(vaddr addr, vaddr len,
     return 0;
 }
 
-void kvm_arch_remove_all_gdbstub_hw_breakpoints(void)
+void kvm_arch_remove_all_hw_breakpoints(void)
 {
     nb_hw_breakpoint = 0;
 }
@@ -6250,7 +6247,7 @@ static int kvm_handle_debug(X86CPU *cpu,
 
     if (arch_info->exception == EXCP01_DB) {
         if (arch_info->dr6 & DR6_BS) {
-            if (cpu_single_stepping(cs)) {
+            if (cs->singlestep_enabled) {
                 ret = EXCP_DEBUG;
             }
         } else {
@@ -6681,7 +6678,7 @@ void kvm_arch_init_irq_routing(KVMState *s)
     kvm_gsi_routing_allowed = true;
 
     if (kvm_irqchip_is_split()) {
-        AccelRouteChange c = accel_irqchip_begin_route_changes();
+        KVMRouteChange c = kvm_irqchip_begin_route_changes(s);
         int i;
 
         /* If the ioapic is in QEMU and the lapics are in KVM, reserve
@@ -6692,7 +6689,7 @@ void kvm_arch_init_irq_routing(KVMState *s)
                 exit(1);
             }
         }
-        accel_irqchip_commit_route_changes(&c);
+        kvm_irqchip_commit_route_changes(&c);
     }
 }
 

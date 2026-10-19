@@ -701,7 +701,6 @@ static void ich9_lpc_initfn(Object *obj)
                                    &lpc->smi_negotiated_features,
                                    OBJ_PROP_FLAG_READ);
 
-    ich9_pm_reset_properties(&lpc->pm);
     ich9_pm_add_properties(obj, &lpc->pm);
 }
 

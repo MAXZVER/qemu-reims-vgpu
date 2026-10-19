@@ -143,10 +143,8 @@ int can_bus_client_set_filters(CanBusClientState *client,
 }
 
 
-static bool can_bus_prepare_delete(UserCreatable *uc, Error **errp)
+static bool can_bus_can_be_deleted(UserCreatable *uc)
 {
-    error_setg(errp, "Deleting CAN bus device '%s' is not supported",
-               object_get_canonical_path_component(OBJECT(uc)));
     return false;
 }
 
@@ -155,7 +153,7 @@ static void can_bus_class_init(ObjectClass *klass,
 {
     UserCreatableClass *uc_klass = USER_CREATABLE_CLASS(klass);
 
-    uc_klass->prepare_delete = can_bus_prepare_delete;
+    uc_klass->can_be_deleted = can_bus_can_be_deleted;
 }
 
 static const TypeInfo can_bus_info = {

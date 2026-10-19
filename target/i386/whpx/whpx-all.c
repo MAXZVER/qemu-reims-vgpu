@@ -9,6 +9,9 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/timer.h"
+#include "qemu/lab-slow.h"
+#include "system/whpx-wp.h"
 #include "cpu.h"
 #include "qemu/typedefs.h"
 #include "system/address-spaces.h"
@@ -47,6 +50,7 @@
 #include "emulate/x86_flags.h"
 #include "emulate/x86_mmu.h"
 #include "trace.h"
+#include "qemu/timer.h"
 
 #include <winhvplatform.h>
 
@@ -273,6 +277,14 @@ typedef enum WhpxStepMode {
 
 static uint32_t max_vcpu_index;
 static WHV_PROCESSOR_XSAVE_FEATURES whpx_xsave_cap;
+/*
+ * Per-VP flag: the last WHvGetVirtualProcessorState(Xsave) succeeded, so the
+ * FP/SSE/AVX image in env is current. On hosts where the read fails hard
+ * (observed with Hyper-V on AMD), the stale env image must never be written
+ * back: a vm_stop/vm_start cycle would otherwise clobber live vector
+ * registers on every VP and corrupt the guest.
+ */
+static bool whpx_xsave_valid[4096];
 
 bool whpx_has_xsave(void)
 {
@@ -612,7 +624,8 @@ void whpx_set_registers(CPUState *cpu, WHPXStateLevel level)
          */
         whpx_set_xcrs(cpu);
 
-        if (whpx_is_xsave_enabled(cpu)) {
+        if (whpx_is_xsave_enabled(cpu) &&
+            whpx_xsave_valid[cpu->cpu_index]) {
             whpx_set_xsave_state(cpu);
         } else {
             whpx_set_legacy_fp_registers(cpu, level);
@@ -838,17 +851,27 @@ static int whpx_get_xsave_state(CPUState *cpu)
             xsavec_buf_len, &bytes_written);
     }
     if (FAILED(hr) || bytes_written == 0) {
-        error_report("failed to get xsave state: %s", strerror(errno));
-        return -errno;
+        static int reported;
+        qemu_vfree(xsavec_buf);
+        whpx_xsave_valid[cpu->cpu_index] = false;
+        if (reported++ < 4) {
+            error_report("WHPX: failed to get xsave state cpu%u hr=%08lx "
+                         "written=%u; env FP/AVX image is stale, "
+                         "write-back disabled", cpu->cpu_index,
+                         (unsigned long)hr, (unsigned)bytes_written);
+        }
+        return -1;
     }
 
     ret = decompact_xsave_area(xsavec_buf, xsavec_buf_len, env);
     qemu_vfree(xsavec_buf);
     if (ret < 0) {
+        whpx_xsave_valid[cpu->cpu_index] = false;
         error_report("failed to decompact xsave area");
         return ret;
     }
     x86_cpu_xrstor_all_areas(x86cpu, env->xsave_buf, env->xsave_buf_len);
+    whpx_xsave_valid[cpu->cpu_index] = true;
 
     return 0;
 }
@@ -1029,12 +1052,864 @@ static int emulate_msr_instruction(CPUState *cpu,
     return 0;
 }
 
+/*
+ * Exit statistics, enabled with QEMU_WHPX_STATS=1: per exit-reason counts and
+ * handling time, time spent waiting for the BQL on the MMIO and pre-run paths,
+ * and the hottest MMIO pages. One line a second on stderr, emitted by whichever
+ * vCPU thread notices the second has passed. The counters race benignly; they
+ * are for attribution, not accounting.
+ */
+enum {
+    WS_MMIO, WS_MMIOF, WS_PIO, WS_IRQWIN, WS_EOI, WS_HALT, WS_CANCEL, WS_MSR,
+    WS_CPUID, WS_EXC, WS_OTHER, WS_NR
+};
+static const char *const whpx_stats_names[WS_NR] = {
+    "mmio", "mmiof", "pio", "irqwin", "eoi", "halt", "cancel", "msr", "cpuid",
+    "exc", "other"
+};
+#define WHPX_STATS_PAGES 64
+static struct {
+    int enabled;                          /* -1 unknown, 0 off, 1 on */
+    uint64_t count[WS_NR], ns[WS_NR];
+    uint64_t mmio_bql_ns, prerun_bql_ns, prerun_n, run_ns;
+    uint64_t run_ecore_ns;                /* TEMP lab: guest run time ending on an efficiency core */
+    uint64_t page[WHPX_STATS_PAGES], hits[WHPX_STATS_PAGES];
+    int64_t last_print;
+    QemuMutex lock;
+} whpx_stats = { .enabled = -1 };
+
+/*
+ * TEMP lab: whether the calling thread is on an efficiency core of a hybrid CPU
+ * (i7-14700K: 8 performance cores with two threads each, 12 efficiency cores).
+ * From the OS CPU-set table, once: EfficiencyClass below the highest is efficiency.
+ */
+#if _WIN32_WINNT < 0x0A00   /* declared only for Windows 10 targets; present since Windows 10 */
+WINBASEAPI WINBOOL WINAPI GetSystemCpuSetInformation(PSYSTEM_CPU_SET_INFORMATION Information,
+                                                     ULONG BufferLength, PULONG ReturnedLength,
+                                                     HANDLE Process, ULONG Flags);
+#endif
+
+static bool whpx_on_ecore(void)
+{
+    static uint8_t ecore[256];
+    static int built;   /* 0 no, 1 building, 2 yes */
+
+    if (qatomic_read(&built) != 2) {
+        if (qatomic_cmpxchg(&built, 0, 1) == 0) {
+            ULONG need = 0;
+            uint8_t *buf;
+            uint8_t maxc = 0;
+            size_t off;
+
+            GetSystemCpuSetInformation(NULL, 0, &need, NULL, 0);
+            buf = need ? g_malloc0(need) : NULL;
+            if (buf && GetSystemCpuSetInformation((PSYSTEM_CPU_SET_INFORMATION)buf, need, &need,
+                                                  NULL, 0)) {
+                for (off = 0; off + 19 <= need;) {
+                    PSYSTEM_CPU_SET_INFORMATION r = (PSYSTEM_CPU_SET_INFORMATION)(buf + off);
+                    if (!r->Size) {
+                        break;
+                    }
+                    maxc = MAX(maxc, r->CpuSet.EfficiencyClass);
+                    off += r->Size;
+                }
+                for (off = 0; off + 19 <= need;) {
+                    PSYSTEM_CPU_SET_INFORMATION r = (PSYSTEM_CPU_SET_INFORMATION)(buf + off);
+                    if (!r->Size) {
+                        break;
+                    }
+                    if (r->CpuSet.Group == 0) {
+                        ecore[r->CpuSet.LogicalProcessorIndex] = r->CpuSet.EfficiencyClass < maxc;
+                    }
+                    off += r->Size;
+                }
+            }
+            g_free(buf);
+            qatomic_set(&built, 2);
+        } else {
+            return false;
+        }
+    }
+    return ecore[GetCurrentProcessorNumber() & 255];
+}
+
+static bool whpx_stats_on(void)
+{
+    if (qatomic_read(&whpx_stats.enabled) < 0) {
+        const char *v = g_getenv("QEMU_WHPX_STATS");
+        qemu_mutex_init(&whpx_stats.lock);
+        whpx_stats.last_print = get_clock();
+        qatomic_set(&whpx_stats.enabled, v && *v && strcmp(v, "0") != 0);
+    }
+    return qatomic_read(&whpx_stats.enabled) > 0;
+}
+
+/* QEMU_WHPX_MMIO_FAST=0 turns whpx_mmio_fast_load off, for A/B runs. */
+static bool whpx_mmio_fast_path(void)
+{
+    static int on = -1;
+
+    if (qatomic_read(&on) < 0) {
+        const char *v = g_getenv("QEMU_WHPX_MMIO_FAST");
+        qatomic_set(&on, !(v && strcmp(v, "0") == 0));
+    }
+    return qatomic_read(&on) > 0;
+}
+
+/* TEMP lab: QEMU_WHPX_MMIO_FAST_STORE=1 turns on whpx_mmio_fast_store. */
+static bool whpx_mmio_fast_store_path(void)
+{
+    static int on = -1;
+
+    if (qatomic_read(&on) < 0) {
+        const char *v = g_getenv("QEMU_WHPX_MMIO_FAST_STORE");
+        qatomic_set(&on, v && strcmp(v, "1") == 0);
+    }
+    return qatomic_read(&on) > 0;
+}
+
+/*
+ * TEMP lab: whpx_mmio_fast_cmp is on by default on AMD hosts only (b644: fps
+ * equal, BQL wait -10 ms/s); an Intel host's canvas lost 4-45 % with a twin of
+ * it (ZCode n351), so there it waits for its own A/B.
+ * QEMU_WHPX_MMIO_FAST_CMP=1|0 overrides.
+ */
+static bool whpx_mmio_fast_cmp_path(void)
+{
+    static int on = -1;
+
+    if (qatomic_read(&on) < 0) {
+        const char *v = g_getenv("QEMU_WHPX_MMIO_FAST_CMP");
+        qatomic_set(&on, v && *v ? strcmp(v, "0") != 0
+                                 : !__builtin_cpu_is("intel"));
+    }
+    return qatomic_read(&on) > 0;
+}
+
+/*
+ * QEMU_WHPX_PRERUN_FAST=1 lets a pre-run with nothing pending skip the BQL.
+ * Opt-in: no frame-rate gain has been measured through the guest's bimodal
+ * 60/120 Hz latch yet, and one of four boots with it on hung in OpenCore
+ * (cause not established).
+ */
+static bool whpx_prerun_fast_path(void)
+{
+    static int on = -1;
+
+    if (qatomic_read(&on) < 0) {
+        const char *v = g_getenv("QEMU_WHPX_PRERUN_FAST");
+        qatomic_set(&on, v && strcmp(v, "1") == 0);
+    }
+    return qatomic_read(&on) > 0;
+}
+
+static int whpx_stats_bucket(WHV_RUN_VP_EXIT_REASON reason)
+{
+    switch (reason) {
+    case WHvRunVpExitReasonMemoryAccess: return WS_MMIO;
+    case WHvRunVpExitReasonX64IoPortAccess: return WS_PIO;
+    case WHvRunVpExitReasonX64InterruptWindow: return WS_IRQWIN;
+    case WHvRunVpExitReasonX64ApicEoi: return WS_EOI;
+    case WHvRunVpExitReasonX64Halt: return WS_HALT;
+    case WHvRunVpExitReasonCanceled: return WS_CANCEL;
+    case WHvRunVpExitReasonX64MsrAccess: return WS_MSR;
+    case WHvRunVpExitReasonX64Cpuid: return WS_CPUID;
+    case WHvRunVpExitReasonException: return WS_EXC;
+    default: return WS_OTHER;
+    }
+}
+
+static void whpx_stats_mmio_page(uint64_t gpa)
+{
+    /* exact register address: the hot set is a handful of registers */
+    uint64_t pg = gpa;
+    unsigned i, slot = (unsigned)(pg * 0x9E3779B97F4A7C15ULL >> 58);
+
+    qemu_mutex_lock(&whpx_stats.lock);
+    for (i = 0; i < WHPX_STATS_PAGES; i++) {
+        unsigned s = (slot + i) % WHPX_STATS_PAGES;
+        if (whpx_stats.hits[s] == 0 || whpx_stats.page[s] == pg) {
+            whpx_stats.page[s] = pg;
+            whpx_stats.hits[s]++;
+            break;
+        }
+    }
+    qemu_mutex_unlock(&whpx_stats.lock);
+}
+
+/*
+ * TEMP lab: the MMIO exits that took the generic (emulated) path, by register
+ * address, access type and leading instruction bytes, so the instruction forms
+ * a fast path would have to cover are named rather than guessed.
+ */
+#define WHPX_SLOW_N 32
+static struct {
+    uint64_t gpa[WHPX_SLOW_N], hits[WHPX_SLOW_N];
+    uint8_t ib[WHPX_SLOW_N][6], nib[WHPX_SLOW_N], type[WHPX_SLOW_N];
+} whpx_slow;
+
+static void whpx_stats_mmio_slow(const WHV_MEMORY_ACCESS_CONTEXT *ctx)
+{
+    unsigned i, n = MIN(ctx->InstructionByteCount, 6u);
+    unsigned slot = (unsigned)((ctx->Gpa ^ ((uint64_t)ctx->InstructionBytes[0] << 40)) *
+                               0x9E3779B97F4A7C15ULL >> 59);
+
+    qemu_mutex_lock(&whpx_stats.lock);
+    for (i = 0; i < WHPX_SLOW_N; i++) {
+        unsigned s = (slot + i) % WHPX_SLOW_N;
+        if (whpx_slow.hits[s] == 0) {
+            whpx_slow.gpa[s] = ctx->Gpa;
+            whpx_slow.type[s] = ctx->AccessInfo.AccessType;
+            whpx_slow.nib[s] = n;
+            memcpy(whpx_slow.ib[s], ctx->InstructionBytes, n);
+        }
+        if (whpx_slow.gpa[s] == ctx->Gpa && whpx_slow.type[s] == ctx->AccessInfo.AccessType &&
+            whpx_slow.nib[s] == n && memcmp(whpx_slow.ib[s], ctx->InstructionBytes, n) == 0) {
+            whpx_slow.hits[s]++;
+            break;
+        }
+    }
+    qemu_mutex_unlock(&whpx_stats.lock);
+}
+
+static void whpx_stats_maybe_print(void)
+{
+    int64_t now = get_clock(), last = qatomic_read(&whpx_stats.last_print);
+    GString *s;
+    unsigned i, top[5] = {0};
+    uint64_t best[5] = {0};
+
+    if (now - last < NANOSECONDS_PER_SECOND ||
+        qatomic_cmpxchg(&whpx_stats.last_print, last, now) != last) {
+        return;
+    }
+    s = g_string_new("whpx-stats");
+    g_string_append_printf(s, " epoch_ms=%" PRId64 " win_ms=%" PRId64,
+                           g_get_real_time() / 1000, (now - last) / 1000000);
+    qemu_mutex_lock(&whpx_stats.lock);
+    for (i = 0; i < WS_NR; i++) {
+        if (whpx_stats.count[i]) {
+            g_string_append_printf(s, " %s=%" PRIu64 "/%" PRIu64 "us", whpx_stats_names[i],
+                                   whpx_stats.count[i], whpx_stats.ns[i] / 1000);
+        }
+        whpx_stats.count[i] = whpx_stats.ns[i] = 0;
+    }
+    g_string_append_printf(s, " run_ms=%" PRIu64 " run_ecore_ms=%" PRIu64 " mmio_bql_us=%" PRIu64
+                           " prerun_bql_us=%" PRIu64 " prerun_n=%" PRIu64,
+                           whpx_stats.run_ns / 1000000, whpx_stats.run_ecore_ns / 1000000,
+                           whpx_stats.mmio_bql_ns / 1000,
+                           whpx_stats.prerun_bql_ns / 1000, whpx_stats.prerun_n);
+    {   /* TEMP lab (b454): DIRTY_WP remaps in the same second */
+        uint64_t rn, rns, rmax, rpg;
+
+        whpx_lab_wp_remap_take(&rn, &rns, &rmax, &rpg);
+        g_string_append_printf(s, " wprm=%" PRIu64 "/%" PRIu64 "us wprm_max_us=%" PRIu64 " wprm_pages=%" PRIu64,
+                               rn, rns / 1000, rmax / 1000, rpg);
+    }
+    whpx_stats.run_ns = whpx_stats.mmio_bql_ns = whpx_stats.prerun_bql_ns = 0;
+    whpx_stats.run_ecore_ns = 0;
+    whpx_stats.prerun_n = 0;
+    for (i = 0; i < WHPX_STATS_PAGES; i++) {
+        unsigned k, j;
+        for (k = 0; k < 5 && whpx_stats.hits[i] <= best[k]; k++) {
+        }
+        if (k < 5) {
+            for (j = 4; j > k; j--) {
+                best[j] = best[j - 1];
+                top[j] = top[j - 1];
+            }
+            best[k] = whpx_stats.hits[i];
+            top[k] = i;
+        }
+    }
+    g_string_append(s, " mmio_addrs=");
+    for (i = 0; i < 5 && best[i]; i++) {
+        g_string_append_printf(s, "%s0x%" PRIx64 ":%" PRIu64, i ? "," : "",
+                               whpx_stats.page[top[i]], best[i]);
+    }
+    memset(whpx_stats.hits, 0, sizeof(whpx_stats.hits));
+    g_string_append(s, " mmio_slow=");
+    for (unsigned j = 0; j < 4; j++) {
+        unsigned b = WHPX_SLOW_N, k;
+        for (i = 0; i < WHPX_SLOW_N; i++) {
+            if (whpx_slow.hits[i] && (b == WHPX_SLOW_N || whpx_slow.hits[i] > whpx_slow.hits[b])) {
+                b = i;
+            }
+        }
+        if (b == WHPX_SLOW_N) {
+            break;
+        }
+        g_string_append_printf(s, "%s0x%" PRIx64 ":%c:", j ? "," : "", whpx_slow.gpa[b],
+                               whpx_slow.type[b] == WHvMemoryAccessWrite ? 'w' : 'r');
+        for (k = 0; k < whpx_slow.nib[b]; k++) {
+            g_string_append_printf(s, "%02x", whpx_slow.ib[b][k]);
+        }
+        g_string_append_printf(s, ":%" PRIu64, whpx_slow.hits[b]);
+        whpx_slow.hits[b] = 0;   /* taken; the rest are cleared below */
+        whpx_slow.gpa[b] = ~0ULL;
+    }
+    memset(&whpx_slow, 0, sizeof(whpx_slow));
+    qemu_mutex_unlock(&whpx_stats.lock);
+    fprintf(stderr, "%s\n", s->str);
+    g_string_free(s, true);
+}
+
+/*
+ * Fast path for the MMIO shape that dominates a busy guest: a plain register
+ * load, mov r32/r64 <- [mem], from a region that declared lockless I/O. The
+ * generic path fetches all GPRs, re-derives the linear address from the ModRM
+ * operand (segment and control-register reads plus a guest page walk, each a
+ * hypercall or several) and writes the GPRs back, about 8 us per exit here --
+ * for an address the exit context already carries as a GPA. This path makes
+ * one hypercall: the store of the loaded value and the advanced RIP.
+ *
+ * Deliberately narrow: 64-bit code, opcode 8B with at most a REX prefix, so
+ * the destination write is a whole-register (zero-extending) store and the
+ * instruction length follows from ModRM/SIB/displacement alone. Anything else,
+ * and every region that still needs the BQL, takes the generic path.
+ */
+static bool whpx_mmio_fast_load(CPUState *cpu,
+                                const WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
+{
+    const WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
+    const WHV_VP_EXIT_CONTEXT *vp = &exit_ctx->VpContext;
+    const uint8_t *b = ctx->InstructionBytes;
+    unsigned n = ctx->InstructionByteCount, i = 0, rex = 0, disp;
+    unsigned modrm, mod, rm, size;
+    MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+    WHV_REGISTER_NAME names[2];
+    WHV_REGISTER_VALUE values[2] = {};
+    MemoryRegion *mr;
+    hwaddr xlat, len;
+    uint64_t val = 0;
+    HRESULT hr;
+
+    if (ctx->AccessInfo.AccessType != WHvMemoryAccessRead ||
+        !vp->ExecutionState.EferLma || !vp->Cs.Long ||
+        vp->ExecutionState.InterruptionPending || (vp->Rflags & TF_MASK)) {
+        return false;
+    }
+    if (i < n && (b[i] & 0xf0) == 0x40) {
+        rex = b[i++];
+    }
+    if (i + 2 > n || b[i] != 0x8b) {
+        return false;
+    }
+    modrm = b[i + 1];
+    i += 2;
+    mod = modrm >> 6;
+    rm = modrm & 7;
+    if (mod == 3) {
+        return false;
+    }
+    disp = mod == 1 ? 1 : mod == 2 ? 4 : 0;
+    if (rm == 4) {
+        if (i >= n) {
+            return false;
+        }
+        if (mod == 0 && (b[i] & 7) == 5) {
+            disp = 4;                   /* SIB, no base: disp32 */
+        }
+        i++;
+    } else if (mod == 0 && rm == 5) {
+        disp = 4;                       /* RIP-relative */
+    }
+    i += disp;
+    if (i > n) {
+        return false;
+    }
+    size = (rex & 8) ? 8 : 4;
+
+    RCU_READ_LOCK_GUARD();
+    len = size;
+    mr = address_space_translate(&address_space_memory, ctx->Gpa, &xlat, &len,
+                                 false, attrs);
+    if (!mr->lockless_io || len < size ||
+        memory_access_is_direct(mr, false, attrs)) {
+        return false;
+    }
+    /* Past here the device has seen the read; the access must complete. */
+    memory_region_dispatch_read(mr, xlat, &val, size_memop(size), attrs);
+
+    names[0] = (WHV_REGISTER_NAME)(WHvX64RegisterRax +
+                                   (((modrm >> 3) & 7) | ((rex & 4) << 1)));
+    values[0].Reg64 = size == 4 ? (uint32_t)val : val;
+    names[1] = WHvX64RegisterRip;
+    values[1].Reg64 = vp->Rip + i;
+    hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
+        whpx_global.partition, cpu->cpu_index, names, 2, values);
+    if (FAILED(hr)) {
+        error_report("WHPX: fast MMIO load: failed to set registers, "
+                     "hr=%08lx", hr);
+    }
+    return true;
+}
+
+/*
+ * TEMP lab (2026-10-16): the compare twin of whpx_mmio_fast_load, for the one
+ * slow MMIO left on a busy guest. The display driver's interrupt handler tests
+ * the fault word with `cmp dword [reg+0x2c], 0` (83 /7 ib): the load path
+ * cannot take it and the generic path emulates it under the BQL, ~6.6 us on
+ * each of the ~3500 interrupts a second of the 5K canvas (b632 whpx-stats
+ * mmio_slow 0x8100102c:r:83782c00740c) - on the wake path of every guest
+ * thread sleeping on a completion stamp. Shape: 83 /7 ib with a memory
+ * operand, 64-bit code, at most a REX prefix. The result is only RFLAGS (CF,
+ * PF, AF, ZF, SF, OF), so one hypercall stores the flags and the advanced RIP.
+ */
+static bool whpx_mmio_fast_cmp(CPUState *cpu,
+                               const WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
+{
+    const WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
+    const WHV_VP_EXIT_CONTEXT *vp = &exit_ctx->VpContext;
+    const uint8_t *b = ctx->InstructionBytes;
+    unsigned n = ctx->InstructionByteCount, i = 0, rex = 0, disp;
+    unsigned modrm, mod, rm, size, msb;
+    MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+    WHV_REGISTER_NAME names[2];
+    WHV_REGISTER_VALUE values[2] = {};
+    MemoryRegion *mr;
+    hwaddr xlat, len;
+    uint64_t val = 0, a, imm, r, flags;
+    HRESULT hr;
+
+    if (ctx->AccessInfo.AccessType != WHvMemoryAccessRead ||
+        !vp->ExecutionState.EferLma || !vp->Cs.Long ||
+        vp->ExecutionState.InterruptionPending || (vp->Rflags & TF_MASK)) {
+        return false;
+    }
+    if (i < n && (b[i] & 0xf0) == 0x40) {
+        rex = b[i++];
+    }
+    if (i + 2 > n || b[i] != 0x83) {
+        return false;
+    }
+    modrm = b[i + 1];
+    i += 2;
+    mod = modrm >> 6;
+    rm = modrm & 7;
+    if (mod == 3 || ((modrm >> 3) & 7) != 7) {
+        return false;
+    }
+    disp = mod == 1 ? 1 : mod == 2 ? 4 : 0;
+    if (rm == 4) {
+        if (i >= n) {
+            return false;
+        }
+        if (mod == 0 && (b[i] & 7) == 5) {
+            disp = 4;                   /* SIB, no base: disp32 */
+        }
+        i++;
+    } else if (mod == 0 && rm == 5) {
+        disp = 4;                       /* RIP-relative */
+    }
+    i += disp;
+    if (i + 1 > n) {
+        return false;
+    }
+    size = (rex & 8) ? 8 : 4;
+    msb = size * 8 - 1;
+    imm = (uint64_t)(int64_t)(int8_t)b[i];
+    i++;
+    if (size == 4) {
+        imm = (uint32_t)imm;
+    }
+
+    RCU_READ_LOCK_GUARD();
+    len = size;
+    mr = address_space_translate(&address_space_memory, ctx->Gpa, &xlat, &len,
+                                 false, attrs);
+    if (!mr->lockless_io || len < size ||
+        memory_access_is_direct(mr, false, attrs)) {
+        return false;
+    }
+    /* Past here the device has seen the read; the access must complete. */
+    memory_region_dispatch_read(mr, xlat, &val, size_memop(size), attrs);
+
+    a = size == 4 ? (uint32_t)val : val;
+    r = a - imm;
+    if (size == 4) {
+        r = (uint32_t)r;
+    }
+    flags = vp->Rflags & ~(uint64_t)(CC_C | CC_P | CC_A | CC_Z | CC_S | CC_O);
+    flags |= a < imm ? CC_C : 0;
+    flags |= __builtin_parity(r & 0xff) ? 0 : CC_P;
+    flags |= ((a ^ imm ^ r) & 0x10) ? CC_A : 0;
+    flags |= r == 0 ? CC_Z : 0;
+    flags |= ((r >> msb) & 1) ? CC_S : 0;
+    flags |= ((((a ^ imm) & (a ^ r)) >> msb) & 1) ? CC_O : 0;
+
+    names[0] = WHvX64RegisterRflags;
+    values[0].Reg64 = flags;
+    names[1] = WHvX64RegisterRip;
+    values[1].Reg64 = vp->Rip + i;
+    hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
+        whpx_global.partition, cpu->cpu_index, names, 2, values);
+    if (FAILED(hr)) {
+        error_report("WHPX: fast MMIO cmp: failed to set registers, "
+                     "hr=%08lx", hr);
+    }
+    return true;
+}
+
+/*
+ * TEMP lab (QEMU_WHPX_MMIO_FAST_STORE=1): the store twin of
+ * whpx_mmio_fast_load, for the register writes a busy guest makes to a region
+ * that declared lockless I/O (the display device's doorbells and acks; its
+ * write handler takes the BQL itself). Shapes: mov [mem], r32/r64 (89 /r) and
+ * mov [mem], imm32 (C7 /0, sign-extended under REX.W), 64-bit code, at most a
+ * REX prefix. The generic path fetches and writes back every GPR and walks the
+ * guest page tables for the linear address (~8 us an exit); this one reads at
+ * most the one source register and writes RIP.
+ */
+static bool whpx_mmio_fast_store(CPUState *cpu,
+                                 const WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
+{
+    const WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
+    const WHV_VP_EXIT_CONTEXT *vp = &exit_ctx->VpContext;
+    const uint8_t *b = ctx->InstructionBytes;
+    unsigned n = ctx->InstructionByteCount, i = 0, rex = 0, disp, imm = 0;
+    unsigned op, modrm, mod, rm, size;
+    MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+    WHV_REGISTER_NAME name;
+    WHV_REGISTER_VALUE value = {};
+    MemoryRegion *mr;
+    hwaddr xlat, len;
+    uint64_t val = 0;
+    HRESULT hr;
+
+    if (ctx->AccessInfo.AccessType != WHvMemoryAccessWrite ||
+        !vp->ExecutionState.EferLma || !vp->Cs.Long ||
+        vp->ExecutionState.InterruptionPending || (vp->Rflags & TF_MASK)) {
+        return false;
+    }
+    if (i < n && (b[i] & 0xf0) == 0x40) {
+        rex = b[i++];
+    }
+    if (i + 2 > n || (b[i] != 0x89 && b[i] != 0xc7)) {
+        return false;
+    }
+    op = b[i];
+    modrm = b[i + 1];
+    i += 2;
+    mod = modrm >> 6;
+    rm = modrm & 7;
+    if (mod == 3 || (op == 0xc7 && ((modrm >> 3) & 7) != 0)) {
+        return false;
+    }
+    disp = mod == 1 ? 1 : mod == 2 ? 4 : 0;
+    if (rm == 4) {
+        if (i >= n) {
+            return false;
+        }
+        if (mod == 0 && (b[i] & 7) == 5) {
+            disp = 4;                   /* SIB, no base: disp32 */
+        }
+        i++;
+    } else if (mod == 0 && rm == 5) {
+        disp = 4;                       /* RIP-relative */
+    }
+    i += disp;
+    if (op == 0xc7) {
+        if (i + 4 > n) {
+            return false;
+        }
+        imm = (uint32_t)b[i] | (uint32_t)b[i + 1] << 8 | (uint32_t)b[i + 2] << 16 |
+              (uint32_t)b[i + 3] << 24;
+        i += 4;
+    }
+    if (i > n) {
+        return false;
+    }
+    size = (rex & 8) ? 8 : 4;
+
+    RCU_READ_LOCK_GUARD();
+    len = size;
+    mr = address_space_translate(&address_space_memory, ctx->Gpa, &xlat, &len,
+                                 true, attrs);
+    if (!mr->lockless_io || len < size ||
+        (!whpx_mmio_fast_store_path() && !mr->lab_fast_store) ||
+        memory_access_is_direct(mr, true, attrs)) {
+        return false;
+    }
+    if (op == 0xc7) {
+        val = size == 8 ? (uint64_t)(int64_t)(int32_t)imm : imm;
+    } else {
+        name = (WHV_REGISTER_NAME)(WHvX64RegisterRax +
+                                   (((modrm >> 3) & 7) | ((rex & 4) << 1)));
+        hr = whp_dispatch.WHvGetVirtualProcessorRegisters(
+            whpx_global.partition, cpu->cpu_index, &name, 1, &value);
+        if (FAILED(hr)) {
+            return false;
+        }
+        val = size == 4 ? (uint32_t)value.Reg64 : value.Reg64;
+    }
+    /* Past here the device sees the store; the instruction must retire. */
+    memory_region_dispatch_write(mr, xlat, val, size_memop(size), attrs);
+    name = WHvX64RegisterRip;
+    value.Reg64 = vp->Rip + i;
+    hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
+        whpx_global.partition, cpu->cpu_index, &name, 1, &value);
+    if (FAILED(hr)) {
+        error_report("WHPX: fast MMIO store: failed to set RIP, hr=%08lx", hr);
+    }
+    return true;
+}
+
+/*
+ * SSE moves between an XMM register and memory that exits (MMIO, or a page the
+ * hypervisor would not let through). QEMU's x86 emulator has no SSE, so such an
+ * exit used to end the VM: "failed to decode instruction f d6" - a guest kernel
+ * `movq m64, xmm` (lab logs 2026-10-04 and 2026-10-15, both early in boot). The
+ * exit names the guest-physical address, so only the operand size, the register
+ * and the instruction length are decoded here; the access goes through the
+ * memory API (RAM or device) under the BQL the caller holds. Long mode only, no
+ * VEX, no address-size override, no access crossing a page; anything else falls
+ * through to the emulator as before.
+ */
+/*
+ * TEMP (lab): the instruction at `rip`, read through the guest's own translation, for an exit that carried no
+ * instruction bytes (b480: the early-boot `movq m64, xmm` exit arrived with none, so the SSE path below had
+ * nothing to decode and the emulator ended the VM). Returns the bytes read; 0 when the first page does not
+ * translate.
+ */
+static unsigned whpx_fetch_insn(CPUState *cpu, uint64_t rip, uint8_t *buf, unsigned len)
+{
+    unsigned got = 0;
+
+    while (got < len) {
+        WHV_TRANSLATE_GVA_RESULT res;
+        WHV_GUEST_PHYSICAL_ADDRESS gpa;
+        uint64_t gva = rip + got;
+        unsigned chunk = MIN(len - got, 0x1000 - (unsigned)(gva & 0xfff));
+        HRESULT hr = whp_dispatch.WHvTranslateGva(whpx_global.partition, cpu->cpu_index, gva,
+                                                  WHvTranslateGvaFlagValidateRead, &res, &gpa);
+
+        if (FAILED(hr) || res.ResultCode != WHvTranslateGvaResultSuccess ||
+            address_space_read(&address_space_memory, gpa, MEMTXATTRS_UNSPECIFIED, buf + got, chunk) !=
+                MEMTX_OK) {
+            break;
+        }
+        got += chunk;
+    }
+    return got;
+}
+
+static bool whpx_mmio_sse(CPUState *cpu, const WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
+{
+    const WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
+    const WHV_VP_EXIT_CONTEXT *vp = &exit_ctx->VpContext;
+    const uint8_t *b = ctx->InstructionBytes;
+    unsigned n = ctx->InstructionByteCount, i = 0, rex = 0, op, modrm, mod, rm, reg, size = 0;
+    bool p66 = false, pf3 = false, pf2 = false, store = false, zero_upper = false;
+    WHV_REGISTER_NAME name;
+    WHV_REGISTER_VALUE value = {};
+    uint8_t buf[16] = {};
+    uint8_t fetched[16];
+    HRESULT hr;
+
+    if (!vp->ExecutionState.EferLma || !vp->Cs.Long || (vp->Rflags & TF_MASK)) {
+        return false;
+    }
+    if (n < 3) {
+        n = whpx_fetch_insn(cpu, vp->Rip, fetched, sizeof(fetched));
+        b = fetched;
+    }
+    if (cpu->vcpu_dirty) {
+        /*
+         * QEMU holds newer registers than the hypervisor (b477-V: an early-boot `movq m64, xmm` hit this and the
+         * emulator, which has no SSE, ended the VM). Hand them over first, as the run loop would before the next
+         * run, so the XMM read and the RIP write below act on the current state.
+         */
+        whpx_set_registers(cpu, WHPX_LEVEL_RUNTIME_STATE);
+        cpu->vcpu_dirty = false;
+    }
+    for (; i < n; i++) {
+        if (b[i] == 0x66) {
+            p66 = true;
+        } else if (b[i] == 0xf3) {
+            pf3 = true;
+        } else if (b[i] == 0xf2) {
+            pf2 = true;
+        } else if (b[i] == 0x2e || b[i] == 0x3e || b[i] == 0x26 || b[i] == 0x36 ||
+                   b[i] == 0x64 || b[i] == 0x65) {
+            continue;   /* the exit's GPA already went through the segment */
+        } else {
+            break;
+        }
+    }
+    if (i < n && (b[i] & 0xf0) == 0x40) {
+        rex = b[i++];
+    }
+    if (i + 3 > n || b[i] != 0x0f) {
+        return false;
+    }
+    op = b[i + 1];
+    modrm = b[i + 2];
+    i += 3;
+    mod = modrm >> 6;
+    rm = modrm & 7;
+    if (mod == 3) {
+        return false;
+    }
+    switch (op) {
+    case 0xd6: if (!p66) return false; store = true; size = 8; break;            /* movq m64, xmm */
+    case 0x7f: if (!p66 && !pf3) return false; store = true; size = 16; break;  /* movdqa / movdqu */
+    case 0xe7: if (!p66) return false; store = true; size = 16; break;          /* movntdq */
+    case 0x2b: store = true; size = 16; break;                                   /* movntps / movntpd */
+    case 0x29: store = true; size = 16; break;                                   /* movaps / movapd */
+    case 0x11: store = true; size = pf3 ? 4 : pf2 ? 8 : 16; break;               /* movups/movupd/movss/movsd */
+    case 0x6f: if (!p66 && !pf3) return false; size = 16; break;                /* movdqa / movdqu load */
+    case 0x28: size = 16; break;                                                 /* movaps / movapd load */
+    case 0x10: size = pf3 ? 4 : pf2 ? 8 : 16; zero_upper = pf3 || pf2; break;   /* movups/.../movss/movsd load */
+    case 0x7e:
+        if (pf3) {
+            size = 8; zero_upper = true;                                         /* movq xmm, m64 */
+        } else if (p66) {
+            store = true; size = (rex & 8) ? 8 : 4;                              /* movd/movq m, xmm */
+        } else {
+            return false;
+        }
+        break;
+    case 0x6e: if (!p66) return false; size = (rex & 8) ? 8 : 4; zero_upper = true; break; /* movd/movq xmm, m */
+    default:
+        return false;
+    }
+    if (pf3 && pf2) {
+        return false;
+    }
+    if (rm == 4) {
+        if (i >= n) {
+            return false;
+        }
+        if (mod == 0 && (b[i] & 7) == 5) {
+            i += 4;                     /* SIB, no base: disp32 */
+        }
+        i++;
+    } else if (mod == 0 && rm == 5) {
+        i += 4;                         /* RIP-relative */
+    }
+    i += mod == 1 ? 1 : mod == 2 ? 4 : 0;
+    if (i > n) {
+        return false;
+    }
+    if (store != (ctx->AccessInfo.AccessType == WHvMemoryAccessWrite) ||
+        (ctx->AccessInfo.GvaValid && (ctx->Gva & 0xfff) != (ctx->Gpa & 0xfff)) ||
+        (ctx->Gpa & 0xfff) + size > 0x1000) {
+        static int told;
+
+        if (told++ < 8) {   /* TEMP lab: what still reaches the emulator */
+            fprintf(stderr, "whpx: SSE access left to the emulator: op 0f %02x store=%d type=%d gva_valid=%d gva=0x%"
+                    PRIx64 " gpa=0x%" PRIx64 " size=%u\n", op, store, ctx->AccessInfo.AccessType,
+                    ctx->AccessInfo.GvaValid, (uint64_t)ctx->Gva, (uint64_t)ctx->Gpa, size);
+        }
+        return false;
+    }
+    reg = ((modrm >> 3) & 7) | ((rex & 4) << 1);
+    name = (WHV_REGISTER_NAME)(WHvX64RegisterXmm0 + reg);
+    hr = whp_dispatch.WHvGetVirtualProcessorRegisters(whpx_global.partition, cpu->cpu_index, &name, 1, &value);
+    if (FAILED(hr)) {
+        return false;
+    }
+    if (store) {
+        memcpy(buf, &value.Reg128.Low64, 8);
+        memcpy(buf + 8, &value.Reg128.High64, 8);
+        address_space_write(&address_space_memory, ctx->Gpa, MEMTXATTRS_UNSPECIFIED, buf, size);
+    } else {
+        address_space_read(&address_space_memory, ctx->Gpa, MEMTXATTRS_UNSPECIFIED, buf, size);
+        if (zero_upper) {
+            value.Reg128.Low64 = 0;
+            value.Reg128.High64 = 0;
+        }
+        if (size == 16) {
+            memcpy(&value.Reg128.Low64, buf, 8);
+            memcpy(&value.Reg128.High64, buf + 8, 8);
+        } else {
+            uint64_t lo = value.Reg128.Low64;
+
+            memcpy(&lo, buf, size);   /* movss/movsd/movd/movq: the low lanes; the rest per zero_upper */
+            value.Reg128.Low64 = lo;
+        }
+        hr = whp_dispatch.WHvSetVirtualProcessorRegisters(whpx_global.partition, cpu->cpu_index, &name, 1, &value);
+        if (FAILED(hr)) {
+            error_report("WHPX: SSE MMIO load: failed to set XMM%u, hr=%08lx", reg, hr);
+        }
+    }
+    name = WHvX64RegisterRip;
+    value.Reg64 = vp->Rip + i;
+    hr = whp_dispatch.WHvSetVirtualProcessorRegisters(whpx_global.partition, cpu->cpu_index, &name, 1, &value);
+    if (FAILED(hr)) {
+        error_report("WHPX: SSE MMIO access: failed to set RIP, hr=%08lx", hr);
+    }
+    {
+        static uint64_t seen;
+
+        if (!(qatomic_fetch_inc(&seen) & 0xfff)) {
+            fprintf(stderr, "whpx: SSE %s of %u bytes at 0x%" PRIx64 " served (op 0f %02x)\n",
+                    store ? "store" : "load", size, (uint64_t)ctx->Gpa, op);
+        }
+    }
+    return true;
+}
+
 static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
 {
     WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
     int ret;
 
-    ret = emulate_instruction(cpu, ctx->InstructionBytes, ctx->InstructionByteCount);
+    /*
+     * Lab REIMS DIRTY_WP: a store into a page the display device write-protected.
+     * The hook makes it writable again; the store is not emulated, the vCPU
+     * simply runs it again, now against a tracked writable mapping.
+     */
+    if (whpx_wp_fault_hook && ctx->AccessInfo.AccessType == WHvMemoryAccessWrite &&
+        whpx_wp_fault_hook(ctx->Gpa)) {
+        return 0;
+    }
+
+    cpu->accel->mmio_fast = whpx_mmio_fast_path() &&
+                            (whpx_mmio_fast_load(cpu, exit_ctx) ||
+                             (whpx_mmio_fast_cmp_path() &&
+                              whpx_mmio_fast_cmp(cpu, exit_ctx)) ||
+                             whpx_mmio_fast_store(cpu, exit_ctx));   /* gated per region inside */
+    if (cpu->accel->mmio_fast) {
+        if (whpx_stats_on()) {
+            whpx_stats_mmio_page(ctx->Gpa);
+        }
+        return 0;
+    }
+
+    /*
+     * Device MMIO handlers run under the BQL in every other accelerator
+     * (KVM/TCG/HVF). This path ran BQL-free on WHPX, so device handlers that
+     * touch MemoryRegion state (dirty-log transactions, flatview queries)
+     * raced the main loop and other vCPUs. Take the BQL around the emulated
+     * access to restore the device model invariant. emulate_instruction never
+     * takes the BQL itself, so this cannot recurse, and every caller is a
+     * vCPU thread outside the BQL.
+     */
+    if (whpx_stats_on()) {
+        int64_t t0 = get_clock();
+        bql_lock();
+        qatomic_add(&whpx_stats.mmio_bql_ns, get_clock() - t0);
+        whpx_stats_mmio_page(ctx->Gpa);
+        whpx_stats_mmio_slow(ctx);
+    } else {
+        bql_lock();
+    }
+    {
+        int64_t lab_t = qemu_lab_slow_begin();
+
+        ret = whpx_mmio_sse(cpu, exit_ctx) ? 0 :
+              emulate_instruction(cpu, ctx->InstructionBytes, ctx->InstructionByteCount);
+        if (lab_t) {
+            char what[48];
+
+            snprintf(what, sizeof(what), "gpa=0x%" PRIx64 "%s", (uint64_t)ctx->Gpa,
+                     ctx->AccessInfo.AccessType == WHvMemoryAccessWrite ? ":w" : ":r");
+            qemu_lab_slow_end("mmio", what, NULL, lab_t);
+        }
+    }
+    bql_unlock();
     if (ret < 0) {
         error_report("failed to emulate mmio");
         return -1;
@@ -1055,6 +1930,20 @@ static int whpx_handle_msr_from_gpf(CPUState *cpu)
     }
 
     return 0;
+}
+
+static void whpx_inject_back_pf(CPUState *cpu)
+{
+    WHV_VP_EXCEPTION_CONTEXT *ctx = &cpu->accel->exit_ctx.VpException;
+    WHV_REGISTER_VALUE reg = {};
+
+    reg.ExceptionEvent.EventPending = 1;
+    reg.ExceptionEvent.EventType = WHvX64PendingEventException;
+    reg.ExceptionEvent.DeliverErrorCode = ctx->ExceptionInfo.ErrorCodeValid;
+    reg.ExceptionEvent.Vector = ctx->ExceptionType;
+    reg.ExceptionEvent.ErrorCode = ctx->ErrorCode;
+    reg.ExceptionEvent.ExceptionParameter = ctx->ExceptionParameter;
+    whpx_set_reg(cpu, WHvRegisterPendingEvent, reg);
 }
 
 static void whpx_inject_back_gpf(CPUState *cpu)
@@ -1111,6 +2000,11 @@ static int whpx_handle_portio(CPUState *cpu,
     CPUX86State *env = &x86_cpu->env;
     int ret;
 
+    if (whpx_stats_on()) {
+        /* TEMP lab: ports show in mmio_addrs as 0x10000000000<port><w|r> */
+        whpx_stats_mmio_page(0x1000000000000000ULL | ((uint64_t)ctx->PortNumber << 4) |
+                             (ctx->AccessInfo.IsWrite ? 1 : 0));
+    }
     if (!ctx->AccessInfo.StringOp && !ctx->AccessInfo.IsWrite) {
         uint64_t val = 0;
         WHV_REGISTER_VALUE reg;
@@ -1278,13 +2172,24 @@ static bool whpx_simulate_rdmsr(CPUState *cs)
     uint64_t val = 0;
 
     switch (msr) {
+    case MSR_IA32_SYSENTER_CS:
+        val = env->sysenter_cs;
+        break;
+    case MSR_IA32_SYSENTER_ESP:
+        val = env->sysenter_esp;
+        break;
+    case MSR_IA32_SYSENTER_EIP:
+        val = env->sysenter_eip;
+        break;
+    case MSR_IA32_MISC_ENABLE:
+        val = env->msr_ia32_misc_enable;
+        break;
     default:
         error_report("WHPX: unknown msr 0x%x", msr);
         x86_emul_raise_exception(&X86_CPU(cpu)->env, EXCP0D_GPF, 0);
         return 1;
         break;
     }
-
     RAX(env) = (uint32_t)val;
     RDX(env) = (uint32_t)(val >> 32);
 
@@ -1299,13 +2204,24 @@ static bool whpx_simulate_wrmsr(CPUState *cs)
     uint64_t data = ((uint64_t)EDX(env) << 32) | EAX(env);
 
     switch (msr) {
+    case MSR_IA32_SYSENTER_CS:
+        env->sysenter_cs = data;
+        break;
+    case MSR_IA32_SYSENTER_ESP:
+        env->sysenter_esp = data;
+        break;
+    case MSR_IA32_SYSENTER_EIP:
+        env->sysenter_eip = data;
+        break;
+    case MSR_IA32_MISC_ENABLE:
+        env->msr_ia32_misc_enable = data;
+        break;
     default:
         error_report("WHPX: unknown msr 0x%x val %llx", msr, data);
         x86_emul_raise_exception(&X86_CPU(cpu)->env, EXCP0D_GPF, 0);
         return 1;
         break;
     }
-
     return 0;
 }
 
@@ -1457,6 +2373,10 @@ uint64_t whpx_get_supported_msr_feature(uint32_t index)
     return 0;
 }
 
+/* QEMU_WHPX_PF_INTERCEPT state: -1 undecided, 0 off, 1 on (see below). */
+static int whpx_pf_intercept = -1;
+static int64_t whpx_pf_intercept_until_ns;
+
 static UINT64 whpx_get_default_exceptions(void)
 {
     struct whpx_state *whpx = &whpx_global;
@@ -1466,7 +2386,75 @@ static UINT64 whpx_get_default_exceptions(void)
         intercepts |= 1UL << WHvX64ExceptionTypeGeneralProtectionFault;
     }
 
+    /*
+     * Intercept page faults: the hypervisor delivers them to the guest only
+     * when the guest's fault path is mapped; early-boot guests with a
+     * page-fault-heavy init otherwise end up in a nested-fault storm and the
+     * VP dies with an UnrecoverableException (seen on AMD hosts). Intercepting
+     * and re-injecting the fault as a pending event keeps the guest in control.
+     *
+     * Every guest #PF then costs a VM exit to user space, tens of thousands a
+     * second under a desktop workload, so it is off unless QEMU_WHPX_PF_INTERCEPT=1
+     * asks for it (a host whose guests do not boot without it).
+     */
+    if (whpx_pf_intercept < 0) {
+        /*
+         * TEMP (lab, n130/hq): off by default. Kept, a macOS desktop pays
+         * ~8 us per guest page fault (n129/n130: 256 MiB of fresh pages 520 ->
+         * 87 ms, 300 process spawns 1.54 -> 0.55 s without it), and macOS 26
+         * boots without it on the i7-14700K and on the Ryzen 9 7950X host
+         * alike (the home rig: guest up in ~40 s instead of ~100). Dropping it
+         * at run time (QEMU_WHPX_PF_INTERCEPT_SECS) froze QEMU with two VMs
+         * on the AMD host, so that stays opt-in.
+         *
+         * QEMU_WHPX_PF_INTERCEPT=1 intercepts for the whole run, or for the
+         * first QEMU_WHPX_PF_INTERCEPT_SECS seconds when that is set too.
+         */
+        const char *v = g_getenv("QEMU_WHPX_PF_INTERCEPT");
+        const char *secs = g_getenv("QEMU_WHPX_PF_INTERCEPT_SECS");
+        int keep_s = secs ? atoi(secs) : 0;
+
+        whpx_pf_intercept = v && strcmp(v, "1") == 0;
+        if (whpx_pf_intercept && keep_s > 0) {
+            whpx_pf_intercept_until_ns = get_clock() +
+                                         (int64_t)keep_s * NANOSECONDS_PER_SECOND;
+        }
+    }
+    if (whpx_pf_intercept) {
+        intercepts |= 1UL << WHvX64ExceptionTypePageFault;
+    }
+
     return intercepts;
+}
+
+/*
+ * TEMP (lab, n130): QEMU_WHPX_PF_INTERCEPT_SECS=N keeps the #PF intercept only
+ * for the first N seconds of the run (the early-boot fault storm it exists
+ * for), then drops it, so the desktop's page faults no longer each cost an
+ * exit to QEMU (~8 us a fault in a macOS guest, n129). Called by every vCPU
+ * before it runs; the switch itself happens once, with all vCPUs stopped.
+ */
+static void whpx_pf_intercept_expire(void)
+{
+    struct whpx_state *whpx = &whpx_global;
+    UINT64 debug_bits;
+
+    if (!whpx_pf_intercept_until_ns || get_clock() < whpx_pf_intercept_until_ns) {
+        return;
+    }
+    start_exclusive();
+    if (whpx_pf_intercept_until_ns) {
+        whpx_pf_intercept_until_ns = 0;
+        whpx_pf_intercept = 0;
+        debug_bits = whpx->exception_exit_bitmap;
+        whpx->exception_exit_bitmap = -1;   /* force the setter to write */
+        if (FAILED(whpx_set_exception_exit_bitmap(debug_bits == (UINT64)-1 ? 0 : debug_bits))) {
+            error_report("WHPX: could not drop the #PF intercept");
+        } else {
+            fprintf(stderr, "reims-lab: #PF intercept dropped\n");
+        }
+    }
+    end_exclusive();
 }
 
 /*
@@ -1853,6 +2841,11 @@ void whpx_apply_breakpoints(
     }
 }
 
+bool whpx_arch_supports_guest_debug(void) 
+{
+    return true;
+}
+
 void whpx_arch_destroy_vcpu(CPUState *cpu)
 {
     X86CPU *x86cpu = X86_CPU(cpu);
@@ -1943,6 +2936,99 @@ static void whpx_vcpu_kick_out_of_hlt(CPUState *cpu)
     }
 }
 
+/*
+ * Which vCPUs are inside WHvRunVirtualProcessor, and how many times each has
+ * come out. Read by whpx_flush_dirty_log from a device thread.
+ */
+#define WHPX_RUN_STATE_MAX 256
+static struct {
+    int in_run;
+    uint64_t exits;
+    int64_t out_ns;   /* TEMP lab (b461 freeze watch): when it last came out, 0 while running */
+    int reason;
+} whpx_run_state[WHPX_RUN_STATE_MAX];
+
+/*
+ * TEMP lab (b461 freeze watch): every 500 ms, the vCPUs that have been out of WHvRunVirtualProcessor - in QEMU's own
+ * exit handling - for over a second, with the exit reason. b461-B2 froze a guest with ~3 vCPUs spinning and almost no
+ * exits: a vCPU parked in the host would hold every guest TLB shootdown, and this names it.
+ */
+static void *whpx_lab_vcpu_watch_fn(void *opaque)
+{
+    /*
+     * TEMP lab (Opus 2026-10-19, work VM freezes): a vCPU out for over 2 s gets every thread's stack dumped once per
+     * episode (whoever holds the BQL or a device lock is in there); at most once a minute.
+     */
+    bool dumped = false;
+    int64_t last_dump = 0;
+
+    for (;;) {
+        int64_t now;
+        int64_t worst = 0;
+        int i;
+
+        g_usleep(500 * 1000);
+        now = get_clock();
+        for (i = 0; i < WHPX_RUN_STATE_MAX; i++) {
+            int64_t out = qatomic_read(&whpx_run_state[i].out_ns);
+
+            if (out && now - out > NANOSECONDS_PER_SECOND && !qatomic_read(&whpx_run_state[i].in_run)) {
+                fprintf(stderr, "whpx-vcpu-stuck: cpu %d out of the hypervisor %" PRId64 " ms, exit reason %#x\n", i,
+                        (now - out) / SCALE_MS, qatomic_read(&whpx_run_state[i].reason));
+                worst = MAX(worst, now - out);
+            }
+        }
+        if (!worst) {
+            dumped = false;
+        } else if (worst > 2 * NANOSECONDS_PER_SECOND && !dumped && now - last_dump > 60 * NANOSECONDS_PER_SECOND) {
+            dumped = true;
+            last_dump = now;
+            qemu_lab_dump_thread_stacks("vcpu-stuck");
+        }
+    }
+    return NULL;
+}
+
+/*
+ * memory_dirty_log_flush_hook: make every vCPU that is running guest code exit
+ * once, and wait (bounded) until it has. A store a running vCPU made may sit in
+ * the hypervisor's per-processor log until that processor exits; a dirty-bitmap
+ * query from another thread in the meantime does not report it. A vCPU outside
+ * WHvRunVirtualProcessor has already exited since its last store.
+ */
+static void whpx_flush_dirty_log(void)
+{
+    uint64_t seq[WHPX_RUN_STATE_MAX];
+    bool wait[WHPX_RUN_STATE_MAX];
+    int max = 0, i;
+    int64_t deadline;
+    CPUState *cpu;
+
+    WITH_RCU_READ_LOCK_GUARD() {
+        CPU_FOREACH(cpu) {
+            i = cpu->cpu_index;
+            if (i < 0 || i >= WHPX_RUN_STATE_MAX) {
+                continue;
+            }
+            max = MAX(max, i + 1);
+            seq[i] = qatomic_read(&whpx_run_state[i].exits);
+            wait[i] = qatomic_read(&whpx_run_state[i].in_run) != 0;
+            if (wait[i]) {
+                whp_dispatch.WHvCancelRunVirtualProcessor(whpx_global.partition,
+                                                          i, 0);
+            }
+        }
+    }
+    deadline = get_clock() + 200 * SCALE_US;
+    for (i = 0; i < max; i++) {
+        while (wait[i] && qatomic_read(&whpx_run_state[i].exits) == seq[i] &&
+               qatomic_read(&whpx_run_state[i].in_run) &&
+               get_clock() < deadline) {
+            /* spin: exits take microseconds */
+        }
+    }
+}
+
 static void whpx_vcpu_pre_run(CPUState *cpu)
 {
     HRESULT hr;
@@ -1961,7 +3047,30 @@ static void whpx_vcpu_pre_run(CPUState *cpu)
     memset(&new_int, 0, sizeof(new_int));
     memset(reg_values, 0, sizeof(reg_values));
 
-    bql_lock();
+    /*
+     * With the APIC in the hypervisor, every step below acts on a pending
+     * interrupt_request bit (NMI/SMI, INIT/TPR, HARD) and does nothing without
+     * one, yet it took the BQL on every exit to find that out -- so a device
+     * handler holding the BQL for milliseconds (a dirty-log sync) stalled
+     * every vCPU at its next exit. With no bit pending there is nothing to
+     * inject and no register to set. A bit raised after this read is
+     * followed by a kick, which cancels the run this returns to, exactly as
+     * one raised after the unlock below always could be.
+     */
+    if (whpx_prerun_fast_path() && whpx_irqchip_in_kernel() &&
+        !cpu_test_interrupt(cpu, ~0)) {
+        vcpu->ready_for_pic_interrupt = false;
+        return;
+    }
+
+    if (whpx_stats_on()) {
+        int64_t t0 = get_clock();
+        bql_lock();
+        qatomic_add(&whpx_stats.prerun_bql_ns, get_clock() - t0);
+        qatomic_inc(&whpx_stats.prerun_n);
+    } else {
+        bql_lock();
+    }
 
     /* Inject NMI */
     if (!vcpu->interruption_pending &&
@@ -2225,6 +3334,8 @@ int whpx_vcpu_run(CPUState *cpu)
 
     bql_unlock();
 
+    whpx_pf_intercept_expire();   /* lab: QEMU_WHPX_PF_INTERCEPT_SECS */
+
     if (exclusive_step_mode != WHPX_STEP_NONE) {
         start_exclusive();
         g_assert(cpu == current_cpu);
@@ -2260,21 +3371,52 @@ int whpx_vcpu_run(CPUState *cpu)
         if (exclusive_step_mode == WHPX_STEP_NONE) {
             whpx_vcpu_pre_run(cpu);
 
+            /* lab: leave the loop so the #PF intercept can be dropped above */
+            if (whpx_pf_intercept_until_ns && get_clock() >= whpx_pf_intercept_until_ns) {
+                qatomic_set(&cpu->exit_request, true);
+            }
+
             /* Corresponding store-release is in cpu_exit. */
             if (qatomic_load_acquire(&cpu->exit_request)) {
                 whpx_vcpu_kick(cpu);
             }
         }
 
-        if (exclusive_step_mode != WHPX_STEP_NONE || cpu_single_stepping(cpu)) {
+        if (exclusive_step_mode != WHPX_STEP_NONE || cpu->singlestep_enabled) {
             whpx_vcpu_configure_single_stepping(cpu, true, NULL);
         }
 
         whpx_inject_exceptions(cpu);
 
+        int64_t stats_t_run = whpx_stats_on() ? get_clock() : 0;
+        if (cpu->cpu_index < WHPX_RUN_STATE_MAX) {
+            static gsize watch_started;
+
+            if (g_once_init_enter(&watch_started)) {   /* TEMP lab (b461 freeze watch) */
+                QemuThread t;
+
+                qemu_thread_create(&t, "whpx-vcpu-watch", whpx_lab_vcpu_watch_fn, NULL, QEMU_THREAD_DETACHED);
+                g_once_init_leave(&watch_started, 1);
+            }
+            qatomic_set(&whpx_run_state[cpu->cpu_index].out_ns, 0);
+            qatomic_set(&whpx_run_state[cpu->cpu_index].in_run, 1);
+        }
         hr = whp_dispatch.WHvRunVirtualProcessor(
             whpx->partition, cpu->cpu_index,
             &vcpu->exit_ctx, sizeof(vcpu->exit_ctx));
+        if (cpu->cpu_index < WHPX_RUN_STATE_MAX) {
+            qatomic_inc(&whpx_run_state[cpu->cpu_index].exits);
+            qatomic_set(&whpx_run_state[cpu->cpu_index].in_run, 0);
+            qatomic_set(&whpx_run_state[cpu->cpu_index].reason, (int)vcpu->exit_ctx.ExitReason);
+            qatomic_set(&whpx_run_state[cpu->cpu_index].out_ns, get_clock());
+        }
+        int64_t stats_t_exit = stats_t_run ? get_clock() : 0;
+        if (stats_t_run) {
+            qatomic_add(&whpx_stats.run_ns, stats_t_exit - stats_t_run);
+            if (whpx_on_ecore()) {
+                qatomic_add(&whpx_stats.run_ecore_ns, stats_t_exit - stats_t_run);
+            }
+        }
 
         if (FAILED(hr)) {
             error_report("WHPX: Failed to exec a virtual processor,"
@@ -2283,7 +3425,7 @@ int whpx_vcpu_run(CPUState *cpu)
             break;
         }
 
-        if (exclusive_step_mode != WHPX_STEP_NONE || cpu_single_stepping(cpu)) {
+        if (exclusive_step_mode != WHPX_STEP_NONE || cpu->singlestep_enabled) {
             whpx_vcpu_configure_single_stepping(cpu,
                 false,
                 &vcpu->exit_ctx.VpContext.Rflags);
@@ -2367,6 +3509,61 @@ int whpx_vcpu_run(CPUState *cpu)
                 val = X86_CPU(cpu)->env.apic_bus_freq;
             }
 
+            /*
+             * The hypervisor intercepts guest accesses to the SYSENTER
+             * MSRs and reports them here. Keep the guest-visible values
+             * in env (the x86_emul fallback and reads both use them).
+             * The partition-side SYSENTER state is left alone: the
+             * hypervisor rejects programmatic updates to it for some
+             * values, and guests reach these MSRs through the emulated
+             * path in practice.
+             */
+            if (vcpu->exit_ctx.MsrAccess.MsrNumber == MSR_IA32_SYSENTER_CS
+                || vcpu->exit_ctx.MsrAccess.MsrNumber == MSR_IA32_SYSENTER_ESP
+                || vcpu->exit_ctx.MsrAccess.MsrNumber == MSR_IA32_SYSENTER_EIP) {
+                CPUX86State *senv = &X86_CPU(cpu)->env;
+                is_known_msr = 1;
+                if (vcpu->exit_ctx.MsrAccess.AccessInfo.IsWrite) {
+                    switch (vcpu->exit_ctx.MsrAccess.MsrNumber) {
+                    case MSR_IA32_SYSENTER_CS:
+                        senv->sysenter_cs = val;
+                        break;
+                    case MSR_IA32_SYSENTER_ESP:
+                        senv->sysenter_esp = val;
+                        break;
+                    case MSR_IA32_SYSENTER_EIP:
+                        senv->sysenter_eip = val;
+                        break;
+                    }
+                } else {
+                    switch (vcpu->exit_ctx.MsrAccess.MsrNumber) {
+                    case MSR_IA32_SYSENTER_CS:
+                        val = senv->sysenter_cs;
+                        break;
+                    case MSR_IA32_SYSENTER_ESP:
+                        val = senv->sysenter_esp;
+                        break;
+                    case MSR_IA32_SYSENTER_EIP:
+                        val = senv->sysenter_eip;
+                        break;
+                    }
+                }
+            }
+            /*
+             * macOS kexts probe IA32_MISC_ENABLE early; failing the
+             * read with #GP panics the boot. Mirror QEMU's TCG
+             * semantics: reads return the stored value, writes store
+             * it verbatim.
+             */
+            if (vcpu->exit_ctx.MsrAccess.MsrNumber == MSR_IA32_MISC_ENABLE) {
+                CPUX86State *menv = &X86_CPU(cpu)->env;
+                is_known_msr = 1;
+                if (vcpu->exit_ctx.MsrAccess.AccessInfo.IsWrite) {
+                    menv->msr_ia32_misc_enable = val;
+                } else {
+                    val = menv->msr_ia32_misc_enable;
+                }
+            }
             if (vcpu->exit_ctx.MsrAccess.MsrNumber == MSR_IA32_APICBASE) {
                 is_known_msr = 1;
                 if (val & MSR_IA32_APICBASE_RESERVED) {
@@ -2574,15 +3771,29 @@ int whpx_vcpu_run(CPUState *cpu)
             /* Dynamic depending on XCR0 and XSS, so query DefaultResult */
             if (vcpu->exit_ctx.CpuidAccess.Rax == 0x07
                 && vcpu->exit_ctx.CpuidAccess.Rcx == 0) {
-                if (vcpu->exit_ctx.CpuidAccess.DefaultResultRdx
-                    & CPUID_7_0_EDX_CET_IBT) {
+                /*
+                 * CET only where the CPU model has it, not wherever the host
+                 * does. The hypervisor reports CET on a host that has it, but
+                 * this accelerator's xsave transfer sizes its buffer from
+                 * CPUID[0xD,0].ECX (user states only) and carries no
+                 * supervisor state. A guest that turns shadow stacks on --
+                 * macOS 26 does, on a Raptor Lake host -- grows the compacted
+                 * area by the CET_U/CET_S components (832 -> 872 bytes here);
+                 * every state read then fails with WHV_E_INSUFFICIENT_BUFFER
+                 * and the guest died of an unrecoverable exception minutes
+                 * later. Skylake-class models have no CET.
+                 */
+                if ((vcpu->exit_ctx.CpuidAccess.DefaultResultRdx
+                     & CPUID_7_0_EDX_CET_IBT)
+                    && (env->features[FEAT_7_0_EDX] & CPUID_7_0_EDX_CET_IBT)) {
                     reg_values[3].Reg32 |= CPUID_7_0_EDX_CET_IBT;
                 } else {
                     reg_values[3].Reg32 &= ~CPUID_7_0_EDX_CET_IBT;
                 }
 
-                if (vcpu->exit_ctx.CpuidAccess.DefaultResultRcx
-                    & CPUID_7_0_ECX_CET_SHSTK) {
+                if ((vcpu->exit_ctx.CpuidAccess.DefaultResultRcx
+                     & CPUID_7_0_ECX_CET_SHSTK)
+                    && (env->features[FEAT_7_0_ECX] & CPUID_7_0_ECX_CET_SHSTK)) {
                     reg_values[2].Reg32 |= CPUID_7_0_ECX_CET_SHSTK;
                 } else {
                     reg_values[2].Reg32 &= ~CPUID_7_0_ECX_CET_SHSTK;
@@ -2612,6 +3823,15 @@ int whpx_vcpu_run(CPUState *cpu)
                 } else {
                     reg_values[2].Reg32 &= ~CPUID_EXT_OSXSAVE;
                 }
+
+                /*
+                 * The hypervisor's in-kernel LAPIC advertises TSC-deadline
+                 * support but faults on the corresponding LVT timer write
+                 * (observed: a guest writing 0x400dd to x2APIC MSR 0x832
+                 * takes #GP in lapic_init). Hide the bit so the guest falls
+                 * back to one-shot mode, which the LAPIC handles.
+                 */
+                reg_values[2].Reg32 &= ~CPUID_EXT_TSC_DEADLINE_TIMER;
             }
 
             hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
@@ -2628,6 +3848,18 @@ int whpx_vcpu_run(CPUState *cpu)
             break;
         }
         case WHvRunVpExitReasonException:
+            if (vcpu->exit_ctx.VpException.ExceptionType ==
+                WHvX64ExceptionTypePageFault) {
+                /*
+                 * Deliver the #PF straight back to the guest as a pending
+                 * exception (mirrors the GPF handling): routing it through
+                 * EXCP_DEBUG loses the fault in the core when no debugger
+                 * is attached.
+                 */
+                whpx_inject_back_pf(cpu);
+                ret = 0;
+                break;
+            }
             if (vcpu->exit_ctx.VpException.ExceptionType ==
                 WHvX64ExceptionTypeGeneralProtectionFault) {
                 if (whpx_handle_msr_from_gpf(cpu)) {
@@ -2648,7 +3880,7 @@ int whpx_vcpu_run(CPUState *cpu)
                 cpu->exception_index = EXCP_DEBUG;
             } else if ((vcpu->exit_ctx.VpException.ExceptionType ==
                         WHvX64ExceptionTypeDebugTrapOrFault) &&
-                       !cpu_single_stepping(cpu)) {
+                       !cpu->singlestep_enabled) {
                 /*
                  * Just finished stepping over a breakpoint, but the
                  * gdb does not expect us to do single-stepping.
@@ -2676,6 +3908,15 @@ int whpx_vcpu_run(CPUState *cpu)
             break;
         }
 
+        if (stats_t_exit) {
+            int b = whpx_stats_bucket(vcpu->exit_ctx.ExitReason);
+            if (b == WS_MMIO && vcpu->mmio_fast) {
+                b = WS_MMIOF;
+            }
+            qatomic_inc(&whpx_stats.count[b]);
+            qatomic_add(&whpx_stats.ns[b], get_clock() - stats_t_exit);
+            whpx_stats_maybe_print();
+        }
     } while (!ret);
 
     if (stepped_over_bp) {
@@ -3009,6 +4250,194 @@ void whpx_arch_accel_class_init(ObjectClass *oc)
         "Separate security domain");
 }
 
+/*
+ * TEMP lab: QEMU_LAB_VPWATCH=1 - whether the hypervisor runs the guest's VPs.
+ * b050 (Intel, 24 vCPUs, large-page RAM): the whole guest stops 8-11 % of the
+ * time, up to ~200 ms at once - four guest threads spinning on
+ * mach_absolute_time all stop together, idle or not, with no dirty query, WP
+ * remap or other device work on the host. A thread here reads every VP's
+ * runtime counters each ~1 ms; a stretch of >= 20 ms in which no VP gained
+ * guest runtime (total - hypervisor), after VPs were running, is the guest not
+ * executing; hv_vps says whether the VPs sat in the hypervisor meanwhile (b052:
+ * total runtime never stopped through the guest's freezes). The
+ * thread's own lateness says whether host threads stalled with them.
+ * Lines: `vpwatch stall t_ms=<epoch> len_ms= prev_vps= watcher_gap_ms=` and a
+ * per-second `vpwatch sec vps= stalls= stall_ms= max_watcher_gap_ms=`.
+ */
+typedef HRESULT (WINAPI *WhvGetVpCountersFn)(WHV_PARTITION_HANDLE, UINT32,
+                                              WHV_PROCESSOR_COUNTER_SET, VOID *,
+                                              UINT32, UINT32 *);
+static WhvGetVpCountersFn lab_vpw_get;
+static unsigned lab_vpw_n;
+
+/* Sum of the VPs' guest runtime (total - hypervisor); the hypervisor part into *hv. */
+static uint64_t lab_vpw_total(uint64_t *per, uint64_t *perhv, uint64_t *hv)
+{
+    uint64_t sum = 0, sumhv = 0;
+    unsigned i;
+
+    for (i = 0; i < lab_vpw_n; i++) {
+        WHV_PROCESSOR_RUNTIME_COUNTERS c = {0};
+        UINT32 got = 0;
+
+        if (SUCCEEDED(lab_vpw_get(whpx_global.partition, i,
+                                  WHvProcessorCounterSetRuntime, &c,
+                                  sizeof(c), &got))) {
+            per[i] = c.TotalRuntime100ns;
+            perhv[i] = c.HypervisorRuntime100ns;
+        }
+        sum += per[i] - perhv[i];
+        sumhv += perhv[i];
+    }
+    *hv = sumhv;
+    return sum;
+}
+
+static void *lab_vpw_thread(void *arg)
+{
+    uint64_t per[256] = {0}, perhv[256] = {0}, hv = 0, hv_prev = 0, stall_hv = 0;
+    uint64_t prev = lab_vpw_total(per, perhv, &hv_prev), sec_stall_ns = 0, sec_hv = 0;
+    int64_t t_prev = get_clock(), sec_t0 = t_prev, stall_t0 = 0;
+    int64_t max_gap_ns = 0, stall_gap_ns = 0;
+    double rate = 0, prev_rate = 0, sec_run = 0;
+    unsigned sec_stalls = 0;
+    HANDLE tm = CreateWaitableTimerExW(NULL, NULL,
+                                       0x00000002 /* HIGH_RESOLUTION */,
+                                       TIMER_ALL_ACCESS);
+
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    for (;;) {
+        if (tm) {
+            LARGE_INTEGER due = { .QuadPart = -10000 };   /* 1 ms */
+            SetWaitableTimer(tm, &due, 0, NULL, NULL, FALSE);
+            WaitForSingleObject(tm, INFINITE);
+        } else {
+            Sleep(1);
+        }
+        int64_t now = get_clock(), dt = now - t_prev;
+        uint64_t cur = lab_vpw_total(per, perhv, &hv);
+        double vps = dt > 0 ? (double)(cur - prev) * 100.0 / dt : 0;
+
+        max_gap_ns = MAX(max_gap_ns, dt);
+        sec_run += (double)(cur - prev) * 100.0;
+        sec_hv += (hv - hv_prev) * 100;
+        if (cur == prev && rate >= 0.5) {
+            if (!stall_t0) {
+                stall_t0 = t_prev;
+                prev_rate = rate;
+                stall_gap_ns = 0;
+                stall_hv = 0;
+            }
+            stall_hv += (hv - hv_prev) * 100;
+            stall_gap_ns = MAX(stall_gap_ns, dt);
+        } else if (stall_t0) {
+            int64_t len = t_prev - stall_t0;
+
+            if (len >= 20 * SCALE_MS) {
+                fprintf(stderr, "vpwatch stall t_ms=%" PRId64 " len_ms=%.1f prev_vps=%.1f "
+                        "watcher_gap_ms=%.1f hv_vps=%.2f\n",
+                        g_get_real_time() / 1000 - (now - stall_t0) / SCALE_MS,
+                        len / 1e6, prev_rate, stall_gap_ns / 1e6,
+                        (double)stall_hv / len);
+                sec_stalls++;
+                sec_stall_ns += len;
+            }
+            stall_t0 = 0;
+        }
+        if (!stall_t0) {
+            /* ~20 ms moving average of the VPs running */
+            rate = rate * 0.95 + vps * 0.05;
+        }
+        if (now - sec_t0 >= NANOSECONDS_PER_SECOND) {
+            fprintf(stderr, "vpwatch sec t_ms=%" PRId64 " vps=%.2f hv_vps=%.2f stalls=%u stall_ms=%" PRIu64
+                    " max_watcher_gap_ms=%.1f\n", g_get_real_time() / 1000,
+                    sec_run / (now - sec_t0), (double)sec_hv / (now - sec_t0), sec_stalls,
+                    sec_stall_ns / 1000000, max_gap_ns / 1e6);
+            sec_hv = 0;
+            sec_t0 = now;
+            sec_run = 0;
+            sec_stalls = 0;
+            sec_stall_ns = 0;
+            max_gap_ns = 0;
+        }
+        prev = cur;
+        hv_prev = hv;
+        t_prev = now;
+    }
+    return NULL;
+}
+
+static void lab_vpw_start(unsigned vps)
+{
+    const char *e = getenv("QEMU_LAB_VPWATCH");
+    HMODULE m = GetModuleHandleA("WinHvPlatform.dll");
+    static QemuThread th;
+
+    if (!e || strcmp(e, "1") != 0) {
+        return;
+    }
+    lab_vpw_get = m ? (WhvGetVpCountersFn)(void *)GetProcAddress(
+                          m, "WHvGetVirtualProcessorCounters") : NULL;
+    lab_vpw_n = MIN(vps, 256u);
+    fprintf(stderr, "vpwatch on vps=%u api=%d\n", lab_vpw_n, lab_vpw_get != NULL);
+    if (lab_vpw_get) {
+        qemu_thread_create(&th, "lab-vpwatch", lab_vpw_thread, NULL,
+                           QEMU_THREAD_DETACHED);
+    }
+}
+
+/*
+ * TEMP lab (Opus 2026-10-17): the hypervisor's own resource controls for the guest partition, which only the classic
+ * and core schedulers honour (bcdedit hypervisorschedulertype). Under classic the guest's VPs are scheduled by the
+ * hypervisor on any logical processor and the root's threads (the drain, the renderer) lose those LPs without the
+ * Windows scheduler knowing: AMD b697 woke guest threads 4x faster (ping-pong 36 -> 8.6 us) but canvas fell 54 -> 46
+ * with drain duty 0.50 -> 0.74. QEMU_WHPX_CPU_WEIGHT (1..10000; the hypervisor's default is 100),
+ * QEMU_WHPX_CPU_RESERVE and QEMU_WHPX_CPU_CAP (raw values in WHP's units) set the matching partition properties;
+ * tried before WHvSetupPartition and again after it if refused, each logged once with its HRESULT.
+ */
+static void whpx_lab_sched_props(WHV_PARTITION_HANDLE part, bool after_setup)
+{
+    static const struct {
+        const char *env;
+        WHV_PARTITION_PROPERTY_CODE code;
+    } props[] = {
+        { "QEMU_WHPX_CPU_WEIGHT", WHvPartitionPropertyCodeCpuWeight },
+        { "QEMU_WHPX_CPU_RESERVE", WHvPartitionPropertyCodeCpuReserve },
+        { "QEMU_WHPX_CPU_CAP", WHvPartitionPropertyCodeCpuCap },
+    };
+    static bool done[ARRAY_SIZE(props)];
+    size_t i;
+
+    for (i = 0; i < ARRAY_SIZE(props); i++) {
+        const char *e = getenv(props[i].env);
+        WHV_PARTITION_PROPERTY prop;
+        HRESULT hr;
+
+        if (done[i] || !e || !*e) {
+            continue;
+        }
+        memset(&prop, 0, sizeof(prop));
+        switch (props[i].code) {
+        case WHvPartitionPropertyCodeCpuWeight:
+            prop.CpuWeight = (UINT32)strtoul(e, NULL, 0);
+            break;
+        case WHvPartitionPropertyCodeCpuReserve:
+            prop.CpuReserve = (UINT32)strtoul(e, NULL, 0);
+            break;
+        default:
+            prop.CpuCap = (UINT32)strtoul(e, NULL, 0);
+            break;
+        }
+        hr = whp_dispatch.WHvSetPartitionProperty(part, props[i].code, &prop,
+                                                  sizeof(WHV_PARTITION_PROPERTY));
+        if (SUCCEEDED(hr) || after_setup) {
+            done[i] = true;
+            fprintf(stderr, "reims-lab: whpx %s=%s %s hr=%08lx\n", props[i].env, e,
+                    after_setup ? "after-setup" : "before-setup", hr);
+        }
+    }
+}
+
 int whpx_accel_init(AccelState *as, MachineState *ms)
 {
     struct whpx_state *whpx;
@@ -3021,7 +4450,7 @@ int whpx_accel_init(AccelState *as, MachineState *ms)
     WHV_PROCESSOR_FEATURES_BANKS processor_features;
     WHV_PROCESSOR_PERFMON_FEATURES perfmon_features;
 
-    UINT32 cpuidExitList[] = {0x0, 0x1, 0x6, 0x7, 0xb, 0xd, 0x14, 0x24, 0x29, 0x1E,
+    UINT32 cpuidExitList[] = {0x0, 0x1, 0x4, 0x6, 0x7, 0xb, 0xd, 0x14, 0x24, 0x29, 0x1E,
         0x40000000, 0x40000001, 0x40000010, 0x80000000, 0x80000001,
         0x80000002, 0x80000003, 0x80000004, 0x80000007, 0x80000008,
         0x8000000A, 0x80000021, 0x80000022, 0xC0000000, 0xC0000001};
@@ -3328,17 +4757,19 @@ int whpx_accel_init(AccelState *as, MachineState *ms)
         goto error;
     }
 
+    memory_dirty_log_flush_hook = whpx_flush_dirty_log;
+    whpx_lab_sched_props(whpx->partition, false);
     hr = whp_dispatch.WHvSetupPartition(whpx->partition);
     if (FAILED(hr)) {
         error_report("WHPX: Failed to setup partition, hr=%08lx", hr);
         ret = -EINVAL;
         goto error;
     }
+    whpx_lab_sched_props(whpx->partition, true);
 
     whpx_memory_init();
     whpx_init_emu();
-
-    as->gdbstub.sstep_flags = SSTEP_ENABLE;
+    lab_vpw_start(ms->smp.cpus);   /* TEMP lab: QEMU_LAB_VPWATCH=1 */
 
     return 0;
 
