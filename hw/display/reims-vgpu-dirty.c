@@ -1629,10 +1629,13 @@ static void reims_vgpu_dirty_tab_del(ReimsVgpuDirty *d, uint64_t token)
     }
 }
 
+static void reims_fence_install(void);   /* TEMP lab LAZY_SYNC */
+
 ReimsVgpuDirty *reims_vgpu_dirty_new(void)
 {
     ReimsVgpuDirty *d = g_new0(ReimsVgpuDirty, 1);
 
+    reims_fence_install();
     qemu_mutex_init(&d->lock);
     qemu_mutex_init(&d->sets_lock);
     /*
@@ -2510,6 +2513,9 @@ static void reims_fence_dma_wait(uint64_t addr, uint64_t len)
     }
     qemu_mutex_lock(&reims_fence_lock);
     t0 = get_clock();
+    if (reims_fence_overlaps_locked(addr, len)) {
+        qatomic_inc(&reims_fence_n_dma);   /* counted when it waits, not when it looks */
+    }
     while (reims_fence_overlaps_locked(addr, len)) {
         if (get_clock() - t0 > 2 * NANOSECONDS_PER_SECOND) {
             fprintf(stderr, "reims-fence STUCK dma 0x%" PRIx64 "+0x%" PRIx64 "\n", addr, len);
@@ -2519,7 +2525,15 @@ static void reims_fence_dma_wait(uint64_t addr, uint64_t len)
         qemu_cond_timedwait(&reims_fence_cond, &reims_fence_lock, 100);
     }
     qemu_mutex_unlock(&reims_fence_lock);
-    qatomic_inc(&reims_fence_n_dma);
+}
+
+static void reims_fence_remap_guard(bool begin);
+
+/* Installed with the device, before any fence: QEMU's first RAM remap after a close must already be guarded. */
+static void reims_fence_install(void)
+{
+    reims_fence_init();
+    whpx_fence_remap_guard_hook = reims_fence_remap_guard;
 }
 
 /*
@@ -2773,7 +2787,6 @@ uint64_t reims_vgpu_dirty_fence_close(ReimsVgpuDirty *d, const uint64_t *gpas, s
         qatomic_inc(&reims_fence_n_refused);
         return 0;
     }
-    whpx_fence_remap_guard_hook = reims_fence_remap_guard;
     token = f->token = reims_fence_next++;
     g_ptr_array_add(reims_fences, f);
     reims_fence_span_locked();
