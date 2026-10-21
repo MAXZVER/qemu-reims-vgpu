@@ -1861,6 +1861,14 @@ static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
      * The hook makes it writable again; the store is not emulated, the vCPU
      * simply runs it again, now against a tracked writable mapping.
      */
+    /*
+     * TEMP lab LAZY_SYNC: any access to guest RAM the device fenced while it lands a frame there waits for the
+     * landing, then runs again against the pages as they are now (first: a write-protected page inside a fence
+     * faults again afterwards and reaches the DIRTY_WP hook below).
+     */
+    if (whpx_fence_fault_hook && whpx_fence_fault_hook(ctx->Gpa)) {
+        return 0;
+    }
     if (whpx_wp_fault_hook && ctx->AccessInfo.AccessType == WHvMemoryAccessWrite &&
         whpx_wp_fault_hook(ctx->Gpa)) {
         return 0;

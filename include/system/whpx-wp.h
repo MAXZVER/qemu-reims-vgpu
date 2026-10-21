@@ -8,6 +8,12 @@
 extern bool (*whpx_wp_fault_hook)(uint64_t gpa);
 extern void (*whpx_wp_invalidate_hook)(void);
 int whpx_wp_remap(uint64_t gpa, uint64_t size, bool writable);
+/*
+ * TEMP lab LAZY_SYNC: take [gpa, gpa+size) away from the guest (`closed`) or give it back writable and tracked;
+ * a guest access to a closed range exits to `whpx_fence_fault_hook`, which returns true once it may run again.
+ */
+extern bool (*whpx_fence_fault_hook)(uint64_t gpa);
+int whpx_fence_remap(uint64_t gpa, uint64_t size, bool closed);
 /* TEMP lab (b454): the DIRTY_WP remaps since the last call - count, time, worst, 4 KiB pages; resets them. */
 void whpx_lab_wp_remap_take(uint64_t *n, uint64_t *ns, uint64_t *max_ns, uint64_t *pages);
 /*

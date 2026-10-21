@@ -1158,6 +1158,23 @@ static void reims_vgpu_pci_guest_write_rebase(void *ctx, uint64_t token, const u
     }
 }
 
+/* HostOps.guest_fence_close / guest_fence_open (TEMP lab LAZY_SYNC). */
+static uint64_t reims_vgpu_pci_guest_fence_close(void *ctx, const uint64_t *gpas, size_t count, size_t page_size)
+{
+    ReimsVGPUPCIState *s = ctx;
+
+    return s->dirty ? reims_vgpu_dirty_fence_close(s->dirty, gpas, count, page_size) : 0;
+}
+
+static void reims_vgpu_pci_guest_fence_open(void *ctx, uint64_t token)
+{
+    ReimsVGPUPCIState *s = ctx;
+
+    if (s->dirty) {
+        reims_vgpu_dirty_fence_open(s->dirty, token);
+    }
+}
+
 /* HostOps.note_work_scope: which doorbells bind the reads that follow. */
 static void reims_vgpu_pci_note_work_scope(void *ctx, uint32_t scope)
 {
@@ -1904,6 +1921,8 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         .guest_write_gen = reims_vgpu_pci_guest_write_gen,
         .guest_written_pages = reims_vgpu_pci_guest_written_pages,
         .page_alias_census = reims_vgpu_pci_page_alias_census,
+        .guest_fence_close = reims_vgpu_pci_guest_fence_close,
+        .guest_fence_open = reims_vgpu_pci_guest_fence_open,
     };
     s->dirty = reims_vgpu_dirty_new();
 
