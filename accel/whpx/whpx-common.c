@@ -588,14 +588,14 @@ int whpx_populate_write(const uint64_t *ranges, unsigned n)
     return FAILED(hr) ? -2 : 0;
 }
 
-int whpx_wp_remap(uint64_t gpa, uint64_t size, bool writable)
+/*
+ * TEMP lab LAZY_SYNC: the host mapping of writable guest RAM [gpa, gpa+size), one RAM region, as the remaps need it
+ * - looked up once by a caller under QEMU's RCU, so a thread outside it (the device's landing thread) can remap the
+ * same range later through the `_at` forms without a flat-view walk. 0, or -1 when not such RAM.
+ */
+int whpx_ram_lookup(uint64_t gpa, uint64_t size, void **mem, uint64_t *ram_addr)
 {
-    struct whpx_state *whpx = &whpx_global;
     MemoryRegionSection sec = memory_region_find(get_system_memory(), gpa, size);
-    HRESULT hr;
-    void *mem;
-    int64_t t_rm;
-    int rc = 0;
 
     if (!sec.mr) {
         return -1;
@@ -605,8 +605,30 @@ int whpx_wp_remap(uint64_t gpa, uint64_t size, bool writable)
         memory_region_unref(sec.mr);
         return -1;
     }
-    mem = memory_region_get_ram_ptr(sec.mr) + sec.offset_within_region;
+    *mem = memory_region_get_ram_ptr(sec.mr) + sec.offset_within_region;
+    *ram_addr = memory_region_get_ram_addr(sec.mr) + sec.offset_within_region;
     memory_region_unref(sec.mr);
+    return 0;
+}
+
+int whpx_wp_remap(uint64_t gpa, uint64_t size, bool writable)
+{
+    void *mem;
+    uint64_t ram_addr;
+
+    if (whpx_ram_lookup(gpa, size, &mem, &ram_addr)) {
+        return -1;
+    }
+    return whpx_wp_remap_at(gpa, size, writable, mem);
+}
+
+int whpx_wp_remap_at(uint64_t gpa, uint64_t size, bool writable, void *mem)
+{
+    struct whpx_state *whpx = &whpx_global;
+    HRESULT hr;
+    int64_t t_rm;
+    int rc = 0;
+
     t_rm = get_clock();
     qatomic_inc(&whpx_wp_busy);
     {
@@ -698,26 +720,27 @@ static int whpx_fenced;
 
 int whpx_fence_remap(uint64_t gpa, uint64_t size, bool closed)
 {
+    void *mem;
+    uint64_t ram_addr;
+
+    if (whpx_ram_lookup(gpa, size, &mem, &ram_addr)) {
+        return -1;
+    }
+    return whpx_fence_remap_at(gpa, size, closed, mem, ram_addr);
+}
+
+int whpx_fence_remap_at(uint64_t gpa, uint64_t size, bool closed, void *mem, uint64_t ram_addr)
+{
     struct whpx_state *whpx = &whpx_global;
-    MemoryRegionSection sec = memory_region_find(get_system_memory(), gpa, size);
     const WHV_MAP_GPA_RANGE_FLAGS open_flags = WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagExecute |
                                                WHvMapGpaRangeFlagWrite | WHvMapGpaRangeFlagTrackDirtyPages;
     HRESULT hr;
-    void *mem, *hv;
-    ram_addr_t ram_addr;
+    void *hv;
     int rc = 0;
 
-    if (!sec.mr) {
+    if (!QEMU_IS_ALIGNED(gpa | size, 4096)) {
         return -1;
     }
-    if (!memory_region_is_ram(sec.mr) || sec.mr->readonly || sec.mr->rom_device ||
-        int128_get64(sec.size) < size || !QEMU_IS_ALIGNED(gpa | size, 4096)) {
-        memory_region_unref(sec.mr);
-        return -1;
-    }
-    mem = memory_region_get_ram_ptr(sec.mr) + sec.offset_within_region;
-    ram_addr = memory_region_get_ram_addr(sec.mr) + sec.offset_within_region;
-    memory_region_unref(sec.mr);
     qatomic_inc(&whpx_wp_busy);
     if (closed && whpx_dirty_tracking && whp_dispatch.WHvQueryGpaRangeDirtyBitmap) {
         uint64_t pages = size >> 12, words = DIV_ROUND_UP(pages, 64);

@@ -2360,7 +2360,21 @@ typedef struct ReimsFence {
     uint64_t token;
     uint64_t *runs;   /* {gpa, size} pairs */
     size_t nruns;
+    /*
+     * Per run, its host mapping and ram_addr, looked up at the close (the drain, under QEMU's RCU): the open runs on
+     * the device's landing thread, which is not, and must not walk a flat view a concurrent MMIO remap may free.
+     */
+    void **mem;
+    uint64_t *ram;
 } ReimsFence;
+
+static void reims_fence_free(ReimsFence *f)
+{
+    g_free(f->runs);
+    g_free(f->mem);
+    g_free(f->ram);
+    g_free(f);
+}
 
 static QemuMutex reims_fence_lock;
 static QemuCond reims_fence_cond;
@@ -2588,7 +2602,7 @@ static bool reims_fence_fault(uint64_t gpa)
             fprintf(stderr, "reims-fence STUCK token=%" PRIu64 " gpa=0x%" PRIx64 ": giving the pages back\n", token,
                     gpa);
             for (r = 0; r < f->nruns; r++) {
-                whpx_fence_remap(f->runs[2 * r], f->runs[2 * r + 1], false);
+                whpx_fence_remap_at(f->runs[2 * r], f->runs[2 * r + 1], false, f->mem[r], f->ram[r]);
             }
             qatomic_inc(&reims_fence_n_stuck);
             reims_fence_drop_locked(f);   /* not freed: an opener may be reading it (a leak, on a bug path) */
@@ -2702,15 +2716,15 @@ static int reims_vgpu_dirty_wp_remap(ReimsVgpuDirty *d, uint64_t gpa, uint64_t s
  * TEMP lab LAZY_SYNC: give a fence's runs back to the guest - writable and tracked, then read-only again where
  * DIRTY_WP holds pages. `wp_mutex` held when `wp`.
  */
-static void reims_fence_reopen_runs(ReimsVgpuDirty *d, const uint64_t *runs, size_t nruns, bool wp)
+static void reims_fence_reopen_runs(ReimsVgpuDirty *d, const ReimsFence *f, size_t nruns, bool wp)
 {
     const uint64_t pg = 1ULL << qemu_target_page_bits();
     size_t r;
 
     for (r = 0; r < nruns; r++) {
-        uint64_t gpa = runs[2 * r], end = gpa + runs[2 * r + 1], a, b;
+        uint64_t gpa = f->runs[2 * r], end = gpa + f->runs[2 * r + 1], a, b;
 
-        whpx_fence_remap(gpa, end - gpa, false);
+        whpx_fence_remap_at(gpa, end - gpa, false, f->mem[r], f->ram[r]);
         for (a = gpa; wp && a < end; a = b) {
             if (!reims_vgpu_dirty_wp_ro(d, a)) {
                 b = a + pg;
@@ -2718,7 +2732,7 @@ static void reims_fence_reopen_runs(ReimsVgpuDirty *d, const uint64_t *runs, siz
             }
             for (b = a + pg; b < end && reims_vgpu_dirty_wp_ro(d, b); b += pg) {
             }
-            whpx_wp_remap(a, b - a, false);
+            whpx_wp_remap_at(a, b - a, false, (uint8_t *)f->mem[r] + (a - gpa));
         }
     }
 }
@@ -2772,6 +2786,19 @@ uint64_t reims_vgpu_dirty_fence_close(ReimsVgpuDirty *d, const uint64_t *gpas, s
     f = g_new0(ReimsFence, 1);
     f->nruns = nruns;
     f->runs = (uint64_t *)g_array_free(runs, FALSE);
+    f->mem = g_new0(void *, nruns);
+    f->ram = g_new0(uint64_t, nruns);
+    for (i = 0; i < nruns; i++) {
+        if (whpx_ram_lookup(f->runs[2 * i], f->runs[2 * i + 1], &f->mem[i], &f->ram[i])) {
+            if (said++ < 8) {
+                fprintf(stderr, "reims-fence refused: run 0x%" PRIx64 "+0x%" PRIx64 " is not one RAM region\n",
+                        f->runs[2 * i], f->runs[2 * i + 1]);
+            }
+            reims_fence_free(f);
+            qatomic_inc(&reims_fence_n_refused);
+            return 0;
+        }
+    }
     if (wp) {
         reims_wp_lock(d, __LINE__);
     }
@@ -2782,8 +2809,7 @@ uint64_t reims_vgpu_dirty_fence_close(ReimsVgpuDirty *d, const uint64_t *gpas, s
         if (wp) {
             qemu_mutex_unlock(&d->wp_mutex);
         }
-        g_free(f->runs);
-        g_free(f);
+        reims_fence_free(f);
         qatomic_inc(&reims_fence_n_refused);
         return 0;
     }
@@ -2795,12 +2821,12 @@ uint64_t reims_vgpu_dirty_fence_close(ReimsVgpuDirty *d, const uint64_t *gpas, s
     qemu_lab_ram_fence_hook = reims_fence_dma_wait;
     qemu_mutex_unlock(&reims_fence_lock);
     for (done = 0; done < nruns; done++) {
-        if (whpx_fence_remap(f->runs[2 * done], f->runs[2 * done + 1], true) != 0) {
+        if (whpx_fence_remap_at(f->runs[2 * done], f->runs[2 * done + 1], true, f->mem[done], f->ram[done]) != 0) {
             break;
         }
     }
     if (done < nruns) {
-        reims_fence_reopen_runs(d, f->runs, done, wp);
+        reims_fence_reopen_runs(d, f, done, wp);
         qemu_mutex_lock(&reims_fence_lock);
         reims_fence_drop_locked(f);
         qemu_mutex_unlock(&reims_fence_lock);
@@ -2810,8 +2836,7 @@ uint64_t reims_vgpu_dirty_fence_close(ReimsVgpuDirty *d, const uint64_t *gpas, s
         if (said++ < 8) {
             fprintf(stderr, "reims-fence refused pages=%zu runs=%zu: remap %zu declined\n", count, nruns, done);
         }
-        g_free(f->runs);
-        g_free(f);
+        reims_fence_free(f);
         qatomic_inc(&reims_fence_n_refused);
         reims_fence_line();
         return 0;
@@ -2840,7 +2865,7 @@ void reims_vgpu_dirty_fence_open(ReimsVgpuDirty *d, uint64_t token)
     f = reims_fence_by_token_locked(token);
     qemu_mutex_unlock(&reims_fence_lock);
     if (f) {
-            reims_fence_reopen_runs(d, f->runs, f->nruns, wp);
+        reims_fence_reopen_runs(d, f, f->nruns, wp);
         qemu_mutex_lock(&reims_fence_lock);
         if (reims_fence_by_token_locked(token) == f) {
             reims_fence_drop_locked(f);
@@ -2852,8 +2877,7 @@ void reims_vgpu_dirty_fence_open(ReimsVgpuDirty *d, uint64_t token)
         qemu_mutex_unlock(&d->wp_mutex);
     }
     if (mine) {
-        g_free(f->runs);
-        g_free(f);
+        reims_fence_free(f);
     }
 }
 

@@ -14,6 +14,13 @@ int whpx_wp_remap(uint64_t gpa, uint64_t size, bool writable);
  */
 extern bool (*whpx_fence_fault_hook)(uint64_t gpa);
 int whpx_fence_remap(uint64_t gpa, uint64_t size, bool closed);
+/*
+ * TEMP lab LAZY_SYNC: the lookup the remaps do (under QEMU's RCU), and remaps of a range looked up before - for a
+ * thread outside QEMU's RCU, while the range cannot move (a fence holds QEMU's RAM remaps off).
+ */
+int whpx_ram_lookup(uint64_t gpa, uint64_t size, void **mem, uint64_t *ram_addr);
+int whpx_fence_remap_at(uint64_t gpa, uint64_t size, bool closed, void *mem, uint64_t ram_addr);
+int whpx_wp_remap_at(uint64_t gpa, uint64_t size, bool writable, void *mem);
 /* TEMP lab LAZY_SYNC: system/physmem.c calls it (when set) before QEMU itself reads or writes guest RAM. */
 extern void (*qemu_lab_ram_fence_hook)(uint64_t addr, uint64_t len);
 /* TEMP lab LAZY_SYNC: around QEMU's own remaps of guest RAM - begin waits the fences out and holds new ones off. */

@@ -30,6 +30,21 @@ int whpx_fence_remap(uint64_t gpa, uint64_t size, bool closed)
     return -ENOSYS;
 }
 
+int whpx_ram_lookup(uint64_t gpa, uint64_t size, void **mem, uint64_t *ram_addr)
+{
+    return -ENOSYS;
+}
+
+int whpx_fence_remap_at(uint64_t gpa, uint64_t size, bool closed, void *mem, uint64_t ram_addr)
+{
+    return -ENOSYS;
+}
+
+int whpx_wp_remap_at(uint64_t gpa, uint64_t size, bool writable, void *mem)
+{
+    return -ENOSYS;
+}
+
 int whpx_populate_write(const uint64_t *ranges, unsigned n)
 {
     return -ENOSYS;
