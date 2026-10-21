@@ -2383,7 +2383,8 @@ static int reims_fence_closed;    /* atomic: how many */
 static uint64_t reims_fence_next = 1;
 /* TEMP lab: one line a second while fences run. */
 static uint64_t reims_fence_n_close, reims_fence_n_refused, reims_fence_n_pages, reims_fence_n_trap, reims_fence_trap_ns,
-                reims_fence_trap_max_ns, reims_fence_n_stuck, reims_fence_n_wp_skip;
+                reims_fence_trap_max_ns, reims_fence_n_stuck, reims_fence_n_wp_skip, reims_fence_n_runs,
+                reims_fence_close_ns, reims_fence_close_max_ns, reims_fence_open_ns, reims_fence_open_max_ns;
 static int64_t reims_fence_line_ns;
 /* [lo, hi) over every closed fence's runs, for the DMA hook's lock-free reject. `reims_fence_lock` writes them. */
 static uint64_t reims_fence_lo, reims_fence_hi;
@@ -2449,6 +2450,22 @@ static ReimsFence *reims_fence_by_token_locked(uint64_t token)
     return NULL;
 }
 
+/* TEMP lab: add one close's or open's wall time to its sum and max (the drain pays the close, reims-land the open). */
+static void reims_fence_note_ns(uint64_t *sum, uint64_t *max, int64_t ns)
+{
+    uint64_t was;
+
+    qatomic_add(sum, (uint64_t)ns);
+    for (was = qatomic_read(max); (uint64_t)ns > was;) {
+        uint64_t seen = qatomic_cmpxchg(max, was, (uint64_t)ns);
+
+        if (seen == was) {
+            break;
+        }
+        was = seen;
+    }
+}
+
 static void reims_fence_line(void)
 {
     int64_t now = get_clock(), was = qatomic_read(&reims_fence_line_ns);
@@ -2457,12 +2474,15 @@ static void reims_fence_line(void)
         return;
     }
     fprintf(stderr, "reims-fence closes=%" PRIu64 " pages=%" PRIu64 " refused=%" PRIu64 " traps=%" PRIu64
-            " trap_us=%" PRIu64 " trap_max_us=%" PRIu64 " wp_skips=%" PRIu64 " dma_waits=%" PRIu64 " stuck=%" PRIu64 "\n",
+            " trap_us=%" PRIu64 " trap_max_us=%" PRIu64 " wp_skips=%" PRIu64 " dma_waits=%" PRIu64 " stuck=%" PRIu64
+            " runs=%" PRIu64 " close_us=%" PRIu64 " close_max_us=%" PRIu64 " open_us=%" PRIu64 " open_max_us=%" PRIu64 "\n",
             qatomic_xchg(&reims_fence_n_close, 0), qatomic_xchg(&reims_fence_n_pages, 0),
             qatomic_xchg(&reims_fence_n_refused, 0), qatomic_xchg(&reims_fence_n_trap, 0),
             qatomic_xchg(&reims_fence_trap_ns, 0) / 1000, qatomic_xchg(&reims_fence_trap_max_ns, 0) / 1000,
             qatomic_xchg(&reims_fence_n_wp_skip, 0), qatomic_xchg(&reims_fence_n_dma, 0),
-            qatomic_read(&reims_fence_n_stuck));
+            qatomic_read(&reims_fence_n_stuck), qatomic_xchg(&reims_fence_n_runs, 0),
+            qatomic_xchg(&reims_fence_close_ns, 0) / 1000, qatomic_xchg(&reims_fence_close_max_ns, 0) / 1000,
+            qatomic_xchg(&reims_fence_open_ns, 0) / 1000, qatomic_xchg(&reims_fence_open_max_ns, 0) / 1000);
 }
 
 /* Recompute the span the DMA hook rejects against. `reims_fence_lock` held. */
@@ -2751,6 +2771,7 @@ uint64_t reims_vgpu_dirty_fence_close(ReimsVgpuDirty *d, const uint64_t *gpas, s
     ReimsFence *f;
     size_t i, nruns, done;
     uint64_t token;
+    int64_t t0 = get_clock();
 
     reims_fence_init();
     if (!d || !gpas || count == 0 || page_size == 0 || page_size % 4096) {
@@ -2846,6 +2867,8 @@ uint64_t reims_vgpu_dirty_fence_close(ReimsVgpuDirty *d, const uint64_t *gpas, s
     }
     qatomic_inc(&reims_fence_n_close);
     qatomic_add(&reims_fence_n_pages, count * (page_size / 4096));
+    qatomic_add(&reims_fence_n_runs, nruns);
+    reims_fence_note_ns(&reims_fence_close_ns, &reims_fence_close_max_ns, get_clock() - t0);
     reims_fence_line();
     return token;
 }
@@ -2856,6 +2879,7 @@ void reims_vgpu_dirty_fence_open(ReimsVgpuDirty *d, uint64_t token)
     bool wp = d && reims_vgpu_dirty_wp_dev == d;
     ReimsFence *f;
     bool mine = false;
+    int64_t t0 = get_clock();
 
     reims_fence_init();
     if (wp) {
@@ -2878,6 +2902,7 @@ void reims_vgpu_dirty_fence_open(ReimsVgpuDirty *d, uint64_t token)
     }
     if (mine) {
         reims_fence_free(f);
+        reims_fence_note_ns(&reims_fence_open_ns, &reims_fence_open_max_ns, get_clock() - t0);
     }
 }
 
