@@ -18,6 +18,7 @@
 bool (*whpx_wp_fault_hook)(uint64_t gpa);
 void (*whpx_wp_invalidate_hook)(void);
 bool (*whpx_fence_fault_hook)(uint64_t gpa);
+void (*whpx_fence_remap_guard_hook)(bool begin);
 
 int whpx_wp_remap(uint64_t gpa, uint64_t size, bool writable)
 {

@@ -2371,6 +2371,8 @@ static int64_t reims_fence_line_ns;
 /* [lo, hi) over every closed fence's runs, for the DMA hook's lock-free reject. `reims_fence_lock` writes them. */
 static uint64_t reims_fence_lo, reims_fence_hi;
 static uint64_t reims_fence_n_dma;
+/* Set while QEMU remaps guest RAM: no fence closes (see whpx_fence_remap_guard_hook). `reims_fence_lock`. */
+static bool reims_fence_blocked;
 
 static void reims_fence_init(void)
 {
@@ -2518,6 +2520,28 @@ static void reims_fence_dma_wait(uint64_t addr, uint64_t len)
     }
     qemu_mutex_unlock(&reims_fence_lock);
     qatomic_inc(&reims_fence_n_dma);
+}
+
+/*
+ * QEMU is about to remap guest RAM (begin) or has (end): the remap maps everything accessible again, so the fences
+ * open first (their copies take milliseconds) and none closes until it is done. With the BQL held; the openers need
+ * neither it nor anything the remap holds.
+ */
+static void reims_fence_remap_guard(bool begin)
+{
+    int64_t t0 = get_clock();
+
+    qemu_mutex_lock(&reims_fence_lock);
+    reims_fence_blocked = begin;
+    while (begin && reims_fences->len) {
+        if (get_clock() - t0 > 2 * NANOSECONDS_PER_SECOND) {
+            fprintf(stderr, "reims-fence STUCK remap guard: %u fences closed\n", reims_fences->len);
+            qatomic_inc(&reims_fence_n_stuck);
+            break;
+        }
+        qemu_cond_timedwait(&reims_fence_cond, &reims_fence_lock, 100);
+    }
+    qemu_mutex_unlock(&reims_fence_lock);
 }
 
 /*
@@ -2738,6 +2762,18 @@ uint64_t reims_vgpu_dirty_fence_close(ReimsVgpuDirty *d, const uint64_t *gpas, s
         reims_wp_lock(d, __LINE__);
     }
     qemu_mutex_lock(&reims_fence_lock);
+    if (reims_fence_blocked) {
+        /* QEMU is remapping guest RAM. */
+        qemu_mutex_unlock(&reims_fence_lock);
+        if (wp) {
+            qemu_mutex_unlock(&d->wp_mutex);
+        }
+        g_free(f->runs);
+        g_free(f);
+        qatomic_inc(&reims_fence_n_refused);
+        return 0;
+    }
+    whpx_fence_remap_guard_hook = reims_fence_remap_guard;
     token = f->token = reims_fence_next++;
     g_ptr_array_add(reims_fences, f);
     reims_fence_span_locked();

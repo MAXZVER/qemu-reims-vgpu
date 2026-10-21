@@ -851,7 +851,29 @@ static void whpx_lab_resident(void *mem, uint64_t size, bool ram)
             lk ? 0UL : GetLastError(), (get_clock() - t0) / 1000000);
 }
 
+static void whpx_set_phys_mem_inner(MemoryRegionSection *section, bool add);
+
+/*
+ * TEMP lab LAZY_SYNC: QEMU remapping guest RAM would map a fenced range accessible again under its landing; the
+ * fences are let out first and no new one closes until the remap is done (`whpx_fence_remap_guard_hook`, set by the
+ * device that fences).
+ */
+void (*whpx_fence_remap_guard_hook)(bool begin);
+
 static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
+{
+    bool guard = whpx_fence_remap_guard_hook && memory_region_is_ram(section->mr);
+
+    if (guard) {
+        whpx_fence_remap_guard_hook(true);
+    }
+    whpx_set_phys_mem_inner(section, add);
+    if (guard) {
+        whpx_fence_remap_guard_hook(false);
+    }
+}
+
+static void whpx_set_phys_mem_inner(MemoryRegionSection *section, bool add)
 {
     struct whpx_state *whpx = &whpx_global;
     MemoryRegion *area = section->mr;
