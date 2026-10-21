@@ -7105,7 +7105,7 @@ void reims_vgpu_dirty_sync_tokens(ReimsVgpuDirty *d, const uint64_t *want, size_
 {
     uint64_t qticket;
     const int shift = qemu_target_page_bits();
-    const bool tight = reims_vgpu_dirty_tight_on(d);   /* TEMP lab DIRTY_TIGHT */
+    bool tight;   /* TEMP lab DIRTY_TIGHT; read once `d` is known (Svace NULL_AFTER_DEREF) */
     const uint64_t target = 1ULL << shift;
     ReimsVgpuDirtySlice *slices = NULL;
     int cap = 0, n, i;
@@ -7125,6 +7125,7 @@ void reims_vgpu_dirty_sync_tokens(ReimsVgpuDirty *d, const uint64_t *want, size_
     if (!d || !want || count == 0 || !qatomic_read(&d->ondemand)) {
         return;
     }
+    tight = reims_vgpu_dirty_tight_on(d);
     tl0 = get_clock();
     qemu_mutex_lock(&d->lock);
     d->lab_prep_lock_ns += get_clock() - tl0;
