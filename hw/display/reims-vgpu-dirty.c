@@ -2757,6 +2757,13 @@ static void reims_fence_reopen_runs(ReimsVgpuDirty *d, const ReimsFence *f, size
     }
 }
 
+static int reims_fence_cmp_u64(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+
+    return x < y ? -1 : x > y;
+}
+
 /*
  * TEMP lab LAZY_SYNC: fence `count` page-aligned GPAs (ReimsVgpuHostOps.guest_fence_close). 0 when refused: no
  * hypervisor, more physical runs than REIMS_VGPU_LAB_FENCE_MAX_RUNS (default 64: each run is one remap each way),
@@ -2765,8 +2772,9 @@ static void reims_fence_reopen_runs(ReimsVgpuDirty *d, const ReimsFence *f, size
 uint64_t reims_vgpu_dirty_fence_close(ReimsVgpuDirty *d, const uint64_t *gpas, size_t count, size_t page_size)
 {
     static long max_runs = -1;
-    static int said;
+    static int said, shape_said;
     bool wp = d && reims_vgpu_dirty_wp_dev == d;
+    uint64_t *sorted;
     GArray *runs;
     ReimsFence *f;
     size_t i, nruns, done;
@@ -2782,19 +2790,41 @@ uint64_t reims_vgpu_dirty_fence_close(ReimsVgpuDirty *d, const uint64_t *gpas, s
 
         max_runs = e ? MAX(1, atol(e)) : 64;
     }
+    /*
+     * The fence is a set of pages, not a sequence: merge runs over the sorted GPAs. b951a (21k): a 42 MB canvas in
+     * the guest's page order was ~10 350 one-page runs - a close cost 50 ms of the drain, one remap per page.
+     */
+    sorted = g_memdup2(gpas, count * sizeof(uint64_t));
+    qsort(sorted, count, sizeof(uint64_t), reims_fence_cmp_u64);
     runs = g_array_new(FALSE, FALSE, sizeof(uint64_t));
     for (i = 0; i < count; i++) {
         uint64_t *last = runs->len ? &g_array_index(runs, uint64_t, runs->len - 2) : NULL;
 
-        if (last && last[0] + last[1] == gpas[i]) {
+        if (last && sorted[i] < last[0] + last[1]) {
+            continue;   /* the same page twice */
+        }
+        if (last && last[0] + last[1] == sorted[i]) {
             last[1] += page_size;
         } else {
-            uint64_t pair[2] = { gpas[i], page_size };
+            uint64_t pair[2] = { sorted[i], page_size };
 
             g_array_append_vals(runs, pair, 2);
         }
     }
     nruns = runs->len / 2;
+    if (shape_said < 8) {
+        size_t in_order = 1, down = 0;
+
+        for (i = 1; i < count; i++) {
+            in_order += gpas[i] != gpas[i - 1] + page_size;
+            down += gpas[i] + page_size == gpas[i - 1];
+        }
+        shape_said++;
+        fprintf(stderr, "reims-fence shape pages=%zu runs_in_order=%zu runs_sorted=%zu descending_steps=%zu"
+                " span_pages=%" PRIu64 "\n", count, in_order, nruns, down,
+                (sorted[count - 1] - sorted[0]) / page_size + 1);
+    }
+    g_free(sorted);
     if ((long)nruns > max_runs) {
         if (said++ < 8) {
             fprintf(stderr, "reims-fence refused pages=%zu runs=%zu (max %ld)\n", count, nruns, max_runs);
