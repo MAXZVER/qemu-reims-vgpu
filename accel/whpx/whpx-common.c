@@ -693,6 +693,8 @@ done:
  * DIRTY_WP holds read-only). 0, or < 0 when refused - the range is then as it was.
  */
 bool (*whpx_fence_fault_hook)(uint64_t gpa);
+/* How many ranges are fenced now: a dirty query failing meanwhile is not a reason to stop tracking. */
+static int whpx_fenced;
 
 int whpx_fence_remap(uint64_t gpa, uint64_t size, bool closed)
 {
@@ -737,8 +739,12 @@ int whpx_fence_remap(uint64_t gpa, uint64_t size, bool closed)
         }
         goto done;
     }
+    /*
+     * Closed keeps the dirty tracking flag (a query over the slot then still walks these pages, as it walks
+     * DIRTY_WP's read-only ones); a hypervisor that refuses it refuses the fence.
+     */
     hr = whp_dispatch.WHvMapGpaRange(whpx->partition, mem, gpa, size,
-                                     closed ? WHvMapGpaRangeFlagNone : open_flags);
+                                     closed ? WHvMapGpaRangeFlagTrackDirtyPages : open_flags);
     if (FAILED(hr)) {
         static int said;
 
@@ -757,6 +763,13 @@ int whpx_fence_remap(uint64_t gpa, uint64_t size, bool closed)
         rc = -3;
     }
 done:
+    if (rc == 0) {
+        if (closed) {
+            qatomic_inc(&whpx_fenced);
+        } else if (qatomic_read(&whpx_fenced) > 0) {
+            qatomic_dec(&whpx_fenced);
+        }
+    }
     qatomic_inc(&whpx_wp_gen);
     qatomic_dec(&whpx_wp_busy);
     return rc;
@@ -1068,6 +1081,11 @@ static void whpx_log_sync(MemoryListener *listener,
              */
             physical_memory_set_dirty_lebitmap((unsigned long *)bitmap,
                                                ram_addr, pages);
+            return;
+        }
+        if (qatomic_read(&whpx_fenced)) {
+            /* TEMP lab LAZY_SYNC: a fence may be why; this round says "all written", tracking stays on. */
+            memory_region_set_dirty(mr, 0, size);
             return;
         }
         whpx_dirty_tracking_disable("bitmap query failed", hr);

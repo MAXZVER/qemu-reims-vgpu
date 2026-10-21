@@ -2915,6 +2915,7 @@ static MemTxResult flatview_read(FlatView *fv, hwaddr addr,
                                  MemTxAttrs attrs, void *buf, hwaddr len);
 static MemTxResult flatview_write(FlatView *fv, hwaddr addr, MemTxAttrs attrs,
                                   const void *buf, hwaddr len);
+extern void (*qemu_lab_ram_fence_hook)(uint64_t addr, uint64_t len);   /* TEMP lab LAZY_SYNC */
 static bool flatview_access_valid(FlatView *fv, hwaddr addr, hwaddr len,
                                   bool is_write, MemTxAttrs attrs);
 
@@ -3322,6 +3323,12 @@ static MemTxResult flatview_write_continue(FlatView *fv, hwaddr addr,
     return result;
 }
 
+/*
+ * TEMP lab LAZY_SYNC (hw/display/reims-vgpu-dirty.c): set once a device fences guest RAM - QEMU's own accesses to
+ * a fenced range wait until the device has landed what it owes there.
+ */
+void (*qemu_lab_ram_fence_hook)(uint64_t addr, uint64_t len);
+
 /* Called from RCU critical section.  */
 static MemTxResult flatview_write(FlatView *fv, hwaddr addr, MemTxAttrs attrs,
                                   const void *buf, hwaddr len)
@@ -3329,6 +3336,10 @@ static MemTxResult flatview_write(FlatView *fv, hwaddr addr, MemTxAttrs attrs,
     hwaddr l;
     hwaddr mr_addr;
     MemoryRegion *mr;
+
+    if (qemu_lab_ram_fence_hook) {
+        qemu_lab_ram_fence_hook(addr, len);
+    }
 
     l = len;
     mr = flatview_translate(fv, addr, &mr_addr, &l, true, attrs);
@@ -3421,6 +3432,9 @@ static MemTxResult flatview_read(FlatView *fv, hwaddr addr,
     hwaddr mr_addr;
     MemoryRegion *mr;
 
+    if (qemu_lab_ram_fence_hook) {
+        qemu_lab_ram_fence_hook(addr, len);   /* TEMP lab LAZY_SYNC */
+    }
     l = len;
     mr = flatview_translate(fv, addr, &mr_addr, &l, false, attrs);
     if (!flatview_access_allowed(mr, attrs, mr_addr, l)) {
@@ -3778,6 +3792,9 @@ void *address_space_map(AddressSpace *as,
     memory_region_ref(mr);
     *plen = flatview_extend_translation(fv, addr, len, mr, xlat,
                                         l, is_write, attrs);
+    if (qemu_lab_ram_fence_hook) {
+        qemu_lab_ram_fence_hook(addr, *plen);   /* TEMP lab LAZY_SYNC */
+    }
     fuzz_dma_read_cb(addr, *plen, mr);
     return qemu_ram_ptr_length(mr->ram_block, xlat, plen, true, is_write);
 }
