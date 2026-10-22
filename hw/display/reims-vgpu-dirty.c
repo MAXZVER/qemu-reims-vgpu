@@ -2102,10 +2102,20 @@ uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
     }
 
     pages = g_new(uint64_t, count);
+    n = 1;   /* stays 1 while the list is already ascending */
     for (i = 0; i < count; i++) {
         pages[i] = gpas[i] & ~((uint64_t)page_size - 1);
+        if (i && pages[i] < pages[i - 1]) {
+            n = 0;
+        }
     }
-    qsort(pages, count, sizeof(*pages), reims_vgpu_dirty_cmp_u64);
+    /*
+     * TEMP lab (Opus 2026-10-23): a surface's page list is usually ascending already (a 5K WebGL canvas is one
+     * contiguous run, 10350 pages); ucrt's qsort does not notice and was 3.3 % of the drain in b994's webgl.
+     */
+    if (!n) {
+        qsort(pages, count, sizeof(*pages), reims_vgpu_dirty_cmp_u64);
+    }
     n = 0;
     for (i = 0; i < count; i++) {
         if (n == 0 || pages[n - 1] != pages[i]) {
