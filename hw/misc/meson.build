@@ -169,5 +169,15 @@ system_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa_ec.c'))
 # HPPA devices
 system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
 
-# TEMP (lab): Apple paravirtual VideoToolbox device probe (PCI 106b:1a03)
-system_ss.add(when: ['CONFIG_VIRTIO_PCI'], if_true: files('apple-vtpv.c'))
+# TEMP lab: Apple paravirtual VideoToolbox transport (see hw/misc/apple-vtpv.c)
+# hwbackend=dx links the minimal static ffmpeg (only the H.264/HEVC/VP9/AV1
+# decoders and their D3D12/D3D11 hwaccels) built by
+# lab/tools/session-2026-10-22/build-ffmpeg-min.sh into MacOnIntel/ffmpeg-min
+vtpv_ffmpeg = meson.project_source_root() / '../../../ffmpeg-min'
+vtpv_dx_dep = declare_dependency(
+  compile_args: ['-I' + vtpv_ffmpeg / 'include'],
+  link_args: [vtpv_ffmpeg / 'lib/libavcodec.a', vtpv_ffmpeg / 'lib/libavutil.a',
+              '-ld3d12', '-ldxgi', '-ld3d11', '-lbcrypt', '-lole32', '-luser32', '-latomic'])
+system_ss.add(when: 'CONFIG_PCI', if_true: [files('apple-vtpv.c', 'apple-vtpv-decode.c',
+                                                  'apple-vtpv-decode-h265.c', 'apple-vtpv-dx.c'),
+                                            vtpv_dx_dep])
