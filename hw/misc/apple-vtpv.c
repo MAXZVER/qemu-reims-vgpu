@@ -64,6 +64,41 @@ typedef struct {
 } VtpvKickSurf;
 
 #define VTPV_FRAMES 256     /* frames waiting for their 'Dbuf' reply (samples are small) */
+#define VTPV_SESS 16        /* decoder sessions alive at once (wallpaper, Safari tabs...) */
+#define VTPV_DBUF_INFLIGHT 4 /* 'Dbuf' requests outstanding per session */
+
+/* one guest decoder session, keyed by the uuid every message carries at
+ * 0x10: its own decoder, stream shape and frames.  ox9: one shared table let
+ * the 4K HEVC wallpaper session starve Safari's ("frame table full" from
+ * YouTube's frame 3), and asking a 'Dbuf' per 'dfrm' at once overran the
+ * 16 KiB host->guest queue - the player queues a GOP ahead of display and
+ * the guest answers 'Dbuf's one by one.  Frames now wait here and only
+ * VTPV_DBUF_INFLIGHT requests are in the queue at any time. */
+typedef struct VtpvSess {
+    bool used;
+    uint8_t uuid[16];
+    uint64_t last_use;
+    struct {
+        uint64_t frame_id;
+        uint64_t seq;               /* arrival order = decode order */
+        uint8_t dbuf_id[8];         /* raw reply-id bytes of our 'Dbuf' */
+        bool in_use;
+        bool dbuf_sent;
+        uint8_t *nv12;              /* outbuf: decoded picture waiting for its buffer */
+        uint32_t w, h;
+        uint8_t *sample;            /* outbuf: or the compressed sample, decoded at the reply */
+        uint32_t sample_len;
+    } frame[VTPV_FRAMES];
+    uint64_t next_seq;
+    uint32_t dbuf_out;              /* 'Dbuf's sent and not answered yet */
+    bool dpba_sent;
+    uint32_t dpba_w, dpba_h;        /* size the last 'Dpba' announced */
+    VtpvDx *dx;
+    int dx_codec;                   /* VtpvDxCodec of the open decoder, -1 none */
+    uint8_t dx_cfg[4096];           /* avcC/hvcC/vpcC/av1C record it was opened with */
+    uint32_t dx_cfg_len;
+    VtpvDxSink dx_sink;
+} VtpvSess;
 
 #define PCI_DEVICE_ID_APPLE_VTPV 0x1a03
 
@@ -149,24 +184,16 @@ struct AppleVtpv {
      * ',err'+',uui') and then completes the frame ('Demt' ',frm'+',err'+',inf'+
      * ',uui' -> VTDecoderSessionEmitDecodedFrame).  Without 'Demt' the guest's
      * VTDecompressionSessionWaitForAsynchronousFrames waits forever. */
-    struct {
-        uint64_t frame_id;
-        uint8_t dbuf_id[8];         /* raw reply-id bytes of our 'Dbuf' */
-        bool in_use;
-        uint8_t *nv12;              /* outbuf: decoded picture waiting for its buffer */
-        uint32_t w, h;
-        uint8_t *sample;            /* outbuf: or the compressed sample, decoded at the reply */
-        uint32_t sample_len;
-    } frame[VTPV_FRAMES];
+    VtpvSess sess[VTPV_SESS];
+    VtpvSess *cur;                  /* session of the message being handled */
+    uint64_t sess_clock;
     const uint8_t *ob_sample;       /* this dfrm's sample (inside msg) for vtpv_send_dbuf */
     uint32_t ob_sample_len;
     uint64_t host_msg_id;
-    bool dpba_sent;
     /* outbuf=on: the app's own output buffers - each decoded picture is held
      * until the guest answers our 'Dbuf' with a pool buffer (its IOSurface
      * attached), then written into that surface and completed by 'Demt' */
     bool outbuf;
-    uint32_t dpba_w, dpba_h;        /* size the last 'Dpba' announced */
     uint64_t surfdesc_gpa;          /* VTPV_SURFDESC of the next kick */
     VtpvKickSurf ksurf[5];
     uint32_t nksurf;
@@ -197,11 +224,6 @@ struct AppleVtpv {
      * (apple-vtpv-dx.c) - codec and config record straight from the format
      * description, samples unchanged; hwbackend=vk keeps the Vulkan modules */
     char *hwbackend_str;
-    VtpvDx *dx;
-    int dx_codec;                  /* VtpvDxCodec of the open decoder, -1 none */
-    uint8_t dx_cfg[4096];          /* avcC/hvcC/vpcC/av1C record it was opened with */
-    uint32_t dx_cfg_len;
-    VtpvDxSink dx_sink;
     uint64_t surfmap_gpa[16];
     uint32_t surfmap_count;
     uint32_t surfmap_kick;
@@ -562,13 +584,14 @@ static bool vtpv_send_h2g(AppleVtpv *s, int slot, uint32_t type,
 static void vtpv_send_demt2(AppleVtpv *s, int slot, uint64_t frame_id,
                             int32_t err, uint32_t inf, const uint8_t *uuid16,
                             const uint8_t *uuid);
+static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16);
 
 static void vtpv_send_dbuf(AppleVtpv *s, int slot, uint64_t frame_id,
                            const uint8_t *uuid16)
 {
     int i, free_i = -1;
     for (i = 0; i < VTPV_FRAMES; i++) {
-        if (!s->frame[i].in_use) {
+        if (!s->cur->frame[i].in_use) {
             free_i = i;
             break;
         }
@@ -583,40 +606,65 @@ static void vtpv_send_dbuf(AppleVtpv *s, int slot, uint64_t frame_id,
         }
         return;
     }
-    uint8_t paras[128];
-    uint32_t n = 0;
-    uint64_t be_frm = cpu_to_be64(frame_id);
-    n += vtpv_para_put(paras + n, 0x2c66726du /* ',frm' */, "=s64",
-                       &be_frm, 8);
-    n += vtpv_para_put(paras + n, 0x2c706f70u /* ',pop' */, "=pls",
-                       vtpv_empty_plist, sizeof(vtpv_empty_plist));
-
-    s->host_msg_id++;
-    s->frame[free_i].frame_id = frame_id;
-    s->frame[free_i].in_use = true;
-    g_free(s->frame[free_i].nv12);
-    s->frame[free_i].nv12 = NULL;
-    g_free(s->frame[free_i].sample);
-    s->frame[free_i].sample = NULL;
+    s->cur->frame[free_i].frame_id = frame_id;
+    s->cur->frame[free_i].seq = s->cur->next_seq++;
+    s->cur->frame[free_i].in_use = true;
+    s->cur->frame[free_i].dbuf_sent = false;
+    g_free(s->cur->frame[free_i].nv12);
+    s->cur->frame[free_i].nv12 = NULL;
+    g_free(s->cur->frame[free_i].sample);
+    s->cur->frame[free_i].sample = NULL;
     if (s->outbuf && s->ob_sample) {
-        s->frame[free_i].sample = g_memdup2(s->ob_sample, s->ob_sample_len);
-        s->frame[free_i].sample_len = s->ob_sample_len;
-    } else if (s->outbuf && s->dx_sink.pictures) {
-        VtpvDxSink *k = &s->dx_sink;
+        s->cur->frame[free_i].sample = g_memdup2(s->ob_sample, s->ob_sample_len);
+        s->cur->frame[free_i].sample_len = s->ob_sample_len;
+    } else if (s->outbuf && s->cur->dx_sink.pictures) {
+        VtpvDxSink *k = &s->cur->dx_sink;
         size_t sz = (size_t)k->w * k->h + (size_t)((k->w + 1) & ~1u) * ((k->h + 1) / 2);
-        s->frame[free_i].nv12 = g_memdup2(k->stage, sz);
-        s->frame[free_i].w = k->w;
-        s->frame[free_i].h = k->h;
+        s->cur->frame[free_i].nv12 = g_memdup2(k->stage, sz);
+        s->cur->frame[free_i].w = k->w;
+        s->cur->frame[free_i].h = k->h;
     }
-    stq_be_p(s->frame[free_i].dbuf_id, s->host_msg_id);
-    uint8_t id8[8];
-    stq_be_p(id8, s->host_msg_id);
-    if (s->verbose) {
-        fprintf(stderr, "apple-vtpv: frame %llu: Dbuf sent (id=%llu)\n",
-                (unsigned long long)frame_id,
-                (unsigned long long)s->host_msg_id);
+    vtpv_pump_dbuf(s, slot, uuid16);
+}
+
+/* ask the guest for buffers for the oldest waiting frames, at most
+ * VTPV_DBUF_INFLIGHT at a time (the next goes out when one is answered) */
+static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
+{
+    VtpvSess *se = s->cur;
+    while (se->dbuf_out < VTPV_DBUF_INFLIGHT) {
+        int next = -1;
+        for (int i = 0; i < VTPV_FRAMES; i++) {
+            if (se->frame[i].in_use && !se->frame[i].dbuf_sent &&
+                (next < 0 || se->frame[i].seq < se->frame[next].seq)) {
+                next = i;
+            }
+        }
+        if (next < 0) {
+            return;
+        }
+        uint8_t paras[128];
+        uint32_t n = 0;
+        uint64_t be_frm = cpu_to_be64(se->frame[next].frame_id);
+        n += vtpv_para_put(paras + n, 0x2c66726du /* ',frm' */, "=s64",
+                           &be_frm, 8);
+        n += vtpv_para_put(paras + n, 0x2c706f70u /* ',pop' */, "=pls",
+                           vtpv_empty_plist, sizeof(vtpv_empty_plist));
+        s->host_msg_id++;
+        stq_be_p(se->frame[next].dbuf_id, s->host_msg_id);
+        uint8_t id8[8];
+        stq_be_p(id8, s->host_msg_id);
+        if (!vtpv_send_h2g(s, slot, 0x44627566u /* 'Dbuf' */, uuid16, id8, paras, n)) {
+            return;                 /* queue full: retried at the next reply */
+        }
+        se->frame[next].dbuf_sent = true;
+        se->dbuf_out++;
+        if (s->verbose) {
+            fprintf(stderr, "apple-vtpv: frame %llu: Dbuf sent (id=%llu, %u out)\n",
+                    (unsigned long long)se->frame[next].frame_id,
+                    (unsigned long long)s->host_msg_id, se->dbuf_out);
+        }
     }
-    vtpv_send_h2g(s, slot, 0x44627566u /* 'Dbuf' */, uuid16, id8, paras, n);
 }
 
 /* 'Demt': complete the frame - the guest runs VTDecoderSessionEmitDecodedFrame
@@ -673,8 +721,8 @@ static void vtpv_send_dpba(AppleVtpv *s, int slot, const uint8_t *uuid16,
         s->host_msg_id++;
         uint8_t id8[8];
         stq_be_p(id8, s->host_msg_id);
-        s->dpba_w = w;
-        s->dpba_h = h;
+        s->cur->dpba_w = w;
+        s->cur->dpba_h = h;
         if (s->verbose) {
             fprintf(stderr, "apple-vtpv: Dpba sent %ux%u 420v (%u plist bytes)\n", w, h, pl);
         }
@@ -854,11 +902,66 @@ static void vtpv_sbf_codec_first(AppleVtpv *s, const uint8_t *sbf, uint32_t n)
 
 static void vtpv_dx_reset(AppleVtpv *s)
 {
-    vtpv_dx_close(s->dx);
-    s->dx = NULL;
-    s->dx_codec = -1;
-    s->dx_cfg_len = 0;
-    s->dpba_w = s->dpba_h = 0;      /* outbuf: the next stream announces its size again */
+    vtpv_dx_close(s->cur->dx);
+    s->cur->dx = NULL;
+    s->cur->dx_codec = -1;
+    s->cur->dx_cfg_len = 0;
+    s->cur->dpba_w = s->cur->dpba_h = 0;      /* outbuf: the next stream announces its size again */
+}
+
+/* a session ends (its uuid deregistered, or evicted): decoder, waiting
+ * frames and stage go with it */
+static void vtpv_sess_free(VtpvSess *se)
+{
+    vtpv_dx_close(se->dx);
+    for (int i = 0; i < VTPV_FRAMES; i++) {
+        g_free(se->frame[i].nv12);
+        g_free(se->frame[i].sample);
+    }
+    g_free(se->dx_sink.stage);
+    memset(se, 0, sizeof(*se));
+    se->dx_codec = -1;
+}
+
+/* the session a message belongs to; a new uuid takes a free entry or the
+ * least recently used one */
+static VtpvSess *vtpv_sess_get(AppleVtpv *s, const uint8_t *uuid16)
+{
+    VtpvSess *lru = NULL, *free_se = NULL;
+    for (int i = 0; i < VTPV_SESS; i++) {
+        VtpvSess *se = &s->sess[i];
+        if (se->used && memcmp(se->uuid, uuid16, 16) == 0) {
+            se->last_use = ++s->sess_clock;
+            return se;
+        }
+        if (!se->used) {
+            free_se = free_se ? free_se : se;
+        } else if (!lru || se->last_use < lru->last_use) {
+            lru = se;
+        }
+    }
+    VtpvSess *se = free_se ? free_se : lru;
+    if (se->used) {
+        fprintf(stderr, "apple-vtpv: session table full, evicting the oldest\n");
+    }
+    vtpv_sess_free(se);
+    se->used = true;
+    memcpy(se->uuid, uuid16, 16);
+    se->last_use = ++s->sess_clock;
+    return se;
+}
+
+static void vtpv_sess_drop(AppleVtpv *s, const uint8_t *uuid16)
+{
+    for (int i = 0; i < VTPV_SESS; i++) {
+        VtpvSess *se = &s->sess[i];
+        if (se->used && memcmp(se->uuid, uuid16, 16) == 0) {
+            if (s->cur == se) {
+                s->cur = NULL;
+            }
+            vtpv_sess_free(se);
+        }
+    }
 }
 
 /* (re)arm the decoder for a format description; a new stream shape closes
@@ -869,18 +972,18 @@ static void vtpv_dx_set_fmt(AppleVtpv *s, const uint8_t *fd, uint32_t n)
     const uint8_t *cfg = NULL;
     uint32_t cfg_len = 0;
     if (!vtpv_dx_parse_fmt(fd, n, &codec, &cfg, &cfg_len) ||
-        cfg_len > sizeof(s->dx_cfg)) {
+        cfg_len > sizeof(s->cur->dx_cfg)) {
         return;
     }
-    if (codec == s->dx_codec && cfg_len == s->dx_cfg_len &&
-        (!cfg_len || memcmp(cfg, s->dx_cfg, cfg_len) == 0)) {
+    if (codec == s->cur->dx_codec && cfg_len == s->cur->dx_cfg_len &&
+        (!cfg_len || memcmp(cfg, s->cur->dx_cfg, cfg_len) == 0)) {
         return;
     }
     vtpv_dx_reset(s);
-    s->dx_codec = codec;
-    s->dx_cfg_len = cfg_len;
+    s->cur->dx_codec = codec;
+    s->cur->dx_cfg_len = cfg_len;
     if (cfg_len) {
-        memcpy(s->dx_cfg, cfg, cfg_len);
+        memcpy(s->cur->dx_cfg, cfg, cfg_len);
     }
     fprintf(stderr, "apple-vtpv: dx stream codec=%d cfg=%u bytes\n", codec, cfg_len);
 }
@@ -986,7 +1089,7 @@ static bool vtpv_fill_surface(AppleVtpv *s, const VtpvKickSurf *ks, const uint8_
 static void vtpv_dx_put(void *opaque, const VtpvDxFrame *f)
 {
     AppleVtpv *s = opaque;
-    VtpvDxSink *k = &s->dx_sink;
+    VtpvDxSink *k = &s->cur->dx_sink;
     uint32_t w = s->surfmap_meta[0] >> 16;
     uint32_t h = s->surfmap_meta[0] & 0xffffu;
     uint32_t bpr0 = s->surfmap_meta[1] ? s->surfmap_meta[1] : w;
@@ -1068,10 +1171,10 @@ static const uint8_t *vtpv_dx_sbf_sample(AppleVtpv *s, uint64_t total, uint64_t 
     if (fd) {
         vtpv_dx_set_fmt(s, fd, fl);
     }
-    if (!sample || s->dx_codec < 0) {
+    if (!sample || s->cur->dx_codec < 0) {
         static int dumps;
         fprintf(stderr, "apple-vtpv: dx: frame %llu sample=%u codec=%d - not decodable\n",
-                (unsigned long long)tag, sample ? sl : 0, s->dx_codec);
+                (unsigned long long)tag, sample ? sl : 0, s->cur->dx_codec);
         if (s->msglog && dumps < 3) {
             /* keep the first unparsed sample buffers next to the wire log */
             g_autofree char *path = g_strdup_printf("%s.dxfail%d.bin", s->msglog, dumps++);
@@ -1090,23 +1193,23 @@ static const uint8_t *vtpv_dx_sbf_sample(AppleVtpv *s, uint64_t total, uint64_t 
 static bool vtpv_dx_decode_sample(AppleVtpv *s, const uint8_t *sample, uint32_t sl,
                                   uint64_t tag)
 {
-    if (!s->dx) {
-        s->dx = vtpv_dx_open(s->dec_gpu_str ? s->dec_gpu_str : "int", "d3d12",
-                             (VtpvDxCodec)s->dx_codec, s->dx_cfg_len ? s->dx_cfg : NULL,
-                             s->dx_cfg_len, vtpv_dx_put, s);
-        if (!s->dx) {
-            fprintf(stderr, "apple-vtpv: dx: decoder open failed (codec %d)\n", s->dx_codec);
+    if (!s->cur->dx) {
+        s->cur->dx = vtpv_dx_open(s->dec_gpu_str ? s->dec_gpu_str : "int", "d3d12",
+                             (VtpvDxCodec)s->cur->dx_codec, s->cur->dx_cfg_len ? s->cur->dx_cfg : NULL,
+                             s->cur->dx_cfg_len, vtpv_dx_put, s);
+        if (!s->cur->dx) {
+            fprintf(stderr, "apple-vtpv: dx: decoder open failed (codec %d)\n", s->cur->dx_codec);
             return false;
         }
     }
-    VtpvDxSink *k = &s->dx_sink;
+    VtpvDxSink *k = &s->cur->dx_sink;
     k->written = 0;                 /* per-message counters; mode + stage stay */
     k->w = k->h = 0;
     k->pictures = 0;
     int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
-    int rc = vtpv_dx_decode(s->dx, sample, sl, (int64_t)tag);
+    int rc = vtpv_dx_decode(s->cur->dx, sample, sl, (int64_t)tag);
     fprintf(stderr, "apple-vtpv: HW-DECODE(dx) frame=%llu codec=%d %ux%u pictures=%d "
-            "-> canvas %llu bytes rc=%d %lld us\n", (unsigned long long)tag, s->dx_codec,
+            "-> canvas %llu bytes rc=%d %lld us\n", (unsigned long long)tag, s->cur->dx_codec,
             k->w, k->h, k->pictures, (unsigned long long)k->written, rc,
             (long long)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t0));
     return rc == 0 && k->pictures > 0;
@@ -1147,6 +1250,7 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
     memcpy(&be_flags, s->msg + 12, 4);
     uint32_t type = be32_to_cpu(be_type);
     uint32_t flags = be32_to_cpu(be_flags);
+    s->cur = vtpv_sess_get(s, s->msg + 0x10);
     char t4[5];
     vtpv_log4cc(t4, type);
 
@@ -1194,13 +1298,13 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                  * decoded pictures) */
                 uint32_t smp_len = 0;
                 const uint8_t *smp = vtpv_dx_sbf_sample(s, total, s->last_frame_id, &smp_len);
-                s->dx_sink.pictures = 0;
+                s->cur->dx_sink.pictures = 0;
                 s->ob_sample = NULL;
                 s->ob_sample_len = 0;
-                if (smp && !s->dpba_w) {
-                    s->dx_sink.to_stage = true;
+                if (smp && !s->cur->dpba_w) {
+                    s->cur->dx_sink.to_stage = true;
                     vtpv_dx_decode_sample(s, smp, smp_len, s->last_frame_id);
-                    s->dx_sink.to_stage = false;
+                    s->cur->dx_sink.to_stage = false;
                 } else if (smp) {
                     s->ob_sample = smp;     /* inside s->msg: copied by vtpv_send_dbuf */
                     s->ob_sample_len = smp_len;
@@ -1622,8 +1726,8 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
         const uint8_t *e = vtpv_para_find(s->msg, total, 0x2c657272u /* ',err' */, &vlen);
         int i, hit = -1;
         for (i = 0; i < VTPV_FRAMES; i++) {
-            if (s->frame[i].in_use &&
-                memcmp(s->frame[i].dbuf_id, s->msg + 0x20, 8) == 0) {
+            if (s->cur->frame[i].in_use && s->cur->frame[i].dbuf_sent &&
+                memcmp(s->cur->frame[i].dbuf_id, s->msg + 0x20, 8) == 0) {
                 hit = i;
                 break;
             }
@@ -1661,21 +1765,25 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
         if (u && ulen == 16) {
             memcpy(uuid, u, 16);
         }
-        uint64_t frame_id = s->frame[hit].frame_id;
-        s->frame[hit].in_use = false;
+        uint64_t frame_id = s->cur->frame[hit].frame_id;
+        s->cur->frame[hit].in_use = false;
+        s->cur->frame[hit].dbuf_sent = false;
+        if (s->cur->dbuf_out) {
+            s->cur->dbuf_out--;
+        }
         uint32_t inf = 0;
-        const uint8_t *pic = s->frame[hit].nv12;    /* first picture of a stream */
-        uint32_t pw = s->frame[hit].w, ph = s->frame[hit].h;
-        if (s->outbuf && s->frame[hit].sample) {
+        const uint8_t *pic = s->cur->frame[hit].nv12;    /* first picture of a stream */
+        uint32_t pw = s->cur->frame[hit].w, ph = s->cur->frame[hit].h;
+        if (s->outbuf && s->cur->frame[hit].sample) {
             /* decode now - replies come back in 'Dbuf' order, which is the
              * decode order - and fill the buffer straight from the stage */
-            VtpvDxSink *k = &s->dx_sink;
+            VtpvDxSink *k = &s->cur->dx_sink;
             k->to_stage = true;
             k->pictures = 0;
-            vtpv_dx_decode_sample(s, s->frame[hit].sample, s->frame[hit].sample_len, frame_id);
+            vtpv_dx_decode_sample(s, s->cur->frame[hit].sample, s->cur->frame[hit].sample_len, frame_id);
             k->to_stage = false;
-            g_free(s->frame[hit].sample);
-            s->frame[hit].sample = NULL;
+            g_free(s->cur->frame[hit].sample);
+            s->cur->frame[hit].sample = NULL;
             if (k->pictures) {
                 pic = k->stage;
                 pw = k->w;
@@ -1697,14 +1805,15 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
             if (!err && !ok) {
                 err = -12911;   /* kVTVideoDecoderMalfunctionErr: no writable buffer */
             }
-            g_free(s->frame[hit].nv12);
-            s->frame[hit].nv12 = NULL;
+            g_free(s->cur->frame[hit].nv12);
+            s->cur->frame[hit].nv12 = NULL;
         }
         vtpv_send_demt2(s, slot, frame_id, err, inf, s->msg + 0x10, uuid);
-        if (s->outbuf && pic && (pw != s->dpba_w || ph != s->dpba_h)) {
+        if (s->outbuf && pic && (pw != s->cur->dpba_w || ph != s->cur->dpba_h)) {
             /* the stream changed size: the next buffers must fit it */
             vtpv_send_dpba(s, slot, s->msg + 0x10, pw, ph);
         }
+        vtpv_pump_dbuf(s, slot, s->msg + 0x10);
         return;
     }
 
@@ -1843,14 +1952,14 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
 
     /* after the StartSession reply has been delivered, give the session its
      * output buffer attributes so the pool exists before the first 'Dbuf' */
-    if (type == 0x64737461u /* 'dsta' */ && !s->dpba_sent) {
-        s->dpba_sent = true;
+    if (type == 0x64737461u /* 'dsta' */ && !s->cur->dpba_sent) {
+        s->cur->dpba_sent = true;
         vtpv_send_dpba(s, slot, s->msg + 0x10, 0, 0);
     }
     if (non_tile_dfrm && s->outbuf) {
-        VtpvDxSink *k = &s->dx_sink;
+        VtpvDxSink *k = &s->cur->dx_sink;
         if (k->pictures) {
-            if (k->w != s->dpba_w || k->h != s->dpba_h) {
+            if (k->w != s->cur->dpba_w || k->h != s->cur->dpba_h) {
                 vtpv_send_dpba(s, slot, s->msg + 0x10, k->w, k->h);
             }
             vtpv_send_dbuf(s, slot, s->last_frame_id, s->msg + 0x10);
@@ -2100,6 +2209,9 @@ static void vtpv_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned si
             if (s->verbose) {
                 fprintf(stderr, "apple-vtpv: slot%d uuid op=%lld\n",
                         s->client_id, (long long)val);
+            }
+            if (val == 2) {
+                vtpv_sess_drop(s, uuid);    /* the guest session is gone */
             }
         }
         break;
@@ -2539,7 +2651,9 @@ static void vtpv_realize(PCIDevice *dev, Error **errp)
     /* INTx pin A as the fallback path; the guest's MSI-enable bit decides which
      * one vtpv_raise actually fires. */
     pci_config_set_interrupt_pin(dev->config, 1);
-    s->dx_codec = -1;
+    for (int i = 0; i < VTPV_SESS; i++) {
+        s->sess[i].dx_codec = -1;
+    }
 
     fprintf(stderr, "apple-vtpv: realized v3 transport (msi+intx), msglog=%s verbose=%u "
             "hwbackend=%s\n", s->msglog ? s->msglog : "(stderr)", s->verbose,
@@ -2553,7 +2667,10 @@ static void vtpv_reset_hold(Object *obj, ResetType type)
     s->client_id = 0;
     s->irq_pending = 0;
     s->msgs_in = s->msgs_out = 0;
-    vtpv_dx_reset(s);
+    for (int i = 0; i < VTPV_SESS; i++) {
+        vtpv_sess_free(&s->sess[i]);
+    }
+    s->cur = NULL;
     g_free(s->surfmap_list);
     s->surfmap_list = NULL;
     s->surfmap_list_n = 0;
