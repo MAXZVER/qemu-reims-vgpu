@@ -66,6 +66,8 @@ typedef struct {
 #define VTPV_FRAMES 256     /* frames waiting for their 'Dbuf' reply (samples are small) */
 #define VTPV_SESS 16        /* decoder sessions alive at once (wallpaper, Safari tabs...) */
 #define VTPV_DBUF_INFLIGHT 4 /* 'Dbuf' requests outstanding per session */
+#define VTPV_BACKLOG 6      /* waiting frames before 'dfrm' replies are held */
+#define VTPV_HELD 64        /* held 'dfrm' replies per session */
 
 /* one guest decoder session, keyed by the uuid every message carries at
  * 0x10: its own decoder, stream shape and frames.  ox9: one shared table let
@@ -91,6 +93,16 @@ typedef struct VtpvSess {
     } frame[VTPV_FRAMES];
     uint64_t next_seq;
     uint32_t dbuf_out;              /* 'Dbuf's sent and not answered yet */
+    /* backpressure: past VTPV_BACKLOG waiting frames the 'dfrm' reply is
+     * held until frames complete (ox10: the wallpaper player ran 260 frames
+     * ahead of its 4-buffer pool and filled the table) */
+    struct {
+        uint8_t rep[128];
+        uint32_t len;
+        int slot;
+        uint64_t frame_id;
+    } held[VTPV_HELD];
+    uint32_t held_head, held_n;
     bool dpba_sent;
     uint32_t dpba_w, dpba_h;        /* size the last 'Dpba' announced */
     VtpvDx *dx;
@@ -951,6 +963,36 @@ static VtpvSess *vtpv_sess_get(AppleVtpv *s, const uint8_t *uuid16)
     return se;
 }
 
+static uint32_t vtpv_sess_waiting(const VtpvSess *se)
+{
+    uint32_t n = 0;
+    for (int i = 0; i < VTPV_FRAMES; i++) {
+        n += se->frame[i].in_use;
+    }
+    return n;
+}
+
+/* deliver held 'dfrm' replies: all of them (flush/invalidate), else those of
+ * frames up to `upto` and the rest once the backlog is below VTPV_BACKLOG */
+static void vtpv_release_held(AppleVtpv *s, uint64_t upto, bool all)
+{
+    VtpvSess *se = s->cur;
+    bool below = vtpv_sess_waiting(se) < VTPV_BACKLOG;
+    while (se->held_n) {
+        typeof(se->held[0]) *h = &se->held[se->held_head];
+        if (!all && !below && h->frame_id > upto) {
+            break;
+        }
+        if (vtpv_dq_enqueue(s, h->slot, h->rep, h->len)) {
+            vtpv_raise(s, h->slot);
+        } else {
+            fprintf(stderr, "apple-vtpv: held reply enqueue failed\n");
+        }
+        se->held_head = (se->held_head + 1) % VTPV_HELD;
+        se->held_n--;
+    }
+}
+
 static void vtpv_sess_drop(AppleVtpv *s, const uint8_t *uuid16)
 {
     for (int i = 0; i < VTPV_SESS; i++) {
@@ -1808,6 +1850,7 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
             g_free(s->cur->frame[hit].nv12);
             s->cur->frame[hit].nv12 = NULL;
         }
+        vtpv_release_held(s, frame_id, false);     /* its dfrm reply before its Demt */
         vtpv_send_demt2(s, slot, frame_id, err, inf, s->msg + 0x10, uuid);
         if (s->outbuf && pic && (pw != s->cur->dpba_w || ph != s->cur->dpba_h)) {
             /* the stream changed size: the next buffers must fit it */
@@ -1829,6 +1872,9 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
      * a wrong-type reply would strand the caller, a timeout is safer. */
     /* cache SPS/PPS from dsts ',fds': find the avcC record by signature and
      * keep the (start-code-free) parameter-set NALs for the decoder */
+    if (type == 0x6466696eu /* 'dfin' */ || type == 0x64696e76u /* 'dinv' */) {
+        vtpv_release_held(s, 0, true);  /* the guest flushes: nothing may stay held */
+    }
     if (type == 0x64696e76u /* 'dinv' */ && vtpv_use_dx(s)) {
         vtpv_dx_reset(s);           /* session invalidated: drop its references */
     }
@@ -1942,7 +1988,17 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
         if (patch_type) {
             memcpy(rep + 8, s->msg + 8, 4);         /* echo the request's 4CC type */
         }
-        if (vtpv_dq_enqueue(s, slot, rep, rlen)) {
+        VtpvSess *se = s->cur;
+        bool queued = s->ob_sample || se->dx_sink.pictures;    /* this dfrm gets a frame entry */
+        if (non_tile_dfrm && s->outbuf && queued && rlen <= sizeof(se->held[0].rep) &&
+            se->held_n < VTPV_HELD && vtpv_sess_waiting(se) >= VTPV_BACKLOG) {
+            uint32_t h = (se->held_head + se->held_n) % VTPV_HELD;
+            memcpy(se->held[h].rep, rep, rlen);
+            se->held[h].len = rlen;
+            se->held[h].slot = slot;
+            se->held[h].frame_id = s->last_frame_id;
+            se->held_n++;
+        } else if (vtpv_dq_enqueue(s, slot, rep, rlen)) {
             vtpv_raise(s, slot);
         } else {
             fprintf(stderr, "apple-vtpv: reply enqueue failed\n");
