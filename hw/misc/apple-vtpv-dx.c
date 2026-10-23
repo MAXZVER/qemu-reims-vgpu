@@ -402,6 +402,9 @@ static int emit(VtpvDx *d, AVFrame *f, int64_t tag)
         switch (m->format) {
         case AV_PIX_FMT_NV12:
             break;
+        case AV_PIX_FMT_GRAY8:
+            o.gray = 1;
+            break;
         case AV_PIX_FMT_YUV420P:
         case AV_PIX_FMT_YUVJ420P:
         case AV_PIX_FMT_YUV422P:

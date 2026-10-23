@@ -52,6 +52,7 @@ typedef struct {
     int pictures;
     bool to_stage;          /* outbuf: keep the picture (tight NV12) in stage */
     uint8_t csx, csy;       /* the staged picture's chroma shifts (1,1 = NV12) */
+    bool cgray;             /* the staged picture is luma only */
     uint8_t *stage;
     size_t stage_cap;
 } VtpvDxSink;
@@ -406,6 +407,8 @@ typedef struct {
     uint32_t len;
     uint8_t data[];
 } VtpvOut;
+
+
 
 /* move what the guest's queue now has room for, oldest first */
 static bool vtpv_outbox_flush(AppleVtpv *s, int slot)
@@ -1250,7 +1253,22 @@ static void vtpv_dx_put(void *opaque, const VtpvDxFrame *f)
     uint32_t bpr1 = s->surfmap_meta[3] ? s->surfmap_meta[3] : w;
     uint32_t dw = MIN(f->width, w), dh = MIN(f->height, h);
 
-    bool nv12 = !f->planar && f->sx == 1 && f->sy == 1;
+    bool nv12 = !f->gray && !f->planar && f->sx == 1 && f->sy == 1;
+    if (k->to_stage && f->gray) {
+        size_t need = (size_t)f->width * f->height;
+        if (k->stage_cap < need) {
+            k->stage = g_realloc(k->stage, need);
+            k->stage_cap = need;
+        }
+        for (uint32_t y = 0; y < f->height; y++) {
+            memcpy(k->stage + (size_t)y * f->width, f->y + (size_t)y * f->y_pitch, f->width);
+        }
+        k->cgray = true;
+        k->w = f->width;
+        k->h = f->height;
+        k->pictures++;
+        return;
+    }
     if (k->to_stage) {
         /* the picture waits in the stage (outbuf: for the guest's own buffer,
          * 'Dbuf'; a tile: for its canvas): tight luma w x h, then CbCr pairs,
@@ -1281,6 +1299,7 @@ static void vtpv_dx_put(void *opaque, const VtpvDxFrame *f)
         }
         k->csx = f->sx;
         k->csy = f->sy;
+        k->cgray = false;
         k->w = f->width;
         k->h = f->height;
         k->pictures++;
@@ -1362,9 +1381,37 @@ static const uint8_t *vtpv_dx_sbf_sample(AppleVtpv *s, uint64_t total, uint64_t 
     return sample;
 }
 
+/* the stream class a decoder rung answers for: codec, and for HEVC the hvcC's
+ * chroma format and luma depth (a HEIF alpha plane is monochrome, the Tahoe
+ * picture 4:2:2) */
+static unsigned vtpv_stream_class(const VtpvSess *se)
+{
+    unsigned chroma = 1, depth = 0;
+    if (se->dx_codec == VTPV_DX_HEVC && se->dx_cfg_len > 18) {
+        chroma = se->dx_cfg[16] & 3;
+        depth = MIN(se->dx_cfg[17] & 7, 3);
+    }
+    return ((unsigned)se->dx_codec & 3) << 4 | chroma << 2 | depth;
+}
+
+/* the rung that last decoded each stream class (0 = not learned, else api + 1):
+ * a session starts there instead of opening and failing the GPU decoders first -
+ * 80 ms a HEIF alpha tile, long enough for ImageIO to drop the image before the
+ * tile's 'TDem' came (TV crashed in CMPhoto's handler) */
+static uint8_t vtpv_learned_api[64];
+
 static bool vtpv_dx_decode_sample(AppleVtpv *s, VtpvSess *se, const uint8_t *sample,
                                   uint32_t sl, uint64_t tag)
 {
+    unsigned cls = vtpv_stream_class(se);
+    if (!se->dx && se->dx_api == VTPV_API_D3D12) {
+        if (vtpv_learned_api[cls]) {
+            se->dx_api = vtpv_learned_api[cls] - 1;
+        } else if (se->dx_codec == VTPV_DX_HEVC && ((cls >> 2) & 3) == 0) {
+            /* monochrome HEVC: no D3D12 or NVDEC profile on either GPU here */
+            se->dx_api = VTPV_API_SW;
+        }
+    }
     for (;;) {
         if (se->dx_api >= VTPV_API_NONE) {
             return false;
@@ -1392,6 +1439,7 @@ static bool vtpv_dx_decode_sample(AppleVtpv *s, VtpvSess *se, const uint8_t *sam
                 (unsigned long long)k->written, rc,
                 (long long)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t0));
         if (rc == 0 && k->pictures > 0) {
+            vtpv_learned_api[cls] = se->dx_api + 1;
             return true;
         }
         /* a stream this decoder does not take: the session moves to the next
@@ -1494,8 +1542,10 @@ static const VtpvKickSurf *vtpv_kick_surf(AppleVtpv *s, uint32_t id);
  * tight luma, then CbCr pairs with chroma shifts (csx, csy) (vtpv_dx_put); w x h
  * of it from (sx, sy) is the tile. The canvas is biplanar 4:2:0 ('420v'/'420f'),
  * 4:2:2 ('422v'/'422f') or 4:4:4 ('444v'/'444f'); its chroma takes the stage's
- * nearest sample when the two subsamplings differ, a row copy when they agree. */
-static bool vtpv_fill_tile(AppleVtpv *s, const VtpvKickSurf *ks, const uint8_t *stage,
+ * nearest sample when the two subsamplings differ, a row copy when they agree.
+ * A one-component 'L008' canvas (a HEIF alpha plane) takes the luma alone; a
+ * luma-only stage (gray) gives a biplanar canvas neutral chroma. */
+static bool vtpv_fill_tile(AppleVtpv *s, const VtpvKickSurf *ks, const uint8_t *stage, bool gray,
                            uint32_t csx, uint32_t csy, uint32_t pw, uint32_t ph, uint32_t sx,
                            uint32_t sy, uint32_t w, uint32_t h, uint32_t ox, uint32_t oy)
 {
@@ -1513,13 +1563,17 @@ static bool vtpv_fill_tile(AppleVtpv *s, const VtpvKickSurf *ks, const uint8_t *
     case 0x34343466u: /* '444f' */
         kx = 0, ky = 0;
         break;
+    case 0x4c303038u: /* 'L008' */
+        kx = ky = 0;
+        break;
     default:
         kx = ky = 2;
         break;
     }
     sx &= ~1u;
     sy &= ~1u;
-    if (kx > 1 || ks->planes != 2 || ox >= ks->pw[0] || oy >= ks->ph[0] || sx >= pw || sy >= ph) {
+    bool one = ks->pixfmt == 0x4c303038u;
+    if (kx > 1 || ks->planes != (one ? 1u : 2u) || ox >= ks->pw[0] || oy >= ks->ph[0] || sx >= pw || sy >= ph) {
         fprintf(stderr, "apple-vtpv: tile: canvas %u is %.4s with %u planes, %ux%u, tile at %u,%u - "
                 "not written\n", ks->id, (const char *)&ks->pixfmt, ks->planes, ks->pw[0],
                 ks->ph[0], ox, oy);
@@ -1530,10 +1584,22 @@ static bool vtpv_fill_tile(AppleVtpv *s, const VtpvKickSurf *ks, const uint8_t *
         vtpv_ksurf_bytes(s, ks, ks->off[0] + (uint64_t)(oy + y) * ks->bpr[0] + ox,
                          stage + (size_t)(sy + y) * pw + sx, dw);
     }
+    if (one) {
+        return true;
+    }
+    uint32_t cols = (dw + (1u << kx) - 1) >> kx, rows = (dh + (1u << ky) - 1) >> ky;
+    if (gray) {
+        g_autofree uint8_t *mid = g_malloc((size_t)cols * 2);
+        memset(mid, 0x80, (size_t)cols * 2);
+        for (uint32_t r = 0; r < rows && (oy >> ky) + r < ks->ph[1]; r++) {
+            vtpv_ksurf_bytes(s, ks, ks->off[1] + (uint64_t)((oy >> ky) + r) * ks->bpr[1] +
+                             (uint64_t)(ox >> kx) * 2, mid, cols * 2);
+        }
+        return true;
+    }
     const uint8_t *chroma = stage + (size_t)pw * ph;
     uint32_t scw = (pw + (1u << csx) - 1) >> csx;           /* stage CbCr pairs a row */
     uint32_t sch = (ph + (1u << csy) - 1) >> csy;
-    uint32_t cols = (dw + (1u << kx) - 1) >> kx, rows = (dh + (1u << ky) - 1) >> ky;
     g_autofree uint8_t *row = g_malloc((size_t)cols * 2 + 2);
     for (uint32_t r = 0; r < rows && (oy >> ky) + r < ks->ph[1]; r++) {
         uint32_t srow = MIN((sy + (r << ky)) >> csy, sch - 1);
@@ -1556,13 +1622,13 @@ static bool vtpv_fill_tile(AppleVtpv *s, const VtpvKickSurf *ks, const uint8_t *
 
 /* 'dtil' on the D3D12 decoder, the host's own contract (VideoToolbox's
  * paravirtual host decoder, static read 10-23): DecodeTile writes the tile into
- * the canvas the request carries (surf[0]) at ',opb', the sync reply is
- * ',err' + ',inf', and the tile is then emitted with 'TDem' (',til', ',err',
- * ',inf', ',uui' = the request's surface-group UUID; message flags 2, no reply)
+ * the canvas the request carries (surf[0]) at ',opb', the tile is emitted
+ * with 'TDem' (',til', ',err', ',inf', ',uui' = the request's surface-group
+ * UUID; message flags 2, no reply) and then comes the sync reply ',err' + ',inf'
  * - the guest's tile output handler runs only on 'TDem', so a decode without it
  * leaves the caller (ImageIO's HEIF reader: System Settings > Displays, sips,
- * Photos) waiting for ever. A tile that does not decode is emitted with its
- * error, never left out. */
+ * Photos) waiting for ever. A tile that does not decode gets the error in
+ * the sync reply alone: the guest emits it itself then. */
 static void vtpv_dtil_dx(AppleVtpv *s, int slot, uint64_t total, uint64_t tile_id,
                          const VtpvKickSurf *ks, uint32_t sx, uint32_t sy, uint32_t tw,
                          uint32_t th, uint32_t ox, uint32_t oy, const uint8_t *uui)
@@ -1576,7 +1642,7 @@ static void vtpv_dtil_dx(AppleVtpv *s, int slot, uint64_t total, uint64_t tile_i
         k->to_stage = true;
         bool ok = vtpv_dx_decode_sample(s, s->cur, sample, sl, tile_id);
         k->to_stage = was_stage;
-        if (ok && vtpv_fill_tile(s, ks, k->stage, k->csx, k->csy, k->w, k->h, sx, sy, tw ? tw : k->w,
+        if (ok && vtpv_fill_tile(s, ks, k->stage, k->cgray, k->csx, k->csy, k->w, k->h, sx, sy, tw ? tw : k->w,
                                  th ? th : k->h, ox, oy)) {
             vtpv_note_surface(ks);
             err = 0;
@@ -1586,25 +1652,42 @@ static void vtpv_dtil_dx(AppleVtpv *s, int slot, uint64_t total, uint64_t tile_i
     uint32_t n = 0;
     int32_t be_err = cpu_to_be32(err);
     uint32_t be_inf = 0;
-    n += vtpv_para_put(paras + n, 0x2c657272u /* ',err' */, "=s32", &be_err, 4);
-    n += vtpv_para_put(paras + n, 0x2c696e66u /* ',inf' */, "=u32", &be_inf, 4);
-    vtpv_send_h2g2(s, slot, 0x6474696cu /* 'dtil' */, 4, s->msg + 0x10, s->msg + 0x20, paras, n);
-
-    n = 0;
-    uint64_t be_til = cpu_to_be64(tile_id);
-    n += vtpv_para_put(paras + n, 0x2c74696cu /* ',til' */, "=s64", &be_til, 8);
-    n += vtpv_para_put(paras + n, 0x2c657272u /* ',err' */, "=s32", &be_err, 4);
-    n += vtpv_para_put(paras + n, 0x2c696e66u /* ',inf' */, "=u32", &be_inf, 4);
-    if (uui) {
-        n += vtpv_para_put(paras + n, 0x2c757569u /* ',uui' */, "=uui", uui, 16);
+    /*
+     * The order is the host's: its VideoToolbox tile decoder emits the tile
+     * from inside DecodeTile, so 'TDem' goes out before the sync reply and the
+     * guest runs the tile's output handler while ImageIO's DecodeTile still
+     * waits. A 'TDem' after the reply met a session ImageIO had already
+     * invalidated ('dinv' right after the reply) - CMPhoto's handler on freed
+     * state (TV crashed in CVBufferSetAttachment). A tile that did not decode
+     * gets only the reply with its error; the guest emits it itself then.
+     */
+    if (!err) {
+        uint64_t be_til = cpu_to_be64(tile_id);
+        n += vtpv_para_put(paras + n, 0x2c74696cu /* ',til' */, "=s64", &be_til, 8);
+        n += vtpv_para_put(paras + n, 0x2c657272u /* ',err' */, "=s32", &be_err, 4);
+        n += vtpv_para_put(paras + n, 0x2c696e66u /* ',inf' */, "=u32", &be_inf, 4);
+        if (uui) {
+            n += vtpv_para_put(paras + n, 0x2c757569u /* ',uui' */, "=uui", uui, 16);
+        }
+        s->host_msg_id++;
+        uint8_t id8[8];
+        stq_be_p(id8, s->host_msg_id);
+        vtpv_send_h2g2(s, slot, 0x5444656du /* 'TDem' */, 2, s->msg + 0x10, id8, paras, n);
     }
-    s->host_msg_id++;
-    uint8_t id8[8];
-    stq_be_p(id8, s->host_msg_id);
-    vtpv_send_h2g2(s, slot, 0x5444656du /* 'TDem' */, 2, s->msg + 0x10, id8, paras, n);
+    /* kVTDecodeInfo_Asynchronous on the reply of a tile whose 'TDem' is under
+     * way: with 0 ImageIO took the tile as done at DecodeTile's return and
+     * invalidated the session ('dinv' 0.5 ms after the reply) while the guest's
+     * queue had not run the 'TDem' handler yet - CMPhoto's handler then met
+     * freed state (TV, Weather, Maps crashed in it, 23u smoke). */
+    uint32_t be_inf_reply = cpu_to_be32(err ? 0 : 1);
+    n = 0;
+    n += vtpv_para_put(paras + n, 0x2c657272u /* ',err' */, "=s32", &be_err, 4);
+    n += vtpv_para_put(paras + n, 0x2c696e66u /* ',inf' */, "=u32", &be_inf_reply, 4);
+    vtpv_send_h2g2(s, slot, 0x6474696cu /* 'dtil' */, 4, s->msg + 0x10, s->msg + 0x20, paras, n);
     if (s->verbose) {
-        fprintf(stderr, "apple-vtpv: tile %llu -> canvas %u (%.4s) at %u,%u err=%d, TDem sent\n",
-                (unsigned long long)tile_id, ks->id, (const char *)&ks->pixfmt, ox, oy, err);
+        fprintf(stderr, "apple-vtpv: tile %llu -> canvas %u (%.4s) at %u,%u err=%d%s\n",
+                (unsigned long long)tile_id, ks->id, (const char *)&ks->pixfmt, ox, oy, err,
+                err ? ", no TDem" : ", TDem sent");
     }
 }
 

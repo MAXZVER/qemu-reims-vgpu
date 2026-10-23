@@ -32,6 +32,7 @@ typedef struct {
     const uint8_t *v;
     uint32_t v_pitch;
     int sx, sy;           /* chroma subsampling shifts: 1,1 = 4:2:0; 1,0 = 4:2:2; 0,0 = 4:4:4 */
+    int gray;             /* luma only (monochrome HEVC: a HEIF alpha plane); uv, v unused */
 } VtpvDxFrame;
 
 typedef void (*VtpvDxOut)(void *opaque, const VtpvDxFrame *f);
