@@ -173,11 +173,14 @@ system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
 # hwbackend=dx links the minimal static ffmpeg (only the H.264/HEVC/VP9/AV1
 # decoders and their D3D12/D3D11 hwaccels) built by
 # lab/tools/session-2026-10-22/build-ffmpeg-min.sh into MacOnIntel/ffmpeg-min
+# Built only on Windows hosts where that tree exists: a checkout without it builds QEMU without the device.
 vtpv_ffmpeg = meson.project_source_root() / '../../../ffmpeg-min'
-vtpv_dx_dep = declare_dependency(
-  compile_args: ['-I' + vtpv_ffmpeg / 'include'],
-  link_args: [vtpv_ffmpeg / 'lib/libavcodec.a', vtpv_ffmpeg / 'lib/libavutil.a',
-              '-ld3d12', '-ldxgi', '-ld3d11', '-lbcrypt', '-lole32', '-luser32', '-latomic'])
-system_ss.add(when: 'CONFIG_PCI', if_true: [files('apple-vtpv.c', 'apple-vtpv-decode.c',
-                                                  'apple-vtpv-decode-h265.c', 'apple-vtpv-dx.c'),
-                                            vtpv_dx_dep])
+if host_os == 'windows' and fs.exists(vtpv_ffmpeg / 'lib/libavcodec.a')
+  vtpv_dx_dep = declare_dependency(
+    compile_args: ['-I' + vtpv_ffmpeg / 'include'],
+    link_args: [vtpv_ffmpeg / 'lib/libavcodec.a', vtpv_ffmpeg / 'lib/libavutil.a',
+                '-ld3d12', '-ldxgi', '-ld3d11', '-lbcrypt', '-lole32', '-luser32', '-latomic'])
+  system_ss.add(when: 'CONFIG_PCI', if_true: [files('apple-vtpv.c', 'apple-vtpv-decode.c',
+                                                    'apple-vtpv-decode-h265.c', 'apple-vtpv-dx.c'),
+                                              vtpv_dx_dep])
+endif
