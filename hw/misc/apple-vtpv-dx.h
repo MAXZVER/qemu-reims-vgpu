@@ -24,17 +24,26 @@ typedef enum {
 
 typedef struct {
     const uint8_t *y;     /* luma plane, valid only during the callback */
-    const uint8_t *uv;    /* interleaved CbCr plane */
+    const uint8_t *uv;    /* interleaved CbCr plane; the Cb plane when planar */
     uint32_t y_pitch, uv_pitch;
     uint32_t width, height;   /* display size (cropped) */
     int64_t tag;          /* the tag passed with the sample that produced it */
+    int planar;           /* uv = Cb plane and v = Cr plane (else uv interleaves CbCr) */
+    const uint8_t *v;
+    uint32_t v_pitch;
+    int sx, sy;           /* chroma subsampling shifts: 1,1 = 4:2:0; 1,0 = 4:2:2; 0,0 = 4:4:4 */
 } VtpvDxFrame;
 
 typedef void (*VtpvDxOut)(void *opaque, const VtpvDxFrame *f);
 
 /*
- * gpu: "int" (Intel, default) or "nv"; api: "d3d12" (default) or "d3d11"
- * (d3d11 = libavcodec staging readback with a CPU copy).
+ * gpu: "int" (Intel, default) or "nv"; api: "d3d12" (default), "d3d11"
+ * (d3d11 = libavcodec staging readback with a CPU copy) or "cuda" (NVDEC on the
+ * NVIDIA GPU, libavcodec readback; the only one of the three libavcodec offers
+ * HEVC 4:4:4 on - HEIF images with full chroma) or "sw" (libavcodec on the
+ * host CPU: the last resort for streams no GPU here decodes - HEVC 4:2:2, the
+ * Tahoe desktop picture; RTX 40 NVDEC has no 4:2:2 and libavcodec offers no
+ * D3D path for HEVC range extensions).
  * Returns NULL and prints the reason on failure.
  */
 VtpvDx *vtpv_dx_open(const char *gpu, const char *api, VtpvDxCodec codec,

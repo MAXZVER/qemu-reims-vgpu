@@ -31,6 +31,16 @@ typedef struct ReimsVgpuDirty ReimsVgpuDirty;
 ReimsVgpuDirty *reims_vgpu_dirty_new(void);
 void reims_vgpu_dirty_free(ReimsVgpuDirty *d);
 
+/*
+ * Another QEMU device stored into these `n` guest pages (4 KiB-aligned GPAs) -
+ * apple-vtpv's decoded pictures and HEIF tiles. A store from the host faults on
+ * nothing and sets no hypervisor dirty bit, so the tracker would keep the GPU's
+ * copy of a surface over them as current. Stamps the pages written, as a
+ * consumed dirty bit does; the next read of a set holding one re-reads it.
+ * Safe from any thread; a no-op before the paravirtual GPU exists.
+ */
+void reims_vgpu_dirty_note_host_store(const uint64_t *gpas, size_t n);
+
 /* TEMP (lab, REIMS_VGPU_LAB_DEVICE_PRIO=on): the calling device thread at above-normal priority. */
 void reims_vgpu_lab_device_prio(const char *who);
 

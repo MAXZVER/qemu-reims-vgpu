@@ -1631,6 +1631,9 @@ static void reims_vgpu_dirty_tab_del(ReimsVgpuDirty *d, uint64_t token)
 
 static void reims_fence_install(void);   /* TEMP lab LAZY_SYNC */
 
+/* The tracker host-store notes go to: the first one made (one paravirtual GPU). */
+static ReimsVgpuDirty *reims_vgpu_dirty_host_dev;
+
 ReimsVgpuDirty *reims_vgpu_dirty_new(void)
 {
     ReimsVgpuDirty *d = g_new0(ReimsVgpuDirty, 1);
@@ -1662,6 +1665,9 @@ ReimsVgpuDirty *reims_vgpu_dirty_new(void)
     d->sets = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free,
                                     reims_vgpu_dirty_set_free);
     d->logged = g_hash_table_new(NULL, NULL);
+    if (!qatomic_read(&reims_vgpu_dirty_host_dev)) {
+        qatomic_set(&reims_vgpu_dirty_host_dev, d);
+    }
     return d;
 }
 
@@ -1672,6 +1678,9 @@ void reims_vgpu_dirty_free(ReimsVgpuDirty *d)
 
     if (!d) {
         return;
+    }
+    if (qatomic_read(&reims_vgpu_dirty_host_dev) == d) {
+        qatomic_set(&reims_vgpu_dirty_host_dev, NULL);
     }
     if (d->od_nworkers) {
         int w;
@@ -5928,6 +5937,24 @@ static void reims_vgpu_dirty_page_seq_cover(ReimsVgpuDirty *d, uint64_t end_pfn)
         call_rcu(oq, reims_vgpu_dirty_qep_free, rcu);
     }
     d->page_seq_n = n;
+}
+
+void reims_vgpu_dirty_note_host_store(const uint64_t *gpas, size_t n)
+{
+    ReimsVgpuDirty *d = qatomic_read(&reims_vgpu_dirty_host_dev);
+    const int shift = qemu_target_page_bits();
+
+    if (!d || !n) {
+        return;
+    }
+    qemu_mutex_lock(&d->lock);
+    for (size_t i = 0; i < n; i++) {
+        uint64_t pfn = gpas[i] >> shift;
+
+        reims_vgpu_dirty_page_seq_cover(d, pfn + 1);
+        d->page_seq[pfn] = ++d->global_seq;
+    }
+    qemu_mutex_unlock(&d->lock);
 }
 
 /* Stamp target page frames [pfn, end) as queried in `epoch`. d->lock held. */

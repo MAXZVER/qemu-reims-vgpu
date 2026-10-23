@@ -38,6 +38,8 @@
 #include "hw/core/qdev-properties.h"
 #include "qemu/timer.h"
 #include "qemu/thread.h"
+#include "system/whpx-wp.h"
+#include "hw/display/reims-vgpu-dirty.h"
 #include <zlib.h>
 
 #define TYPE_APPLE_VTPV "apple-vtpv-pci"
@@ -49,6 +51,7 @@ typedef struct {
     uint32_t w, h;
     int pictures;
     bool to_stage;          /* outbuf: keep the picture (tight NV12) in stage */
+    uint8_t csx, csy;       /* the staged picture's chroma shifts (1,1 = NV12) */
     uint8_t *stage;
     size_t stage_cap;
 } VtpvDxSink;
@@ -109,8 +112,17 @@ typedef struct VtpvSess {
     int dx_codec;                   /* VtpvDxCodec of the open decoder, -1 none */
     uint8_t dx_cfg[4096];           /* avcC/hvcC/vpcC/av1C record it was opened with */
     uint32_t dx_cfg_len;
+    uint8_t dx_api;                 /* VTPV_API_*: the decoder this session moved to */
     VtpvDxSink dx_sink;
 } VtpvSess;
+
+/* the decoders a session tries, in order: the GPU's D3D12 Video (Intel by
+ * default: H.264/HEVC/VP9/AV1, HEVC 4:2:2 and 4:4:4 through the range-extension
+ * profiles), NVDEC on the NVIDIA GPU (what D3D12 there refuses), and libavcodec
+ * on the host CPU only for a stream no GPU here decodes (12-bit HEVC) - never
+ * an error the guest would show as a black or green picture */
+enum { VTPV_API_D3D12, VTPV_API_CUDA, VTPV_API_SW, VTPV_API_NONE };
+static const char *const vtpv_api_name[] = { "d3d12", "cuda", "sw" };
 
 #define PCI_DEVICE_ID_APPLE_VTPV 0x1a03
 
@@ -1002,6 +1014,7 @@ static void vtpv_dx_reset(AppleVtpv *s)
     vtpv_dec_drain(s, s->cur);
     vtpv_dx_close(s->cur->dx);
     s->cur->dx = NULL;
+    s->cur->dx_api = VTPV_API_D3D12;
     s->cur->dx_codec = -1;
     s->cur->dx_cfg_len = 0;
     s->cur->dpba_w = s->cur->dpba_h = 0;      /* outbuf: the next stream announces its size again */
@@ -1126,6 +1139,33 @@ static uint64_t vtpv_surf_page(AppleVtpv *s, uint32_t pg)
     return vtpv_page_gpa(s, pg) & ~(uint64_t)0xfff;
 }
 
+/*
+ * Before the device stores into a guest page: the paravirtual GPU's dirty
+ * tracking trusts write-protected pages until a guest store faults on them, and
+ * a store of ours never faults - a decoded picture or HEIF tile the guest then
+ * hands to the GPU (WallpaperAgent: the desktop picture) was read from the GPU's
+ * stale copy (all zero: a green desktop). The fault hook is the "a store is about
+ * to happen" the tracking already understands.
+ */
+static void vtpv_host_store(uint64_t gpa)
+{
+    if (whpx_wp_fault_hook) {
+        whpx_wp_fault_hook(gpa & ~(uint64_t)0xfff);
+    }
+}
+
+/* after the device filled an attached surface: its pages are written, for the
+ * paravirtual GPU's tracking (vtpv_host_store's fault covers write-protected
+ * pages only; a surface the GPU holds a copy of is re-read from these stamps) */
+static void vtpv_note_surface(const VtpvKickSurf *ks)
+{
+    g_autofree uint64_t *pg = g_new(uint64_t, ks->npages ? ks->npages : 1);
+    for (uint32_t i = 0; i < ks->npages; i++) {
+        pg[i] = ks->pages[i] & ~(uint64_t)0xfff;
+    }
+    reims_vgpu_dirty_note_host_store(pg, ks->npages);
+}
+
 /* one row segment into the exported surface pages (4 KiB each) */
 static uint64_t vtpv_wb_bytes(AppleVtpv *s, uint64_t off, const uint8_t *src,
                               uint32_t len)
@@ -1137,6 +1177,7 @@ static uint64_t vtpv_wb_bytes(AppleVtpv *s, uint64_t off, const uint8_t *src,
         uint32_t in_pg = 4096 - (sa & 0xfff);
         uint32_t chunk = MIN(len, in_pg);
         if (vtpv_page_ok(s, pg)) {
+            vtpv_host_store(vtpv_surf_page(s, pg));
             dma_memory_write(pci_get_address_space(PCI_DEVICE(s)),
                              vtpv_surf_page(s, pg) + (sa & 0xfff), src, chunk,
                              MEMTXATTRS_UNSPECIFIED);
@@ -1162,6 +1203,7 @@ static void vtpv_ksurf_bytes(AppleVtpv *s, const VtpvKickSurf *ks, uint64_t off,
         uint32_t pg = sa >> 12;
         uint32_t chunk = MIN(len, 4096 - (uint32_t)(sa & 0xfff));
         if (pg < ks->npages) {
+            vtpv_host_store(ks->pages[pg]);
             dma_memory_write(pci_get_address_space(PCI_DEVICE(s)),
                              (ks->pages[pg] & ~(uint64_t)0xfff) + (sa & 0xfff), src, chunk,
                              MEMTXATTRS_UNSPECIFIED);
@@ -1208,11 +1250,15 @@ static void vtpv_dx_put(void *opaque, const VtpvDxFrame *f)
     uint32_t bpr1 = s->surfmap_meta[3] ? s->surfmap_meta[3] : w;
     uint32_t dw = MIN(f->width, w), dh = MIN(f->height, h);
 
+    bool nv12 = !f->planar && f->sx == 1 && f->sy == 1;
     if (k->to_stage) {
-        /* outbuf: the picture waits for the guest's own buffer ('Dbuf') */
-        /* tight NV12: luma w x h, then CbCr rows of the even-rounded width */
-        uint32_t cw = (f->width + 1) & ~1u, ch = (f->height + 1) / 2;
-        size_t need = (size_t)f->width * f->height + (size_t)cw * ch;
+        /* the picture waits in the stage (outbuf: for the guest's own buffer,
+         * 'Dbuf'; a tile: for its canvas): tight luma w x h, then CbCr pairs,
+         * (w >> sx) of them a row, (h >> sy) rows, both rounded up - NV12 for
+         * 4:2:0, NV16 for 4:2:2, NV24 for 4:4:4 */
+        uint32_t cw = (f->width + (1u << f->sx) - 1) >> f->sx;
+        uint32_t ch = (f->height + (1u << f->sy) - 1) >> f->sy;
+        size_t need = (size_t)f->width * f->height + (size_t)cw * 2 * ch;
         if (k->stage_cap < need) {
             k->stage = g_realloc(k->stage, need);
             k->stage_cap = need;
@@ -1222,11 +1268,26 @@ static void vtpv_dx_put(void *opaque, const VtpvDxFrame *f)
         }
         uint8_t *uv = k->stage + (size_t)f->width * f->height;
         for (uint32_t y = 0; y < ch; y++) {
-            memcpy(uv + (size_t)y * cw, f->uv + (size_t)y * f->uv_pitch, cw);
+            uint8_t *d = uv + (size_t)y * cw * 2;
+            if (!f->planar) {
+                memcpy(d, f->uv + (size_t)y * f->uv_pitch, (size_t)cw * 2);
+                continue;
+            }
+            const uint8_t *cb = f->uv + (size_t)y * f->uv_pitch, *cr = f->v + (size_t)y * f->v_pitch;
+            for (uint32_t x = 0; x < cw; x++) {
+                d[2 * x] = cb[x];
+                d[2 * x + 1] = cr[x];
+            }
         }
+        k->csx = f->sx;
+        k->csy = f->sy;
         k->w = f->width;
         k->h = f->height;
         k->pictures++;
+        return;
+    }
+    if (!nv12) {
+        fprintf(stderr, "apple-vtpv: a non-NV12 picture outside a staged decode - dropped\n");
         return;
     }
 
@@ -1304,26 +1365,44 @@ static const uint8_t *vtpv_dx_sbf_sample(AppleVtpv *s, uint64_t total, uint64_t 
 static bool vtpv_dx_decode_sample(AppleVtpv *s, VtpvSess *se, const uint8_t *sample,
                                   uint32_t sl, uint64_t tag)
 {
-    if (!se->dx) {
-        se->dx = vtpv_dx_open(s->dec_gpu_str ? s->dec_gpu_str : "int", "d3d12",
-                             (VtpvDxCodec)se->dx_codec, se->dx_cfg_len ? se->dx_cfg : NULL,
-                             se->dx_cfg_len, vtpv_dx_put, se);
-        if (!se->dx) {
-            fprintf(stderr, "apple-vtpv: dx: decoder open failed (codec %d)\n", se->dx_codec);
+    for (;;) {
+        if (se->dx_api >= VTPV_API_NONE) {
             return false;
         }
+        if (!se->dx) {
+            const char *gpu = se->dx_api == VTPV_API_CUDA ? "nv" : s->dec_gpu_str ? s->dec_gpu_str : "int";
+            se->dx = vtpv_dx_open(gpu, vtpv_api_name[se->dx_api], (VtpvDxCodec)se->dx_codec,
+                                 se->dx_cfg_len ? se->dx_cfg : NULL, se->dx_cfg_len, vtpv_dx_put, se);
+            if (!se->dx) {
+                fprintf(stderr, "apple-vtpv: dx: %s decoder open failed (codec %d)\n",
+                        vtpv_api_name[se->dx_api], se->dx_codec);
+                se->dx_api++;
+                continue;
+            }
+        }
+        VtpvDxSink *k = &se->dx_sink;
+        k->written = 0;             /* per-message counters; mode + stage stay */
+        k->w = k->h = 0;
+        k->pictures = 0;
+        int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        int rc = vtpv_dx_decode(se->dx, sample, sl, (int64_t)tag);
+        fprintf(stderr, "apple-vtpv: HW-DECODE(%s) frame=%llu codec=%d %ux%u pictures=%d "
+                "-> canvas %llu bytes rc=%d %lld us\n", vtpv_api_name[se->dx_api],
+                (unsigned long long)tag, se->dx_codec, k->w, k->h, k->pictures,
+                (unsigned long long)k->written, rc,
+                (long long)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t0));
+        if (rc == 0 && k->pictures > 0) {
+            return true;
+        }
+        /* a stream this decoder does not take: the session moves to the next
+         * one once, and stays there (HEVC only - the range extensions) */
+        if (se->dx_codec != VTPV_DX_HEVC || se->dx_api + 1 >= VTPV_API_NONE) {
+            return false;
+        }
+        vtpv_dx_close(se->dx);
+        se->dx = NULL;
+        se->dx_api++;
     }
-    VtpvDxSink *k = &se->dx_sink;
-    k->written = 0;                 /* per-message counters; mode + stage stay */
-    k->w = k->h = 0;
-    k->pictures = 0;
-    int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
-    int rc = vtpv_dx_decode(se->dx, sample, sl, (int64_t)tag);
-    fprintf(stderr, "apple-vtpv: HW-DECODE(dx) frame=%llu codec=%d %ux%u pictures=%d "
-            "-> canvas %llu bytes rc=%d %lld us\n", (unsigned long long)tag, se->dx_codec,
-            k->w, k->h, k->pictures, (unsigned long long)k->written, rc,
-            (long long)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t0));
-    return rc == 0 && k->pictures > 0;
 }
 
 /* decode the ',sbf' of a 'dtil'/'dfrm' and write the picture back */
@@ -1410,6 +1489,124 @@ static bool vtpv_dec_wait(AppleVtpv *s, VtpvSess *se, int idx)
 
 static void vtpv_hwdecode_dfrm(AppleVtpv *s, uint64_t total);
 static const VtpvKickSurf *vtpv_kick_surf(AppleVtpv *s, uint32_t id);
+
+/* a staged tile -> its place (ox, oy) in the caller's canvas. The stage is pw x ph
+ * tight luma, then CbCr pairs with chroma shifts (csx, csy) (vtpv_dx_put); w x h
+ * of it from (sx, sy) is the tile. The canvas is biplanar 4:2:0 ('420v'/'420f'),
+ * 4:2:2 ('422v'/'422f') or 4:4:4 ('444v'/'444f'); its chroma takes the stage's
+ * nearest sample when the two subsamplings differ, a row copy when they agree. */
+static bool vtpv_fill_tile(AppleVtpv *s, const VtpvKickSurf *ks, const uint8_t *stage,
+                           uint32_t csx, uint32_t csy, uint32_t pw, uint32_t ph, uint32_t sx,
+                           uint32_t sy, uint32_t w, uint32_t h, uint32_t ox, uint32_t oy)
+{
+    uint32_t kx, ky;
+    switch (ks->pixfmt) {
+    case 0x34323076u: /* '420v' */
+    case 0x34323066u: /* '420f' */
+        kx = 1, ky = 1;
+        break;
+    case 0x34323276u: /* '422v' */
+    case 0x34323266u: /* '422f' */
+        kx = 1, ky = 0;
+        break;
+    case 0x34343476u: /* '444v' */
+    case 0x34343466u: /* '444f' */
+        kx = 0, ky = 0;
+        break;
+    default:
+        kx = ky = 2;
+        break;
+    }
+    sx &= ~1u;
+    sy &= ~1u;
+    if (kx > 1 || ks->planes != 2 || ox >= ks->pw[0] || oy >= ks->ph[0] || sx >= pw || sy >= ph) {
+        fprintf(stderr, "apple-vtpv: tile: canvas %u is %.4s with %u planes, %ux%u, tile at %u,%u - "
+                "not written\n", ks->id, (const char *)&ks->pixfmt, ks->planes, ks->pw[0],
+                ks->ph[0], ox, oy);
+        return false;
+    }
+    uint32_t dw = MIN(MIN(w, pw - sx), ks->pw[0] - ox), dh = MIN(MIN(h, ph - sy), ks->ph[0] - oy);
+    for (uint32_t y = 0; y < dh; y++) {
+        vtpv_ksurf_bytes(s, ks, ks->off[0] + (uint64_t)(oy + y) * ks->bpr[0] + ox,
+                         stage + (size_t)(sy + y) * pw + sx, dw);
+    }
+    const uint8_t *chroma = stage + (size_t)pw * ph;
+    uint32_t scw = (pw + (1u << csx) - 1) >> csx;           /* stage CbCr pairs a row */
+    uint32_t sch = (ph + (1u << csy) - 1) >> csy;
+    uint32_t cols = (dw + (1u << kx) - 1) >> kx, rows = (dh + (1u << ky) - 1) >> ky;
+    g_autofree uint8_t *row = g_malloc((size_t)cols * 2 + 2);
+    for (uint32_t r = 0; r < rows && (oy >> ky) + r < ks->ph[1]; r++) {
+        uint32_t srow = MIN((sy + (r << ky)) >> csy, sch - 1);
+        const uint8_t *src = chroma + (size_t)srow * scw * 2;
+        const uint8_t *put = row;
+        if (kx == csx) {
+            put = src + (size_t)(sx >> csx) * 2;
+        } else {
+            for (uint32_t c = 0; c < cols; c++) {
+                uint32_t scol = MIN((sx + (c << kx)) >> csx, scw - 1);
+                row[2 * c] = src[2 * scol];
+                row[2 * c + 1] = src[2 * scol + 1];
+            }
+        }
+        vtpv_ksurf_bytes(s, ks, ks->off[1] + (uint64_t)((oy >> ky) + r) * ks->bpr[1] +
+                         (uint64_t)(ox >> kx) * 2, put, cols * 2);
+    }
+    return true;
+}
+
+/* 'dtil' on the D3D12 decoder, the host's own contract (VideoToolbox's
+ * paravirtual host decoder, static read 10-23): DecodeTile writes the tile into
+ * the canvas the request carries (surf[0]) at ',opb', the sync reply is
+ * ',err' + ',inf', and the tile is then emitted with 'TDem' (',til', ',err',
+ * ',inf', ',uui' = the request's surface-group UUID; message flags 2, no reply)
+ * - the guest's tile output handler runs only on 'TDem', so a decode without it
+ * leaves the caller (ImageIO's HEIF reader: System Settings > Displays, sips,
+ * Photos) waiting for ever. A tile that does not decode is emitted with its
+ * error, never left out. */
+static void vtpv_dtil_dx(AppleVtpv *s, int slot, uint64_t total, uint64_t tile_id,
+                         const VtpvKickSurf *ks, uint32_t sx, uint32_t sy, uint32_t tw,
+                         uint32_t th, uint32_t ox, uint32_t oy, const uint8_t *uui)
+{
+    int32_t err = -12909;           /* kVTVideoDecoderBadDataErr */
+    uint32_t sl = 0;
+    const uint8_t *sample = vtpv_dx_sbf_sample(s, total, tile_id, &sl);
+    if (sample) {
+        VtpvDxSink *k = &s->cur->dx_sink;
+        bool was_stage = k->to_stage;
+        k->to_stage = true;
+        bool ok = vtpv_dx_decode_sample(s, s->cur, sample, sl, tile_id);
+        k->to_stage = was_stage;
+        if (ok && vtpv_fill_tile(s, ks, k->stage, k->csx, k->csy, k->w, k->h, sx, sy, tw ? tw : k->w,
+                                 th ? th : k->h, ox, oy)) {
+            vtpv_note_surface(ks);
+            err = 0;
+        }
+    }
+    uint8_t paras[96];
+    uint32_t n = 0;
+    int32_t be_err = cpu_to_be32(err);
+    uint32_t be_inf = 0;
+    n += vtpv_para_put(paras + n, 0x2c657272u /* ',err' */, "=s32", &be_err, 4);
+    n += vtpv_para_put(paras + n, 0x2c696e66u /* ',inf' */, "=u32", &be_inf, 4);
+    vtpv_send_h2g2(s, slot, 0x6474696cu /* 'dtil' */, 4, s->msg + 0x10, s->msg + 0x20, paras, n);
+
+    n = 0;
+    uint64_t be_til = cpu_to_be64(tile_id);
+    n += vtpv_para_put(paras + n, 0x2c74696cu /* ',til' */, "=s64", &be_til, 8);
+    n += vtpv_para_put(paras + n, 0x2c657272u /* ',err' */, "=s32", &be_err, 4);
+    n += vtpv_para_put(paras + n, 0x2c696e66u /* ',inf' */, "=u32", &be_inf, 4);
+    if (uui) {
+        n += vtpv_para_put(paras + n, 0x2c757569u /* ',uui' */, "=uui", uui, 16);
+    }
+    s->host_msg_id++;
+    uint8_t id8[8];
+    stq_be_p(id8, s->host_msg_id);
+    vtpv_send_h2g2(s, slot, 0x5444656du /* 'TDem' */, 2, s->msg + 0x10, id8, paras, n);
+    if (s->verbose) {
+        fprintf(stderr, "apple-vtpv: tile %llu -> canvas %u (%.4s) at %u,%u err=%d, TDem sent\n",
+                (unsigned long long)tile_id, ks->id, (const char *)&ks->pixfmt, ox, oy, err);
+    }
+}
 
 static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                                 uint32_t nsurf)
@@ -1533,6 +1730,17 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                 tcd ? (int32_t)ldl_be_p(tcd + 4) : -1,
                 opb ? (int32_t)ldl_be_p(opb) : -1,
                 opb ? (int32_t)ldl_be_p(opb + 4) : -1);
+        const VtpvKickSurf *canvas = nsurf ? vtpv_kick_surf(s, sl->surf[0]) : NULL;
+        if (s->hwdecode && canvas && vtpv_use_dx(s)) {
+            uint32_t ulen = 0;
+            const uint8_t *uui = vtpv_para_find(s->msg, total, 0x2c757569u /* ',uui' */, &ulen);
+            int32_t ox = opb ? (int32_t)ldl_be_p(opb) : 0, oy = opb ? (int32_t)ldl_be_p(opb + 4) : 0;
+            int32_t tw = tcd ? (int32_t)ldl_be_p(tcd) : 0, th = tcd ? (int32_t)ldl_be_p(tcd + 4) : 0;
+            int32_t sx = tco ? (int32_t)ldl_be_p(tco) : 0, sy = tco ? (int32_t)ldl_be_p(tco + 4) : 0;
+            vtpv_dtil_dx(s, slot, total, tile_id, canvas, MAX(sx, 0), MAX(sy, 0), MAX(tw, 0),
+                         MAX(th, 0), MAX(ox, 0), MAX(oy, 0), ulen == 16 ? uui : NULL);
+            return;
+        }
         if (s->hwdecode && s->writeback && s->surfmap_count && vtpv_use_dx(s)) {
             vtpv_dx_decode_sbf(s, total, tile_id);
         } else if (s->hwdecode && s->writeback && s->surfmap_count) {
@@ -1998,6 +2206,9 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
             const VtpvKickSurf *ks = sl->surf[0] ? vtpv_kick_surf(s, sl->surf[0]) : NULL;
             int64_t t_fill = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
             bool ok = !err && ks && vtpv_fill_surface(s, ks, pic, pw, ph);
+            if (ok) {
+                vtpv_note_surface(ks);
+            }
             t_fill = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t_fill;
             if (s->verbose > 1) {
                 /* zlib crc32 of the tight NV12, as vtprobe11's .crc truth */

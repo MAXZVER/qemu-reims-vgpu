@@ -38,6 +38,7 @@
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_d3d12va.h>
+#include <libavutil/pixdesc.h>
 #pragma GCC diagnostic pop
 
 #define MAXPEND 8
@@ -72,6 +73,8 @@ struct VtpvDx {
     AVBufferRef *hw;
     enum AVPixelFormat hwfmt;
     int d3d12;
+    int cuda;
+    int soft;                   /* "sw": libavcodec on the CPU, no device */
     int hook;                   /* decode-order output via get_buffer2 */
     int pipelined;
     VtpvDxOut out;
@@ -92,6 +95,10 @@ struct VtpvDx {
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[2];
     UINT64 tex_w;
     UINT tex_h;
+    DXGI_FORMAT tex_fmt;
+    int nplanes;                /* 2: NV12/P010; 1: the packed HEVC range-extension outputs */
+    uint8_t *conv;              /* packed -> luma + interleaved CbCr, for the callback */
+    size_t conv_cap;
     /* stats */
     LARGE_INTEGER qf;
     double t_parse, t_gpu;
@@ -282,6 +289,68 @@ static void fire(VtpvDx *d, Slot *s)
     wait_fv(d, s->fv);
     d->t_gpu += now_ms(d) - a;
     s->busy = 0;
+    if (d->nplanes == 1) {
+        /* YUY2 / Y210 (4:2:2) and AYUV / Y410 (4:4:4) as luma + CbCr pairs, 8 bits */
+        const uint8_t *src = s->mem + d->fp[0].Offset;
+        uint32_t pitch = d->fp[0].Footprint.RowPitch, w = s->out.width, h = s->out.height;
+        int c422 = d->tex_fmt == DXGI_FORMAT_YUY2 || d->tex_fmt == DXGI_FORMAT_Y210;
+        uint32_t cw = c422 ? (w + 1) / 2 : w;
+        size_t need = (size_t)w * h + (size_t)cw * 2 * h;
+        if (d->conv_cap < need) {
+            free(d->conv);
+            d->conv = malloc(need);
+            d->conv_cap = d->conv ? need : 0;
+            if (!d->conv) return;
+        }
+        uint8_t *yp = d->conv, *cp = d->conv + (size_t)w * h;
+        for (uint32_t y = 0; y < h; y++) {
+            const uint8_t *r = src + (size_t)y * pitch;
+            uint8_t *yo = yp + (size_t)y * w, *co = cp + (size_t)y * cw * 2;
+            switch (d->tex_fmt) {
+            case DXGI_FORMAT_YUY2:          /* Y0 U Y1 V */
+                for (uint32_t x = 0; x < cw; x++) {
+                    yo[2 * x] = r[4 * x];
+                    if (2 * x + 1 < w) yo[2 * x + 1] = r[4 * x + 2];
+                    co[2 * x] = r[4 * x + 1];
+                    co[2 * x + 1] = r[4 * x + 3];
+                }
+                break;
+            case DXGI_FORMAT_Y210: {        /* the same, 16-bit samples, data in the high bits */
+                const uint16_t *q = (const uint16_t *)r;
+                for (uint32_t x = 0; x < cw; x++) {
+                    yo[2 * x] = q[4 * x] >> 8;
+                    if (2 * x + 1 < w) yo[2 * x + 1] = q[4 * x + 2] >> 8;
+                    co[2 * x] = q[4 * x + 1] >> 8;
+                    co[2 * x + 1] = q[4 * x + 3] >> 8;
+                }
+                break;
+            }
+            case DXGI_FORMAT_AYUV:          /* V U Y A */
+                for (uint32_t x = 0; x < w; x++) {
+                    yo[x] = r[4 * x + 2];
+                    co[2 * x] = r[4 * x + 1];
+                    co[2 * x + 1] = r[4 * x];
+                }
+                break;
+            default: {                      /* Y410: U 0-9, Y 10-19, V 20-29 */
+                const uint32_t *q = (const uint32_t *)r;
+                for (uint32_t x = 0; x < w; x++) {
+                    yo[x] = (q[x] >> 12) & 0xff;
+                    co[2 * x] = (q[x] >> 2) & 0xff;
+                    co[2 * x + 1] = (q[x] >> 22) & 0xff;
+                }
+                break;
+            }
+            }
+        }
+        s->out.y = yp;
+        s->out.y_pitch = w;
+        s->out.uv = cp;
+        s->out.uv_pitch = cw * 2;
+        s->out.planar = 0;
+        s->out.sx = c422 ? 1 : 0;
+        s->out.sy = 0;
+    }
     d->out(d->opaque, &s->out);
 }
 
@@ -289,11 +358,13 @@ static void fire(VtpvDx *d, Slot *s)
 static int slots_setup(VtpvDx *d, ID3D12Resource *tex, int sub)
 {
     D3D12_RESOURCE_DESC td = ID3D12Resource_GetDesc(tex);
-    if (d->slot[0].buf && td.Width == d->tex_w && td.Height == d->tex_h) return 0;
+    if (d->slot[0].buf && td.Width == d->tex_w && td.Height == d->tex_h && td.Format == d->tex_fmt) return 0;
     for (int i = 0; i < NSLOT; i++) fire(d, &d->slot[i]);   /* resolution change: drain */
     slots_free(d);
+    d->tex_fmt = td.Format;
+    d->nplanes = td.Format == DXGI_FORMAT_NV12 || td.Format == DXGI_FORMAT_P010 ? 2 : 1;
     UINT64 off = 0;
-    for (int p = 0; p < 2; p++) {
+    for (int p = 0; p < d->nplanes; p++) {
         UINT s = (UINT)sub + (UINT)p * td.DepthOrArraySize * td.MipLevels;
         UINT64 t;
         ID3D12Device_GetCopyableFootprints(d->dev, &td, s, 1, off, &d->fp[p], NULL, NULL, &t);
@@ -311,17 +382,44 @@ static int slots_setup(VtpvDx *d, ID3D12Resource *tex, int sub)
  * pipelined mode calls back the PREVIOUS picture once this copy is queued */
 static int emit(VtpvDx *d, AVFrame *f, int64_t tag)
 {
-    VtpvDxFrame o = { .width = (uint32_t)d->c->width, .height = (uint32_t)d->c->height, .tag = tag };
+    VtpvDxFrame o = { .width = (uint32_t)d->c->width, .height = (uint32_t)d->c->height, .tag = tag,
+                      .sx = 1, .sy = 1 };
     d->npics++;
     if (!d->d3d12) {
-        double a = now_ms(d);
-        av_frame_unref(d->sw);
-        if (av_hwframe_transfer_data(d->sw, f, 0) < 0) return -1;
-        d->t_gpu += now_ms(d) - a;
-        o.y = d->sw->data[0];
-        o.y_pitch = (uint32_t)d->sw->linesize[0];
-        o.uv = d->sw->data[1];
-        o.uv_pitch = (uint32_t)d->sw->linesize[1];
+        /* d3d11/cuda: libavcodec's readback; sw: the frame is in memory already */
+        AVFrame *m = f;
+        if (!d->soft) {
+            double a = now_ms(d);
+            av_frame_unref(d->sw);
+            if (av_hwframe_transfer_data(d->sw, f, 0) < 0) return -1;
+            d->t_gpu += now_ms(d) - a;
+            m = d->sw;
+        }
+        o.y = m->data[0];
+        o.y_pitch = (uint32_t)m->linesize[0];
+        o.uv = m->data[1];
+        o.uv_pitch = (uint32_t)m->linesize[1];
+        switch (m->format) {
+        case AV_PIX_FMT_NV12:
+            break;
+        case AV_PIX_FMT_YUV420P:
+        case AV_PIX_FMT_YUVJ420P:
+        case AV_PIX_FMT_YUV422P:
+        case AV_PIX_FMT_YUVJ422P:
+        case AV_PIX_FMT_YUV444P:
+        case AV_PIX_FMT_YUVJ444P: {
+            const AVPixFmtDescriptor *pd = av_pix_fmt_desc_get(m->format);
+            o.planar = 1;
+            o.v = m->data[2];
+            o.v_pitch = (uint32_t)m->linesize[2];
+            o.sx = pd->log2_chroma_w;
+            o.sy = pd->log2_chroma_h;
+            break;
+        }
+        default:
+            fprintf(stderr, "vtpv-dx: picture format %s not handled\n", av_get_pix_fmt_name(m->format));
+            return -1;
+        }
         d->out(d->opaque, &o);
         return 0;
     }
@@ -332,7 +430,7 @@ static int emit(VtpvDx *d, AVFrame *f, int64_t tag)
     D3D12_RESOURCE_DESC td = ID3D12Resource_GetDesc(df->texture);
     ID3D12CommandAllocator_Reset(s->alloc);
     ID3D12GraphicsCommandList_Reset(s->list, s->alloc, NULL);
-    for (int p = 0; p < 2; p++) {
+    for (int p = 0; p < d->nplanes; p++) {
         D3D12_TEXTURE_COPY_LOCATION src = { .pResource = df->texture,
             .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             .SubresourceIndex = (UINT)df->subresource_index + (UINT)p * td.DepthOrArraySize * td.MipLevels };
@@ -348,8 +446,10 @@ static int emit(VtpvDx *d, AVFrame *f, int64_t tag)
     s->fv = d->fv;
     o.y = s->mem + d->fp[0].Offset;
     o.y_pitch = d->fp[0].Footprint.RowPitch;
-    o.uv = s->mem + d->fp[1].Offset;
-    o.uv_pitch = d->fp[1].Footprint.RowPitch;
+    if (d->nplanes == 2) {      /* packed outputs get their planes in fire() */
+        o.uv = s->mem + d->fp[1].Offset;
+        o.uv_pitch = d->fp[1].Footprint.RowPitch;
+    }
     s->out = o;
     s->busy = 1;
     d->next = (d->next + 1) % NSLOT;
@@ -367,24 +467,38 @@ VtpvDx *vtpv_dx_open(const char *gpu, const char *api, VtpvDxCodec codec,
     QueryPerformanceFrequency(&d->qf);
     d->out = out;
     d->opaque = opaque;
-    d->d3d12 = !(api && strcmp(api, "d3d11") == 0);
-    d->hook = codec == VTPV_DX_H264 || codec == VTPV_DX_HEVC;
-    d->hwfmt = d->d3d12 ? AV_PIX_FMT_D3D12 : AV_PIX_FMT_D3D11;
-    int ai = adapter_for(gpu && strcmp(gpu, "nv") == 0 ? 0x10de : 0x8086);
-    if (ai < 0) { fprintf(stderr, "vtpv-dx: no %s adapter\n", gpu ? gpu : "int"); goto fail; }
-    char devstr[16];
-    snprintf(devstr, sizeof devstr, "%d", ai);
-    if (av_hwdevice_ctx_create(&d->hw, d->d3d12 ? AV_HWDEVICE_TYPE_D3D12VA : AV_HWDEVICE_TYPE_D3D11VA,
-                               devstr, NULL, 0) < 0) {
-        fprintf(stderr, "vtpv-dx: %s device on adapter %d failed\n", d->d3d12 ? "d3d12" : "d3d11", ai);
-        goto fail;
+    d->cuda = api && strcmp(api, "cuda") == 0;
+    d->soft = api && strcmp(api, "sw") == 0;
+    d->d3d12 = !d->cuda && !d->soft && !(api && strcmp(api, "d3d11") == 0);
+    d->hook = d->d3d12 && (codec == VTPV_DX_H264 || codec == VTPV_DX_HEVC);
+    d->hwfmt = d->cuda ? AV_PIX_FMT_CUDA : d->d3d12 ? AV_PIX_FMT_D3D12 : AV_PIX_FMT_D3D11;
+    if (d->soft) {
+        /* no device: libavcodec's own decoder on this thread */
+    } else if (d->cuda) {
+        /* CUDA numbers its own devices: the first NVIDIA GPU */
+        if (av_hwdevice_ctx_create(&d->hw, AV_HWDEVICE_TYPE_CUDA, "0", NULL, 0) < 0) {
+            fprintf(stderr, "vtpv-dx: cuda device failed (libavcodec without nvdec, or no NVIDIA GPU)\n");
+            goto fail;
+        }
+    } else {
+        int ai = adapter_for(gpu && strcmp(gpu, "nv") == 0 ? 0x10de : 0x8086);
+        if (ai < 0) { fprintf(stderr, "vtpv-dx: no %s adapter\n", gpu ? gpu : "int"); goto fail; }
+        char devstr[16];
+        snprintf(devstr, sizeof devstr, "%d", ai);
+        if (av_hwdevice_ctx_create(&d->hw, d->d3d12 ? AV_HWDEVICE_TYPE_D3D12VA : AV_HWDEVICE_TYPE_D3D11VA,
+                                   devstr, NULL, 0) < 0) {
+            fprintf(stderr, "vtpv-dx: %s device on adapter %d failed\n", d->d3d12 ? "d3d12" : "d3d11", ai);
+            goto fail;
+        }
     }
     const AVCodec *dec = avcodec_find_decoder_by_name(avcodec_get_name(ids[codec]));
     if (!dec) goto fail;
     d->c = avcodec_alloc_context3(dec);
     d->c->opaque = d;
-    d->c->hw_device_ctx = av_buffer_ref(d->hw);
-    d->c->get_format = get_fmt;
+    if (!d->soft) {
+        d->c->hw_device_ctx = av_buffer_ref(d->hw);
+        d->c->get_format = get_fmt;
+    }
     if (d->hook) d->c->get_buffer2 = get_buf;
     d->c->thread_count = 1;
     if (cfg && cfg_len) {
@@ -473,6 +587,7 @@ void vtpv_dx_close(VtpvDx *d)
     if (d->q) ID3D12CommandQueue_Release(d->q);
     if (d->fence) ID3D12Fence_Release(d->fence);
     if (d->ev) CloseHandle(d->ev);
+    free(d->conv);
     av_frame_free(&d->fr);
     av_frame_free(&d->sw);
     av_packet_free(&d->pkt);
