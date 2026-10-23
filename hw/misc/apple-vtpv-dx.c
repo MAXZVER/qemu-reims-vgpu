@@ -103,7 +103,32 @@ struct VtpvDx {
     LARGE_INTEGER qf;
     double t_parse, t_gpu;
     int npics;
+    /* pool key (vtpv_dx_close) and the time it went there */
+    int nv;
+    VtpvDxCodec codec;
+    uint8_t *cfg;
+    uint32_t cfg_len;
+    volatile double pooled_at;
 };
+
+/*
+ * Reuse.  Every HEIF tile comes in its own decoder session, and each open paid
+ * the D3D12 device, libavcodec's context, the copy queue and on the first
+ * picture the decoder heap: 12-60 ms a tile against 1.6 ms for a picture on an
+ * open decoder.  The guest's reply clerk times a slow 'dtil' out (TV, 10-23:
+ * "timeout waiting for pending reply ... 'dtil'", -19093); CMPhoto then drops
+ * the image and frees state a later tile's callback still uses (TV, Weather
+ * crashed in it).  So one device per api and GPU for the process, and closed
+ * decoders wait POOL_TTL_MS in a pool for a session with the same stream
+ * configuration (the tiles of one image share it).
+ */
+#define POOL_MAX 8
+#define POOL_TTL_MS 5000.0
+static SRWLOCK pool_lock = SRWLOCK_INIT;
+static VtpvDx *pool[POOL_MAX];
+static AVBufferRef *dev_cache[2][2];        /* [cuda][nv] */
+
+static void dx_destroy(VtpvDx *d);
 
 static double now_ms(const VtpvDx *d)
 {
@@ -187,6 +212,7 @@ static DWORD WINAPI ka_main(LPVOID p)
     while (!d->ka_stop) {
         Sleep((DWORD)d->ka_ms);
         if (d->ka_stop) break;
+        if (d->pooled_at > 0 && now_ms(d) - d->pooled_at > POOL_TTL_MS) continue;   /* expired in the pool */
         ID3D12CommandAllocator_Reset(d->ka_alloc);
         ID3D12GraphicsCommandList_Reset(d->ka_list, d->ka_alloc, NULL);
         ID3D12GraphicsCommandList_CopyBufferRegion(d->ka_list, d->ka_dst, 0, d->ka_src, 0, 256);
@@ -465,32 +491,90 @@ VtpvDx *vtpv_dx_open(const char *gpu, const char *api, VtpvDxCodec codec,
                      const uint8_t *cfg, uint32_t cfg_len, VtpvDxOut out, void *opaque)
 {
     static const enum AVCodecID ids[] = { AV_CODEC_ID_H264, AV_CODEC_ID_HEVC, AV_CODEC_ID_VP9, AV_CODEC_ID_AV1 };
+    int cuda = api && strcmp(api, "cuda") == 0;
+    int soft = api && strcmp(api, "sw") == 0;
+    int d3d12 = !cuda && !soft && !(api && strcmp(api, "d3d11") == 0);
+    int nv = cuda || (gpu && strcmp(gpu, "nv") == 0);
+    if (cuda || d3d12) {
+        /* a pooled decoder of this stream configuration; drop the expired ones */
+        VtpvDx *hit = NULL, *old[POOL_MAX];
+        int nold = 0;
+        AcquireSRWLockExclusive(&pool_lock);
+        for (int i = 0; i < POOL_MAX; i++) {
+            VtpvDx *p = pool[i];
+            if (!p) continue;
+            if (now_ms(p) - p->pooled_at > POOL_TTL_MS) {
+                old[nold++] = p;
+                pool[i] = NULL;
+            } else if (!hit && p->cuda == cuda && p->d3d12 == d3d12 && p->nv == nv && p->codec == codec &&
+                       p->cfg_len == cfg_len && (!cfg_len || memcmp(p->cfg, cfg, cfg_len) == 0)) {
+                hit = p;
+                pool[i] = NULL;
+            }
+        }
+        ReleaseSRWLockExclusive(&pool_lock);
+        for (int i = 0; i < nold; i++) dx_destroy(old[i]);
+        if (hit) {
+            hit->out = out;
+            hit->opaque = opaque;
+            hit->pipelined = 0;
+            hit->t_parse = hit->t_gpu = 0;
+            hit->npics = 0;
+            hit->pooled_at = 0;
+            return hit;
+        }
+    }
     VtpvDx *d = calloc(1, sizeof(*d));
     if (!d) return NULL;
     QueryPerformanceFrequency(&d->qf);
     d->out = out;
     d->opaque = opaque;
-    d->cuda = api && strcmp(api, "cuda") == 0;
-    d->soft = api && strcmp(api, "sw") == 0;
-    d->d3d12 = !d->cuda && !d->soft && !(api && strcmp(api, "d3d11") == 0);
+    d->cuda = cuda;
+    d->soft = soft;
+    d->d3d12 = d3d12;
+    d->nv = nv;
+    d->codec = codec;
+    if (cfg_len) {
+        d->cfg = malloc(cfg_len);
+        if (!d->cfg) goto fail;
+        memcpy(d->cfg, cfg, cfg_len);
+        d->cfg_len = cfg_len;
+    }
     d->hook = d->d3d12 && (codec == VTPV_DX_H264 || codec == VTPV_DX_HEVC);
     d->hwfmt = d->cuda ? AV_PIX_FMT_CUDA : d->d3d12 ? AV_PIX_FMT_D3D12 : AV_PIX_FMT_D3D11;
     if (d->soft) {
         /* no device: libavcodec's own decoder on this thread */
-    } else if (d->cuda) {
-        /* CUDA numbers its own devices: the first NVIDIA GPU */
-        if (av_hwdevice_ctx_create(&d->hw, AV_HWDEVICE_TYPE_CUDA, "0", NULL, 0) < 0) {
-            fprintf(stderr, "vtpv-dx: cuda device failed (libavcodec without nvdec, or no NVIDIA GPU)\n");
-            goto fail;
+    } else if (d->cuda || d->d3d12) {
+        /* one device per api and GPU for the process (see POOL_MAX) */
+        AcquireSRWLockExclusive(&pool_lock);
+        AVBufferRef **dc = &dev_cache[d->cuda][d->nv];
+        if (!*dc) {
+            if (d->cuda) {
+                /* CUDA numbers its own devices: the first NVIDIA GPU */
+                if (av_hwdevice_ctx_create(dc, AV_HWDEVICE_TYPE_CUDA, "0", NULL, 0) < 0) {
+                    fprintf(stderr, "vtpv-dx: cuda device failed (libavcodec without nvdec, or no NVIDIA GPU)\n");
+                }
+            } else {
+                int ai = adapter_for(d->nv ? 0x10de : 0x8086);
+                char devstr[16];
+                snprintf(devstr, sizeof devstr, "%d", ai);
+                if (ai < 0) {
+                    fprintf(stderr, "vtpv-dx: no %s adapter\n", gpu ? gpu : "int");
+                } else if (av_hwdevice_ctx_create(dc, AV_HWDEVICE_TYPE_D3D12VA, devstr, NULL, 0) < 0) {
+                    fprintf(stderr, "vtpv-dx: d3d12 device on adapter %d failed\n", ai);
+                }
+            }
         }
+        d->hw = *dc ? av_buffer_ref(*dc) : NULL;
+        ReleaseSRWLockExclusive(&pool_lock);
+        if (!d->hw) goto fail;
     } else {
         int ai = adapter_for(gpu && strcmp(gpu, "nv") == 0 ? 0x10de : 0x8086);
         if (ai < 0) { fprintf(stderr, "vtpv-dx: no %s adapter\n", gpu ? gpu : "int"); goto fail; }
         char devstr[16];
         snprintf(devstr, sizeof devstr, "%d", ai);
-        if (av_hwdevice_ctx_create(&d->hw, d->d3d12 ? AV_HWDEVICE_TYPE_D3D12VA : AV_HWDEVICE_TYPE_D3D11VA,
-                                   devstr, NULL, 0) < 0) {
-            fprintf(stderr, "vtpv-dx: %s device on adapter %d failed\n", d->d3d12 ? "d3d12" : "d3d11", ai);
+        if (av_hwdevice_ctx_create(&d->hw, AV_HWDEVICE_TYPE_D3D11VA, devstr, NULL, 0) < 0) {
+            fprintf(stderr, "vtpv-dx: d3d11 device on adapter %d failed\n", ai);
             goto fail;
         }
     }
@@ -517,7 +601,7 @@ VtpvDx *vtpv_dx_open(const char *gpu, const char *api, VtpvDxCodec codec,
     d->sw = av_frame_alloc();
     return d;
 fail:
-    vtpv_dx_close(d);
+    dx_destroy(d);
     return NULL;
 }
 
@@ -575,6 +659,53 @@ void vtpv_dx_stats(const VtpvDx *d, double *ms_parse, double *ms_gpu, int *pictu
 void vtpv_dx_close(VtpvDx *d)
 {
     if (!d) return;
+    if (d->cuda || d->d3d12) {
+        /* to the pool: pictures in flight are dropped (their copies finished
+         * first, nothing writes the slots later), the decoder forgets its
+         * references */
+        for (int i = 0; i < d->npend; i++) av_frame_free(&d->pend[i]);
+        d->npend = 0;
+        if (d->fence && d->q) {
+            ID3D12CommandQueue_Signal(d->q, d->fence, ++d->fv);
+            wait_fv(d, d->fv);
+        }
+        for (int i = 0; i < NSLOT; i++) d->slot[i].busy = 0;
+        avcodec_flush_buffers(d->c);
+        d->out = NULL;
+        d->opaque = NULL;
+        d->pooled_at = now_ms(d);
+        VtpvDx *evict = d;
+        AcquireSRWLockExclusive(&pool_lock);
+        for (int i = 0; i < POOL_MAX && evict; i++) {
+            if (!pool[i]) {
+                pool[i] = d;
+                evict = NULL;
+            }
+        }
+        if (evict) {
+            /* full: the oldest goes */
+            int o = 0;
+            for (int i = 1; i < POOL_MAX; i++) {
+                if (pool[i]->pooled_at < pool[o]->pooled_at) o = i;
+            }
+            evict = pool[o];
+            pool[o] = d;
+        }
+        ReleaseSRWLockExclusive(&pool_lock);
+        if (evict) dx_destroy(evict);
+        return;
+    }
+    dx_destroy(d);
+}
+
+void vtpv_dx_discard(VtpvDx *d)
+{
+    if (d) dx_destroy(d);
+}
+
+static void dx_destroy(VtpvDx *d)
+{
+    if (!d) return;
     ka_stop(d);
     for (int i = 0; i < d->npend; i++) av_frame_free(&d->pend[i]);
     if (d->fence && d->q) {
@@ -596,5 +727,6 @@ void vtpv_dx_close(VtpvDx *d)
     av_packet_free(&d->pkt);
     avcodec_free_context(&d->c);
     av_buffer_unref(&d->hw);
+    free(d->cfg);
     free(d);
 }

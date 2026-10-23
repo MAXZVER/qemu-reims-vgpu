@@ -1404,6 +1404,7 @@ static bool vtpv_dx_decode_sample(AppleVtpv *s, VtpvSess *se, const uint8_t *sam
                                   uint32_t sl, uint64_t tag)
 {
     unsigned cls = vtpv_stream_class(se);
+    int64_t t_in = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     if (!se->dx && se->dx_api == VTPV_API_D3D12) {
         if (vtpv_learned_api[cls]) {
             se->dx_api = vtpv_learned_api[cls] - 1;
@@ -1433,11 +1434,11 @@ static bool vtpv_dx_decode_sample(AppleVtpv *s, VtpvSess *se, const uint8_t *sam
         k->pictures = 0;
         int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         int rc = vtpv_dx_decode(se->dx, sample, sl, (int64_t)tag);
+        int64_t t1 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         fprintf(stderr, "apple-vtpv: HW-DECODE(%s) frame=%llu codec=%d %ux%u pictures=%d "
-                "-> canvas %llu bytes rc=%d %lld us\n", vtpv_api_name[se->dx_api],
+                "-> canvas %llu bytes rc=%d %lld us (open %lld us)\n", vtpv_api_name[se->dx_api],
                 (unsigned long long)tag, se->dx_codec, k->w, k->h, k->pictures,
-                (unsigned long long)k->written, rc,
-                (long long)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t0));
+                (unsigned long long)k->written, rc, (long long)(t1 - t0), (long long)(t0 - t_in));
         if (rc == 0 && k->pictures > 0) {
             vtpv_learned_api[cls] = se->dx_api + 1;
             return true;
@@ -1447,7 +1448,7 @@ static bool vtpv_dx_decode_sample(AppleVtpv *s, VtpvSess *se, const uint8_t *sam
         if (se->dx_codec != VTPV_DX_HEVC || se->dx_api + 1 >= VTPV_API_NONE) {
             return false;
         }
-        vtpv_dx_close(se->dx);
+        vtpv_dx_discard(se->dx);
         se->dx = NULL;
         se->dx_api++;
     }
@@ -1622,9 +1623,9 @@ static bool vtpv_fill_tile(AppleVtpv *s, const VtpvKickSurf *ks, const uint8_t *
 
 /* 'dtil' on the D3D12 decoder, the host's own contract (VideoToolbox's
  * paravirtual host decoder, static read 10-23): DecodeTile writes the tile into
- * the canvas the request carries (surf[0]) at ',opb', the tile is emitted
- * with 'TDem' (',til', ',err', ',inf', ',uui' = the request's surface-group
- * UUID; message flags 2, no reply) and then comes the sync reply ',err' + ',inf'
+ * the canvas the request carries (surf[0]) at ',opb', the sync reply ',err' +
+ * ',inf' answers and the tile is emitted with 'TDem' (',til', ',err', ',inf',
+ * ',uui' = the request's surface-group UUID; message flags 2, no reply)
  * - the guest's tile output handler runs only on 'TDem', so a decode without it
  * leaves the caller (ImageIO's HEIF reader: System Settings > Displays, sips,
  * Photos) waiting for ever. A tile that does not decode gets the error in
@@ -1653,15 +1654,22 @@ static void vtpv_dtil_dx(AppleVtpv *s, int slot, uint64_t total, uint64_t tile_i
     int32_t be_err = cpu_to_be32(err);
     uint32_t be_inf = 0;
     /*
-     * The order is the host's: its VideoToolbox tile decoder emits the tile
-     * from inside DecodeTile, so 'TDem' goes out before the sync reply and the
-     * guest runs the tile's output handler while ImageIO's DecodeTile still
-     * waits. A 'TDem' after the reply met a session ImageIO had already
-     * invalidated ('dinv' right after the reply) - CMPhoto's handler on freed
-     * state (TV crashed in CVBufferSetAttachment). A tile that did not decode
-     * gets only the reply with its error; the guest emits it itself then.
+     * The reply first, with kVTDecodeInfo_Asynchronous when a 'TDem' follows,
+     * then the 'TDem' - the order of the host's asynchronous decoder, whose
+     * emit comes after DecodeTile returned. The guest runs replies and our
+     * messages on one serial queue ("...paravirtualization.guest"): a 'TDem'
+     * ahead of the reply put the reply behind CMPhoto's tile handler (up to
+     * 70 ms), the reply clerk timed DecodeTile out (-19093), CMPhoto dropped
+     * the image and the handler of a later tile met its freed state (TV and
+     * Weather, 23v). A tile that did not decode gets only the reply with its
+     * error; the guest emits it itself then.
      */
+    uint32_t be_inf_reply = cpu_to_be32(err ? 0 : 1);
+    n += vtpv_para_put(paras + n, 0x2c657272u /* ',err' */, "=s32", &be_err, 4);
+    n += vtpv_para_put(paras + n, 0x2c696e66u /* ',inf' */, "=u32", &be_inf_reply, 4);
+    vtpv_send_h2g2(s, slot, 0x6474696cu /* 'dtil' */, 4, s->msg + 0x10, s->msg + 0x20, paras, n);
     if (!err) {
+        n = 0;
         uint64_t be_til = cpu_to_be64(tile_id);
         n += vtpv_para_put(paras + n, 0x2c74696cu /* ',til' */, "=s64", &be_til, 8);
         n += vtpv_para_put(paras + n, 0x2c657272u /* ',err' */, "=s32", &be_err, 4);
@@ -1674,16 +1682,6 @@ static void vtpv_dtil_dx(AppleVtpv *s, int slot, uint64_t total, uint64_t tile_i
         stq_be_p(id8, s->host_msg_id);
         vtpv_send_h2g2(s, slot, 0x5444656du /* 'TDem' */, 2, s->msg + 0x10, id8, paras, n);
     }
-    /* kVTDecodeInfo_Asynchronous on the reply of a tile whose 'TDem' is under
-     * way: with 0 ImageIO took the tile as done at DecodeTile's return and
-     * invalidated the session ('dinv' 0.5 ms after the reply) while the guest's
-     * queue had not run the 'TDem' handler yet - CMPhoto's handler then met
-     * freed state (TV, Weather, Maps crashed in it, 23u smoke). */
-    uint32_t be_inf_reply = cpu_to_be32(err ? 0 : 1);
-    n = 0;
-    n += vtpv_para_put(paras + n, 0x2c657272u /* ',err' */, "=s32", &be_err, 4);
-    n += vtpv_para_put(paras + n, 0x2c696e66u /* ',inf' */, "=u32", &be_inf_reply, 4);
-    vtpv_send_h2g2(s, slot, 0x6474696cu /* 'dtil' */, 4, s->msg + 0x10, s->msg + 0x20, paras, n);
     if (s->verbose) {
         fprintf(stderr, "apple-vtpv: tile %llu -> canvas %u (%.4s) at %u,%u err=%d%s\n",
                 (unsigned long long)tile_id, ks->id, (const char *)&ks->pixfmt, ox, oy, err,

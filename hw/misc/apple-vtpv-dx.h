@@ -68,6 +68,14 @@ void vtpv_dx_flush(VtpvDx *d);
 /* Average milliseconds per picture: CPU time in libavcodec, GPU wait+copy */
 void vtpv_dx_stats(const VtpvDx *d, double *ms_parse, double *ms_gpu, int *pictures);
 
+/* The session is done with the decoder.  A GPU decoder goes to a small pool
+ * and the next vtpv_dx_open() of the same api, GPU, codec and configuration
+ * record takes it back flushed (every HEIF tile comes in its own decoder
+ * session); pictures still in flight are dropped, the callback never runs
+ * again for this caller. */
 void vtpv_dx_close(VtpvDx *d);
+
+/* Close for good: a decoder that refused its stream. */
+void vtpv_dx_discard(VtpvDx *d);
 
 #endif /* HW_MISC_APPLE_VTPV_DX_H */
