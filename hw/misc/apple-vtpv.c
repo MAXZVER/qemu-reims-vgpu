@@ -243,11 +243,17 @@ struct AppleVtpv {
     bool ob_first;                  /* this dfrm's picture was decoded in place (stream start) */
     uint64_t host_msg_id;
     uint64_t h2g_renotify;          /* stalled host->guest queues notified again */
+    int64_t kick_open_us;           /* CLIENT_ID write that opened the kext's register sequence */
+    /* 'TDem's waiting tdem_delay_us after their 'dtil' reply (vtpv_tdem_*) */
+    QEMUTimer *tdem_timer;
+    GQueue tdem_q;
+    uint32_t tdem_delay_us;
     /* outbuf=on: the app's own output buffers - each decoded picture is held
      * until the guest answers our 'Dbuf' with a pool buffer (its IOSurface
      * attached), then written into that surface and completed by 'Demt' */
     bool outbuf;
     bool decthread;                 /* decode ahead on the decode thread (A/B: off = at the reply) */
+    bool tiles;                     /* off: refuse tile sessions ('dsts'), the guest decodes HEIF itself */
     uint64_t surfdesc_gpa;          /* VTPV_SURFDESC of the next kick */
     VtpvKickSurf ksurf[5];
     uint32_t nksurf;
@@ -437,6 +443,8 @@ static bool vtpv_outbox_flush(AppleVtpv *s, int slot)
  * VTPV_STALL_MS (a pump that stopped at an undispatchable message), at most
  * VTPV_STALL_TRIES times without progress (a client that died); true while
  * the queue holds entries */
+static void vtpv_log4cc(char out[5], uint32_t v);
+
 static bool vtpv_h2g_watch(AppleVtpv *s, int slot, int64_t now)
 {
     AppleVtpvSlot *sl = &s->slot[slot];
@@ -446,8 +454,9 @@ static bool vtpv_h2g_watch(AppleVtpv *s, int slot, int64_t now)
                         MEMTXATTRS_UNSPECIFIED)) {
         return false;
     }
-    uint32_t head = le32_to_cpu(h.head), tail = le32_to_cpu(h.tail);
-    if (head == tail) {
+    uint32_t head = le32_to_cpu(h.head), tail = le32_to_cpu(h.tail), qs = le32_to_cpu(h.queue_size);
+    if (head == tail || qs + sizeof(h) > sl->h2g_len || head > qs || tail > qs) {
+        /* empty, or no queue there any more (a client that went: its pages hold anything) */
         sl->stall_tries = 0;
         return false;
     }
@@ -459,8 +468,15 @@ static bool vtpv_h2g_watch(AppleVtpv *s, int slot, int64_t now)
         sl->seen_ms = now;
         sl->stall_tries++;
         s->h2g_renotify++;
-        fprintf(stderr, "apple-vtpv: slot%d h2g head %u tail %u untouched %d ms - notify again (%d)\n",
-                slot, head, tail, VTPV_STALL_MS, sl->stall_tries);
+        uint8_t e[4 + 0x30] = { 0 };
+        dma_memory_read(pci_get_address_space(PCI_DEVICE(s)), sl->h2g_gpa + sizeof(h) + head, e,
+                        MIN(sizeof(e), (size_t)(qs - head)), MEMTXATTRS_UNSPECIFIED);
+        char t4[5];
+        vtpv_log4cc(t4, ldl_be_p(e + 4 + 8));
+        fprintf(stderr, "apple-vtpv: slot%d h2g head %u tail %u qsize %u untouched %d ms - notify again (%d); "
+                "head entry size %u type %s flags %#x uuid %02x%02x%02x%02x id %llu\n",
+                slot, head, tail, qs, VTPV_STALL_MS, sl->stall_tries, ldl_le_p(e), t4, ldl_be_p(e + 4 + 12),
+                e[4 + 16], e[4 + 17], e[4 + 18], e[4 + 19], (unsigned long long)ldq_be_p(e + 4 + 32));
         vtpv_raise(s, slot);
     }
     return sl->stall_tries < VTPV_STALL_TRIES;
@@ -1126,6 +1142,8 @@ static uint32_t vtpv_sess_waiting(const VtpvSess *se)
     return n;
 }
 
+static void vtpv_tdem_flush(AppleVtpv *s, const uint8_t *uuid16, bool drop);
+
 static void vtpv_sess_drop(AppleVtpv *s, const uint8_t *uuid16)
 {
     for (int i = 0; i < VTPV_SESS; i++) {
@@ -1137,6 +1155,7 @@ static void vtpv_sess_drop(AppleVtpv *s, const uint8_t *uuid16)
             vtpv_sess_free(s, se);
         }
     }
+    vtpv_tdem_flush(s, uuid16, true);
     /* what still waits for room and names the UUID would reach a guest that
      * no longer dispatches it, and its pump stops at such a message */
     for (int i = 0; i < VTPV_MAX_SLOT; i++) {
@@ -1684,6 +1703,64 @@ static bool vtpv_fill_tile(AppleVtpv *s, const VtpvKickSurf *ks, const uint8_t *
     return true;
 }
 
+/*
+ * 'TDem' after a pause. CMPhoto's tile handler reads state its DecodeTile
+ * caller sets up after DecodeTile returns: a host's asynchronous decoder
+ * emits a decode time later, ours had the picture before the reply and the
+ * handler ran beside the returning caller (TV, Weather, Maps, Podcasts: the
+ * handler on a garbage pixel buffer or dictionary, ~1 s after launch, with
+ * 'TDem' before the reply as well as right after it). A session's waiting
+ * 'TDem's go out before anything that ends its tiles ('dtfi', 'dinv',
+ * '-dec') is answered, and with its UUID when that goes.
+ */
+typedef struct {
+    int slot;
+    int64_t due_us;
+    uint8_t uuid16[16];
+    uint32_t n;
+    uint8_t paras[96];
+} VtpvTdem;
+
+static void vtpv_tdem_send(AppleVtpv *s, VtpvTdem *t)
+{
+    uint8_t id8[8];
+    s->host_msg_id++;
+    stq_be_p(id8, s->host_msg_id);
+    vtpv_send_h2g2(s, t->slot, 0x5444656du /* 'TDem' */, 2, t->uuid16, id8, t->paras, t->n);
+}
+
+static void vtpv_tdem_tick(void *opaque)
+{
+    AppleVtpv *s = opaque;
+    int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    VtpvTdem *t;
+    while ((t = g_queue_peek_head(&s->tdem_q)) && t->due_us <= now) {
+        g_queue_pop_head(&s->tdem_q);
+        vtpv_tdem_send(s, t);
+        g_free(t);
+    }
+    if (t) {
+        timer_mod(s->tdem_timer, t->due_us);
+    }
+}
+
+/* send (or with drop, forget) the waiting 'TDem's of one session, oldest first */
+static void vtpv_tdem_flush(AppleVtpv *s, const uint8_t *uuid16, bool drop)
+{
+    for (GList *l = s->tdem_q.head; l;) {
+        GList *next = l->next;
+        VtpvTdem *t = l->data;
+        if (memcmp(t->uuid16, uuid16, 16) == 0) {
+            g_queue_delete_link(&s->tdem_q, l);
+            if (!drop) {
+                vtpv_tdem_send(s, t);
+            }
+            g_free(t);
+        }
+        l = next;
+    }
+}
+
 /* 'dtil' on the D3D12 decoder, the host's own contract (VideoToolbox's
  * paravirtual host decoder, static read 10-23): DecodeTile writes the tile into
  * the canvas the request carries (surf[0]) at ',opb', the sync reply ',err' +
@@ -1740,10 +1817,21 @@ static void vtpv_dtil_dx(AppleVtpv *s, int slot, uint64_t total, uint64_t tile_i
         if (uui) {
             n += vtpv_para_put(paras + n, 0x2c757569u /* ',uui' */, "=uui", uui, 16);
         }
-        s->host_msg_id++;
-        uint8_t id8[8];
-        stq_be_p(id8, s->host_msg_id);
-        vtpv_send_h2g2(s, slot, 0x5444656du /* 'TDem' */, 2, s->msg + 0x10, id8, paras, n);
+        VtpvTdem *t = g_new0(VtpvTdem, 1);
+        t->slot = slot;
+        memcpy(t->uuid16, s->msg + 0x10, 16);
+        memcpy(t->paras, paras, n);
+        t->n = n;
+        if (!s->tdem_delay_us) {
+            vtpv_tdem_send(s, t);
+            g_free(t);
+        } else {
+            t->due_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) + s->tdem_delay_us;
+            g_queue_push_tail(&s->tdem_q, t);
+            if (!timer_pending(s->tdem_timer)) {
+                timer_mod(s->tdem_timer, t->due_us);
+            }
+        }
     }
     if (s->verbose) {
         fprintf(stderr, "apple-vtpv: tile %llu -> canvas %u (%.4s) at %u,%u err=%d%s\n",
@@ -1782,6 +1870,11 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
     s->cur = vtpv_sess_get(s, s->msg + 0x10);
     char t4[5];
     vtpv_log4cc(t4, type);
+    if (type == 0x64746669u /* 'dtfi' */ || type == 0x64696e76u /* 'dinv' */) {
+        vtpv_tdem_flush(s, s->msg + 0x10, false);   /* its tiles out before the answer */
+    } else if (type == 0x2d646563u /* '-dec' */) {
+        vtpv_tdem_flush(s, s->msg + 0x10, true);    /* the decoder is gone */
+    }
 
     FILE *f = s->msglog ? fopen(s->msglog, "a") : NULL;
     if (f) {
@@ -2519,6 +2612,13 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
         if (patch_type) {
             memcpy(rep + 8, s->msg + 8, 4);         /* echo the request's 4CC type */
         }
+        if (!s->tiles && type == 0x64737473u /* 'dsts' */ && reply_tpl == vtpv_tpl_generic &&
+            rlen == (long)sizeof(vtpv_tpl_generic)) {
+            /* tiles=off: StartTileSession fails (kVTCouldNotFindVideoDecoderErr,
+             * ',err' of the generic template at 0x54); ImageIO decodes the
+             * HEIF itself */
+            stl_be_p(rep + 0x54, (uint32_t)-12906);
+        }
         vtpv_dq_push(s, slot, rep, rlen);
         vtpv_raise(s, slot);
         g_free(rep);
@@ -2748,6 +2848,7 @@ static void vtpv_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned si
         if (val < VTPV_MAX_SLOT) {
             s->client_id = val;
         }
+        s->kick_open_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);  /* the kext's locked sequence starts */
         break;
     case VTPV_G2H_GPA ... VTPV_G2H_LEN + 4:
     case VTPV_H2G_GPA ... VTPV_H2G_LEN + 4:
@@ -2785,7 +2886,13 @@ static void vtpv_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned si
                         s->client_id, (long long)val);
             }
             if (val == 2) {
+                int64_t d0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
                 vtpv_sess_drop(s, uuid);    /* the guest session is gone */
+                int64_t d1 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+                if (d1 - d0 > 5000) {
+                    fprintf(stderr, "apple-vtpv: slot%d long uuid drop %lld us\n", s->client_id,
+                            (long long)(d1 - d0));
+                }
             }
         }
         break;
@@ -2805,10 +2912,27 @@ static void vtpv_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned si
         for (int i = 0; i < 5; i++) {
             nsurf += sl->surf[i] != 0;
         }
+        int64_t k0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         vtpv_load_surfdesc(s);
+        int64_t k1 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         vtpv_handle_message(s, s->client_id, val, nsurf);
+        int64_t k2 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         vtpv_drop_surfdesc(s);
         memset(sl->surf, 0, sizeof(sl->surf));
+        if (s->kick_open_us && k0 - s->kick_open_us > 20000) {
+            /* the kext's register writes before the kick, under its spin lock:
+             * each one an MMIO exit that waits for the BQL */
+            fprintf(stderr, "apple-vtpv: slot%d slow kick prologue %lld us\n", s->client_id,
+                    (long long)(k0 - s->kick_open_us));
+        }
+        if (k2 - k0 > 20000) {
+            /* the guest kext holds a spin lock for the whole kick: every other
+             * caller of the device - and its user lock chain - waits that long */
+            char t5[5];
+            vtpv_log4cc(t5, ldl_be_p(s->msg + 8));
+            fprintf(stderr, "apple-vtpv: slot%d long kick %.4s %lld us (surfdesc %lld us)\n",
+                    s->client_id, t5, (long long)(k2 - k0), (long long)(k1 - k0));
+        }
         break;
     }
     case VTPV_SURFDESC ... VTPV_SURFDESC + 7:
@@ -3239,6 +3363,8 @@ static void vtpv_realize(PCIDevice *dev, Error **errp)
     qemu_thread_create(&s->dec_thread, "vtpv-decode", vtpv_dec_thread, s,
                        QEMU_THREAD_DETACHED);
     s->outbox_timer = timer_new_ms(QEMU_CLOCK_REALTIME, vtpv_outbox_tick, s);
+    s->tdem_timer = timer_new_us(QEMU_CLOCK_REALTIME, vtpv_tdem_tick, s);
+    g_queue_init(&s->tdem_q);
 
     fprintf(stderr, "apple-vtpv: realized v3 transport (msi+intx), msglog=%s verbose=%u "
             "hwbackend=%s\n", s->msglog ? s->msglog : "(stderr)", s->verbose,
@@ -3276,11 +3402,13 @@ static const Property vtpv_properties[] = {
     DEFINE_PROP_BOOL("mock_demt", AppleVtpv, mock_demt, false),
     DEFINE_PROP_BOOL("outbuf", AppleVtpv, outbuf, true),
     DEFINE_PROP_BOOL("decthread", AppleVtpv, decthread, true),
+    DEFINE_PROP_BOOL("tiles", AppleVtpv, tiles, true),
     DEFINE_PROP_BOOL("writeback", AppleVtpv, writeback, true),
     DEFINE_PROP_BOOL("hwdecode", AppleVtpv, hwdecode, true),
     DEFINE_PROP_STRING("decgpu", AppleVtpv, dec_gpu_str),
     DEFINE_PROP_STRING("hwbackend", AppleVtpv, hwbackend_str),
     DEFINE_PROP_UINT32("verbose", AppleVtpv, verbose, 1),
+    DEFINE_PROP_UINT32("tdem-delay-us", AppleVtpv, tdem_delay_us, 0),
 };
 
 static void vtpv_class_init(ObjectClass *klass, const void *data)
