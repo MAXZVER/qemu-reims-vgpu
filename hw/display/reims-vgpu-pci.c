@@ -194,6 +194,15 @@ struct ReimsVGPUPCIState {
     bool shutdown_notifier_registered;
 };
 
+/*
+ * RAM-only, as the shim's read_gpa: a child ring's tail GPA is programmed by the
+ * guest, and one placed on a device register would otherwise make a doorbell
+ * write perform that device's MMIO read (read-to-clear side effects included).
+ */
+static const MemTxAttrs reims_vgpu_pci_ram_attrs = {
+    .memory = true,
+};
+
 /* ---------- HostOps (GPA R/W + BH; Linux has no map_pages / xreg) ---------- */
 
 static int reims_vgpu_pci_read_xreg(void *ctx, uint32_t index, uint64_t *out)
@@ -975,7 +984,7 @@ static void reims_vgpu_pci_peek_tails(ReimsVGPUPCIState *s)
         uint64_t gpa = reims_vgpu_qemu_child_tail_gpa(s->rust_handle, ch);
         uint32_t tail;
 
-        if (!gpa || address_space_read(&address_space_memory, gpa, MEMTXATTRS_UNSPECIFIED,
+        if (!gpa || address_space_read(&address_space_memory, gpa, reims_vgpu_pci_ram_attrs,
                                        &tail, 4) != MEMTX_OK) {
             continue;
         }
@@ -1146,6 +1155,23 @@ static void reims_vgpu_pci_guest_write_rebase(void *ctx, uint64_t token, const u
 
     if (s->dirty) {
         reims_vgpu_dirty_rebase(s->dirty, token, gpas, count);
+    }
+}
+
+/* HostOps.guest_fence_close / guest_fence_open (TEMP lab LAZY_SYNC). */
+static uint64_t reims_vgpu_pci_guest_fence_close(void *ctx, const uint64_t *gpas, size_t count, size_t page_size)
+{
+    ReimsVGPUPCIState *s = ctx;
+
+    return s->dirty ? reims_vgpu_dirty_fence_close(s->dirty, gpas, count, page_size) : 0;
+}
+
+static void reims_vgpu_pci_guest_fence_open(void *ctx, uint64_t token)
+{
+    ReimsVGPUPCIState *s = ctx;
+
+    if (s->dirty) {
+        reims_vgpu_dirty_fence_open(s->dirty, token);
     }
 }
 
@@ -1630,7 +1656,7 @@ static void reims_vgpu_pci_gfx_write(void *opaque, hwaddr offset, uint64_t data,
 
             if (tail_gpa &&
                 address_space_read(&address_space_memory, tail_gpa,
-                                   MEMTXATTRS_UNSPECIFIED, &db_tail, 4) == MEMTX_OK) {
+                                   reims_vgpu_pci_ram_attrs, &db_tail, 4) == MEMTX_OK) {
                 db_tail = le32_to_cpu(db_tail);
                 db_tail_ok = true;
             }
@@ -1738,18 +1764,23 @@ static void reims_vgpu_pci_stop_backend(ReimsVGPUPCIState *s)
         }
         s->harvest_started = false;
     }
-    if (s->action_bh) {
-        qemu_bh_delete(s->action_bh);
-        s->action_bh = NULL;
-    }
     if (s->rust_handle != 0) {
         /*
          * Close + join the host window first (no-op if none): its Vulkan
          * objects tear down on the window thread before we proceed, so the
          * process/driver-unload teardown never races live Vulkan work (the
          * libnvidia-eglcore crash class the drain teardown already guards).
+         * Before the action BH goes, too: the window's input sink schedules
+         * that BH (HostOps.notify_actions) until its thread is joined, and a
+         * close with the pointer still moving reached a deleted BH.
          */
         reims_vgpu_qemu_window_stop(s->rust_handle);
+    }
+    if (s->action_bh) {
+        qemu_bh_delete(s->action_bh);
+        s->action_bh = NULL;
+    }
+    if (s->rust_handle != 0) {
         reims_vgpu_qemu_device_destroy(s->rust_handle);
         s->rust_handle = 0;
     }
@@ -1890,6 +1921,8 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
         .guest_write_gen = reims_vgpu_pci_guest_write_gen,
         .guest_written_pages = reims_vgpu_pci_guest_written_pages,
         .page_alias_census = reims_vgpu_pci_page_alias_census,
+        .guest_fence_close = reims_vgpu_pci_guest_fence_close,
+        .guest_fence_open = reims_vgpu_pci_guest_fence_open,
     };
     s->dirty = reims_vgpu_dirty_new();
 

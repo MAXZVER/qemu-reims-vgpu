@@ -1629,10 +1629,13 @@ static void reims_vgpu_dirty_tab_del(ReimsVgpuDirty *d, uint64_t token)
     }
 }
 
+static void reims_fence_install(void);   /* TEMP lab LAZY_SYNC */
+
 ReimsVgpuDirty *reims_vgpu_dirty_new(void)
 {
     ReimsVgpuDirty *d = g_new0(ReimsVgpuDirty, 1);
 
+    reims_fence_install();
     qemu_mutex_init(&d->lock);
     qemu_mutex_init(&d->sets_lock);
     /*
@@ -2099,10 +2102,20 @@ uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
     }
 
     pages = g_new(uint64_t, count);
+    n = 1;   /* stays 1 while the list is already ascending */
     for (i = 0; i < count; i++) {
         pages[i] = gpas[i] & ~((uint64_t)page_size - 1);
+        if (i && pages[i] < pages[i - 1]) {
+            n = 0;
+        }
     }
-    qsort(pages, count, sizeof(*pages), reims_vgpu_dirty_cmp_u64);
+    /*
+     * TEMP lab (Opus 2026-10-23): a surface's page list is usually ascending already (a 5K WebGL canvas is one
+     * contiguous run, 10350 pages); ucrt's qsort does not notice and was 3.3 % of the drain in b994's webgl.
+     */
+    if (!n) {
+        qsort(pages, count, sizeof(*pages), reims_vgpu_dirty_cmp_u64);
+    }
     n = 0;
     for (i = 0; i < count; i++) {
         if (n == 0 || pages[n - 1] != pages[i]) {
@@ -2341,6 +2354,303 @@ static int reims_vgpu_dirty_cmp_run(gconstpointer a, gconstpointer b);
 enum { WP_CAUSE_PROTECT, WP_CAUSE_FAULT, WP_CAUSE_ORPHAN, WP_CAUSE_DROP, WP_CAUSE_OTHER };
 static __thread int reims_wp_cause = WP_CAUSE_OTHER;
 
+/*
+ * TEMP lab LAZY_SYNC (Opus 10-21): fences. The device takes a frame's guest pages away from the guest (no access at
+ * all) while it lands the frame there through its own mapping, after it already completed the guest's synchronize;
+ * a vCPU touching them waits in `reims_fence_fault` until the landing gives them back. The guest therefore never
+ * observes the pages before the frame is in them - the synchronize's contract - and nobody waits when nobody looks
+ * (b948: the WebGL canvas is synchronized every frame and re-backed on fresh pages ~5-20 ms later, unread).
+ *
+ * A fence is registered (closed) before its remaps and removed (open) after them, under `reims_fence_lock`, so an
+ * exit on a page mid-remap always finds it. Lock order: `wp_mutex` (when DIRTY_WP runs) before `reims_fence_lock`.
+ * DIRTY_WP keeps its `wp_bits` meaning "read-only for the guest": a protect or release that meets a fenced page
+ * skips only the hypervisor call, and the open re-protects what the bits hold read-only.
+ */
+typedef struct ReimsFence {
+    uint64_t token;
+    uint64_t *runs;   /* {gpa, size} pairs */
+    size_t nruns;
+    /*
+     * Per run, its host mapping and ram_addr, looked up at the close (the drain, under QEMU's RCU): the open runs on
+     * the device's landing thread, which is not, and must not walk a flat view a concurrent MMIO remap may free.
+     */
+    void **mem;
+    uint64_t *ram;
+} ReimsFence;
+
+static void reims_fence_free(ReimsFence *f)
+{
+    g_free(f->runs);
+    g_free(f->mem);
+    g_free(f->ram);
+    g_free(f);
+}
+
+static QemuMutex reims_fence_lock;
+static QemuCond reims_fence_cond;
+static GPtrArray *reims_fences;   /* closed fences */
+static int reims_fence_closed;    /* atomic: how many */
+static uint64_t reims_fence_next = 1;
+/* TEMP lab: one line a second while fences run. */
+static uint64_t reims_fence_n_close, reims_fence_n_refused, reims_fence_n_pages, reims_fence_n_trap, reims_fence_trap_ns,
+                reims_fence_trap_max_ns, reims_fence_n_stuck, reims_fence_n_wp_skip, reims_fence_n_runs,
+                reims_fence_close_ns, reims_fence_close_max_ns, reims_fence_open_ns, reims_fence_open_max_ns;
+static int64_t reims_fence_line_ns;
+/* [lo, hi) over every closed fence's runs, for the DMA hook's lock-free reject. `reims_fence_lock` writes them. */
+static uint64_t reims_fence_lo, reims_fence_hi;
+static uint64_t reims_fence_n_dma;
+/* Set while QEMU remaps guest RAM: no fence closes (see whpx_fence_remap_guard_hook). `reims_fence_lock`. */
+static bool reims_fence_blocked;
+
+static void reims_fence_init(void)
+{
+    static gsize once;
+
+    if (g_once_init_enter(&once)) {
+        qemu_mutex_init(&reims_fence_lock);
+        qemu_cond_init(&reims_fence_cond);
+        reims_fences = g_ptr_array_new();
+        g_once_init_leave(&once, 1);
+    }
+}
+
+/* The closed fence holding `gpa`, or NULL. `reims_fence_lock` held. */
+static ReimsFence *reims_fence_find_locked(uint64_t gpa)
+{
+    guint i;
+    size_t r;
+
+    for (i = 0; i < reims_fences->len; i++) {
+        ReimsFence *f = g_ptr_array_index(reims_fences, i);
+
+        for (r = 0; r < f->nruns; r++) {
+            if (gpa >= f->runs[2 * r] && gpa < f->runs[2 * r] + f->runs[2 * r + 1]) {
+                return f;
+            }
+        }
+    }
+    return NULL;
+}
+
+static bool reims_fence_page_closed(uint64_t gpa)
+{
+    bool closed;
+
+    if (!qatomic_read(&reims_fence_closed)) {
+        return false;
+    }
+    qemu_mutex_lock(&reims_fence_lock);
+    closed = reims_fence_find_locked(gpa) != NULL;
+    qemu_mutex_unlock(&reims_fence_lock);
+    return closed;
+}
+
+/* The closed fence with this token, or NULL. `reims_fence_lock` held. */
+static ReimsFence *reims_fence_by_token_locked(uint64_t token)
+{
+    guint i;
+
+    for (i = 0; i < reims_fences->len; i++) {
+        ReimsFence *f = g_ptr_array_index(reims_fences, i);
+
+        if (f->token == token) {
+            return f;
+        }
+    }
+    return NULL;
+}
+
+/* TEMP lab: add one close's or open's wall time to its sum and max (the drain pays the close, reims-land the open). */
+static void reims_fence_note_ns(uint64_t *sum, uint64_t *max, int64_t ns)
+{
+    uint64_t was;
+
+    qatomic_add(sum, (uint64_t)ns);
+    for (was = qatomic_read(max); (uint64_t)ns > was;) {
+        uint64_t seen = qatomic_cmpxchg(max, was, (uint64_t)ns);
+
+        if (seen == was) {
+            break;
+        }
+        was = seen;
+    }
+}
+
+static void reims_fence_line(void)
+{
+    int64_t now = get_clock(), was = qatomic_read(&reims_fence_line_ns);
+
+    if (now - was < NANOSECONDS_PER_SECOND || qatomic_cmpxchg(&reims_fence_line_ns, was, now) != was) {
+        return;
+    }
+    fprintf(stderr, "reims-fence closes=%" PRIu64 " pages=%" PRIu64 " refused=%" PRIu64 " traps=%" PRIu64
+            " trap_us=%" PRIu64 " trap_max_us=%" PRIu64 " wp_skips=%" PRIu64 " dma_waits=%" PRIu64 " stuck=%" PRIu64
+            " runs=%" PRIu64 " close_us=%" PRIu64 " close_max_us=%" PRIu64 " open_us=%" PRIu64 " open_max_us=%" PRIu64 "\n",
+            qatomic_xchg(&reims_fence_n_close, 0), qatomic_xchg(&reims_fence_n_pages, 0),
+            qatomic_xchg(&reims_fence_n_refused, 0), qatomic_xchg(&reims_fence_n_trap, 0),
+            qatomic_xchg(&reims_fence_trap_ns, 0) / 1000, qatomic_xchg(&reims_fence_trap_max_ns, 0) / 1000,
+            qatomic_xchg(&reims_fence_n_wp_skip, 0), qatomic_xchg(&reims_fence_n_dma, 0),
+            qatomic_read(&reims_fence_n_stuck), qatomic_xchg(&reims_fence_n_runs, 0),
+            qatomic_xchg(&reims_fence_close_ns, 0) / 1000, qatomic_xchg(&reims_fence_close_max_ns, 0) / 1000,
+            qatomic_xchg(&reims_fence_open_ns, 0) / 1000, qatomic_xchg(&reims_fence_open_max_ns, 0) / 1000);
+}
+
+/* Recompute the span the DMA hook rejects against. `reims_fence_lock` held. */
+static void reims_fence_span_locked(void)
+{
+    uint64_t lo = UINT64_MAX, hi = 0;
+    guint i;
+    size_t r;
+
+    for (i = 0; i < reims_fences->len; i++) {
+        ReimsFence *f = g_ptr_array_index(reims_fences, i);
+
+        for (r = 0; r < f->nruns; r++) {
+            lo = MIN(lo, f->runs[2 * r]);
+            hi = MAX(hi, f->runs[2 * r] + f->runs[2 * r + 1]);
+        }
+    }
+    qatomic_set(&reims_fence_lo, lo);
+    qatomic_set(&reims_fence_hi, hi);
+}
+
+/* Remove a closed fence and wake its waiters. `reims_fence_lock` held. */
+static void reims_fence_drop_locked(ReimsFence *f)
+{
+    g_ptr_array_remove_fast(reims_fences, f);
+    qatomic_dec(&reims_fence_closed);
+    reims_fence_span_locked();
+    qemu_cond_broadcast(&reims_fence_cond);
+}
+
+/* Whether a closed fence overlaps [addr, addr+len). `reims_fence_lock` held. */
+static bool reims_fence_overlaps_locked(uint64_t addr, uint64_t len)
+{
+    guint i;
+    size_t r;
+
+    for (i = 0; i < reims_fences->len; i++) {
+        ReimsFence *f = g_ptr_array_index(reims_fences, i);
+
+        for (r = 0; r < f->nruns; r++) {
+            if (addr < f->runs[2 * r] + f->runs[2 * r + 1] && f->runs[2 * r] < addr + len) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/*
+ * TEMP lab LAZY_SYNC: QEMU's own accesses to guest RAM (device DMA, the instruction emulator, this device's reads)
+ * wait for a fence over them too - a page the guest freed after the synchronize and handed to a disk read must not
+ * be overwritten by the landing afterwards, nor read before it. Free when nothing is fenced; one span compare
+ * otherwise. Never past 2 s (a device bug; logged).
+ */
+static void reims_fence_dma_wait(uint64_t addr, uint64_t len)
+{
+    int64_t t0;
+
+    if (!qatomic_read(&reims_fence_closed) || len == 0 ||
+        addr >= qatomic_read(&reims_fence_hi) || addr + len <= qatomic_read(&reims_fence_lo)) {
+        return;
+    }
+    qemu_mutex_lock(&reims_fence_lock);
+    t0 = get_clock();
+    if (reims_fence_overlaps_locked(addr, len)) {
+        qatomic_inc(&reims_fence_n_dma);   /* counted when it waits, not when it looks */
+    }
+    while (reims_fence_overlaps_locked(addr, len)) {
+        if (get_clock() - t0 > 2 * NANOSECONDS_PER_SECOND) {
+            fprintf(stderr, "reims-fence STUCK dma 0x%" PRIx64 "+0x%" PRIx64 "\n", addr, len);
+            qatomic_inc(&reims_fence_n_stuck);
+            break;
+        }
+        qemu_cond_timedwait(&reims_fence_cond, &reims_fence_lock, 100);
+    }
+    qemu_mutex_unlock(&reims_fence_lock);
+}
+
+static void reims_fence_remap_guard(bool begin);
+
+/* Installed with the device, before any fence: QEMU's first RAM remap after a close must already be guarded. */
+static void reims_fence_install(void)
+{
+    reims_fence_init();
+    whpx_fence_remap_guard_hook = reims_fence_remap_guard;
+}
+
+/*
+ * QEMU is about to remap guest RAM (begin) or has (end): the remap maps everything accessible again, so the fences
+ * open first (their copies take milliseconds) and none closes until it is done. With the BQL held; the openers need
+ * neither it nor anything the remap holds.
+ */
+static void reims_fence_remap_guard(bool begin)
+{
+    int64_t t0 = get_clock();
+
+    qemu_mutex_lock(&reims_fence_lock);
+    reims_fence_blocked = begin;
+    while (begin && reims_fences->len) {
+        if (get_clock() - t0 > 2 * NANOSECONDS_PER_SECOND) {
+            fprintf(stderr, "reims-fence STUCK remap guard: %u fences closed\n", reims_fences->len);
+            qatomic_inc(&reims_fence_n_stuck);
+            break;
+        }
+        qemu_cond_timedwait(&reims_fence_cond, &reims_fence_lock, 100);
+    }
+    qemu_mutex_unlock(&reims_fence_lock);
+}
+
+/*
+ * The vCPU exit hook: an access to a fenced page waits for the fence to open, then runs again. A fence closed for
+ * longer than 2 s is a device bug; the pages are given back writable here (DIRTY_WP's read-only pages in it lose
+ * their protection) rather than freeze the guest.
+ */
+static bool reims_fence_fault(uint64_t gpa)
+{
+    ReimsFence *f;
+    uint64_t token, m;
+    int64_t t0, dt;
+
+    if (!qatomic_read(&reims_fence_closed) || gpa >= qatomic_read(&reims_fence_hi) ||
+        gpa < qatomic_read(&reims_fence_lo)) {
+        return false;   /* every MMIO exit passes here: no lock unless the address is in the fenced span */
+    }
+    qemu_mutex_lock(&reims_fence_lock);
+    f = reims_fence_find_locked(gpa);
+    if (!f) {
+        qemu_mutex_unlock(&reims_fence_lock);
+        return false;
+    }
+    token = f->token;
+    t0 = get_clock();
+    while ((f = reims_fence_by_token_locked(token)) != NULL) {
+        if (get_clock() - t0 > 2 * NANOSECONDS_PER_SECOND) {
+            size_t r;
+
+            fprintf(stderr, "reims-fence STUCK token=%" PRIu64 " gpa=0x%" PRIx64 ": giving the pages back\n", token,
+                    gpa);
+            for (r = 0; r < f->nruns; r++) {
+                whpx_fence_remap_at(f->runs[2 * r], f->runs[2 * r + 1], false, f->mem[r], f->ram[r]);
+            }
+            qatomic_inc(&reims_fence_n_stuck);
+            reims_fence_drop_locked(f);   /* not freed: an opener may be reading it (a leak, on a bug path) */
+            break;
+        }
+        qemu_cond_timedwait(&reims_fence_cond, &reims_fence_lock, 100);
+    }
+    qemu_mutex_unlock(&reims_fence_lock);
+    dt = get_clock() - t0;
+    qatomic_inc(&reims_fence_n_trap);
+    qatomic_add(&reims_fence_trap_ns, (uint64_t)dt);
+    while ((m = qatomic_read(&reims_fence_trap_max_ns)) < (uint64_t)dt &&
+           qatomic_cmpxchg(&reims_fence_trap_max_ns, m, (uint64_t)dt) != m) {
+    }
+    reims_fence_line();
+    return true;
+}
+
 static int reims_vgpu_dirty_wp_remap(ReimsVgpuDirty *d, uint64_t gpa, uint64_t size, bool writable)
 {
     const uint64_t step = 1ULL << qemu_target_page_bits();
@@ -2355,7 +2665,46 @@ static int reims_vgpu_dirty_wp_remap(ReimsVgpuDirty *d, uint64_t gpa, uint64_t s
         }
     }
     qatomic_set(&reims_wp_stage, 2);   /* TEMP lab (b461 freeze watch) */
-    rc = whpx_wp_remap(gpa, size, writable);
+    if (!qatomic_read(&reims_fence_closed)) {
+        rc = whpx_wp_remap(gpa, size, writable);
+    } else {
+        /*
+         * TEMP lab LAZY_SYNC: fenced pages keep no access; the fence's open applies what `wp_bits` say. A protect
+         * refused part-way gives the pieces already read-only back, as one refused remap leaves the range writable:
+         * the bits are cleared below for all of it.
+         */
+        uint64_t lo = gpa, ok_end = gpa;
+
+        rc = 0;
+        for (a = gpa; a <= gpa + size && rc == 0; a += step) {
+            bool fenced = a < gpa + size && reims_fence_page_closed(a);
+
+            if (a == gpa + size || fenced) {
+                if (a > lo) {
+                    rc = whpx_wp_remap(lo, a - lo, writable);
+                    if (rc == 0) {
+                        ok_end = a;
+                    }
+                }
+                if (fenced) {
+                    qatomic_inc(&reims_fence_n_wp_skip);
+                }
+                lo = a + step;
+            }
+        }
+        if (rc && !writable) {
+            for (a = gpa, lo = gpa; a <= ok_end; a += step) {
+                bool fenced = a < ok_end && reims_fence_page_closed(a);
+
+                if (a == ok_end || fenced) {
+                    if (a > lo) {
+                        whpx_wp_remap(lo, a - lo, true);
+                    }
+                    lo = a + step;
+                }
+            }
+        }
+    }
     qatomic_set(&reims_wp_stage, 0);
     if (writable || rc) {
         for (a = gpa; a < gpa + size; a += step) {
@@ -2391,6 +2740,210 @@ static int reims_vgpu_dirty_wp_remap(ReimsVgpuDirty *d, uint64_t gpa, uint64_t s
     }
     d->lab_wp_remaps++;
     return rc;
+}
+
+/*
+ * TEMP lab LAZY_SYNC: give a fence's runs back to the guest - writable and tracked, then read-only again where
+ * DIRTY_WP holds pages. `wp_mutex` held when `wp`.
+ */
+static void reims_fence_reopen_runs(ReimsVgpuDirty *d, const ReimsFence *f, size_t nruns, bool wp)
+{
+    const uint64_t pg = 1ULL << qemu_target_page_bits();
+    size_t r;
+
+    for (r = 0; r < nruns; r++) {
+        uint64_t gpa = f->runs[2 * r], end = gpa + f->runs[2 * r + 1], a, b;
+
+        whpx_fence_remap_at(gpa, end - gpa, false, f->mem[r], f->ram[r]);
+        for (a = gpa; wp && a < end; a = b) {
+            if (!reims_vgpu_dirty_wp_ro(d, a)) {
+                b = a + pg;
+                continue;
+            }
+            for (b = a + pg; b < end && reims_vgpu_dirty_wp_ro(d, b); b += pg) {
+            }
+            whpx_wp_remap_at(a, b - a, false, (uint8_t *)f->mem[r] + (a - gpa));
+        }
+    }
+}
+
+static int reims_fence_cmp_u64(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+
+    return x < y ? -1 : x > y;
+}
+
+/*
+ * TEMP lab LAZY_SYNC: fence `count` page-aligned GPAs (ReimsVgpuHostOps.guest_fence_close). 0 when refused: no
+ * hypervisor, more physical runs than REIMS_VGPU_LAB_FENCE_MAX_RUNS (default 64: each run is one remap each way),
+ * or a remap the hypervisor declined.
+ */
+uint64_t reims_vgpu_dirty_fence_close(ReimsVgpuDirty *d, const uint64_t *gpas, size_t count, size_t page_size)
+{
+    static long max_runs = -1;
+    static int said, shape_said;
+    bool wp = d && reims_vgpu_dirty_wp_dev == d;
+    uint64_t *sorted;
+    GArray *runs;
+    ReimsFence *f;
+    size_t i, nruns, done;
+    uint64_t token;
+    int64_t t0 = get_clock();
+
+    reims_fence_init();
+    if (!d || !gpas || count == 0 || page_size == 0 || page_size % 4096) {
+        return 0;
+    }
+    if (max_runs < 0) {
+        const char *e = getenv("REIMS_VGPU_LAB_FENCE_MAX_RUNS");
+
+        max_runs = e ? MAX(1, atol(e)) : 64;
+    }
+    /*
+     * The fence is a set of pages, not a sequence: merge runs over the sorted GPAs. b951a (21k): a 42 MB canvas in
+     * the guest's page order was ~10 350 one-page runs - a close cost 50 ms of the drain, one remap per page.
+     */
+    sorted = g_memdup2(gpas, count * sizeof(uint64_t));
+    qsort(sorted, count, sizeof(uint64_t), reims_fence_cmp_u64);
+    runs = g_array_new(FALSE, FALSE, sizeof(uint64_t));
+    for (i = 0; i < count; i++) {
+        uint64_t *last = runs->len ? &g_array_index(runs, uint64_t, runs->len - 2) : NULL;
+
+        if (last && sorted[i] < last[0] + last[1]) {
+            continue;   /* the same page twice */
+        }
+        if (last && last[0] + last[1] == sorted[i]) {
+            last[1] += page_size;
+        } else {
+            uint64_t pair[2] = { sorted[i], page_size };
+
+            g_array_append_vals(runs, pair, 2);
+        }
+    }
+    nruns = runs->len / 2;
+    if (shape_said < 8) {
+        size_t in_order = 1, down = 0;
+
+        for (i = 1; i < count; i++) {
+            in_order += gpas[i] != gpas[i - 1] + page_size;
+            down += gpas[i] + page_size == gpas[i - 1];
+        }
+        shape_said++;
+        fprintf(stderr, "reims-fence shape pages=%zu runs_in_order=%zu runs_sorted=%zu descending_steps=%zu"
+                " span_pages=%" PRIu64 "\n", count, in_order, nruns, down,
+                (sorted[count - 1] - sorted[0]) / page_size + 1);
+    }
+    g_free(sorted);
+    if ((long)nruns > max_runs) {
+        if (said++ < 8) {
+            fprintf(stderr, "reims-fence refused pages=%zu runs=%zu (max %ld)\n", count, nruns, max_runs);
+        }
+        qatomic_inc(&reims_fence_n_refused);
+        g_array_free(runs, TRUE);
+        reims_fence_line();
+        return 0;
+    }
+    f = g_new0(ReimsFence, 1);
+    f->nruns = nruns;
+    f->runs = (uint64_t *)g_array_free(runs, FALSE);
+    f->mem = g_new0(void *, nruns);
+    f->ram = g_new0(uint64_t, nruns);
+    for (i = 0; i < nruns; i++) {
+        if (whpx_ram_lookup(f->runs[2 * i], f->runs[2 * i + 1], &f->mem[i], &f->ram[i])) {
+            if (said++ < 8) {
+                fprintf(stderr, "reims-fence refused: run 0x%" PRIx64 "+0x%" PRIx64 " is not one RAM region\n",
+                        f->runs[2 * i], f->runs[2 * i + 1]);
+            }
+            reims_fence_free(f);
+            qatomic_inc(&reims_fence_n_refused);
+            return 0;
+        }
+    }
+    if (wp) {
+        reims_wp_lock(d, __LINE__);
+    }
+    qemu_mutex_lock(&reims_fence_lock);
+    if (reims_fence_blocked) {
+        /* QEMU is remapping guest RAM. */
+        qemu_mutex_unlock(&reims_fence_lock);
+        if (wp) {
+            qemu_mutex_unlock(&d->wp_mutex);
+        }
+        reims_fence_free(f);
+        qatomic_inc(&reims_fence_n_refused);
+        return 0;
+    }
+    token = f->token = reims_fence_next++;
+    g_ptr_array_add(reims_fences, f);
+    reims_fence_span_locked();
+    qatomic_inc(&reims_fence_closed);
+    whpx_fence_fault_hook = reims_fence_fault;
+    qemu_lab_ram_fence_hook = reims_fence_dma_wait;
+    qemu_mutex_unlock(&reims_fence_lock);
+    for (done = 0; done < nruns; done++) {
+        if (whpx_fence_remap_at(f->runs[2 * done], f->runs[2 * done + 1], true, f->mem[done], f->ram[done]) != 0) {
+            break;
+        }
+    }
+    if (done < nruns) {
+        reims_fence_reopen_runs(d, f, done, wp);
+        qemu_mutex_lock(&reims_fence_lock);
+        reims_fence_drop_locked(f);
+        qemu_mutex_unlock(&reims_fence_lock);
+        if (wp) {
+            qemu_mutex_unlock(&d->wp_mutex);
+        }
+        if (said++ < 8) {
+            fprintf(stderr, "reims-fence refused pages=%zu runs=%zu: remap %zu declined\n", count, nruns, done);
+        }
+        reims_fence_free(f);
+        qatomic_inc(&reims_fence_n_refused);
+        reims_fence_line();
+        return 0;
+    }
+    if (wp) {
+        qemu_mutex_unlock(&d->wp_mutex);
+    }
+    qatomic_inc(&reims_fence_n_close);
+    qatomic_add(&reims_fence_n_pages, count * (page_size / 4096));
+    qatomic_add(&reims_fence_n_runs, nruns);
+    reims_fence_note_ns(&reims_fence_close_ns, &reims_fence_close_max_ns, get_clock() - t0);
+    reims_fence_line();
+    return token;
+}
+
+/* TEMP lab LAZY_SYNC: open a fence (ReimsVgpuHostOps.guest_fence_open). An unknown token is a no-op. */
+void reims_vgpu_dirty_fence_open(ReimsVgpuDirty *d, uint64_t token)
+{
+    bool wp = d && reims_vgpu_dirty_wp_dev == d;
+    ReimsFence *f;
+    bool mine = false;
+    int64_t t0 = get_clock();
+
+    reims_fence_init();
+    if (wp) {
+        reims_wp_lock(d, __LINE__);
+    }
+    qemu_mutex_lock(&reims_fence_lock);
+    f = reims_fence_by_token_locked(token);
+    qemu_mutex_unlock(&reims_fence_lock);
+    if (f) {
+        reims_fence_reopen_runs(d, f, f->nruns, wp);
+        qemu_mutex_lock(&reims_fence_lock);
+        if (reims_fence_by_token_locked(token) == f) {
+            reims_fence_drop_locked(f);
+        }
+        mine = true;   /* the stuck-guard drops but never frees */
+        qemu_mutex_unlock(&reims_fence_lock);
+    }
+    if (wp) {
+        qemu_mutex_unlock(&d->wp_mutex);
+    }
+    if (mine) {
+        reims_fence_free(f);
+        reims_fence_note_ns(&reims_fence_open_ns, &reims_fence_open_max_ns, get_clock() - t0);
+    }
 }
 
 /*
@@ -6562,7 +7115,7 @@ void reims_vgpu_dirty_sync_tokens(ReimsVgpuDirty *d, const uint64_t *want, size_
 {
     uint64_t qticket;
     const int shift = qemu_target_page_bits();
-    const bool tight = reims_vgpu_dirty_tight_on(d);   /* TEMP lab DIRTY_TIGHT */
+    bool tight;   /* TEMP lab DIRTY_TIGHT; read once `d` is known (Svace NULL_AFTER_DEREF) */
     const uint64_t target = 1ULL << shift;
     ReimsVgpuDirtySlice *slices = NULL;
     int cap = 0, n, i;
@@ -6582,6 +7135,7 @@ void reims_vgpu_dirty_sync_tokens(ReimsVgpuDirty *d, const uint64_t *want, size_
     if (!d || !want || count == 0 || !qatomic_read(&d->ondemand)) {
         return;
     }
+    tight = reims_vgpu_dirty_tight_on(d);
     tl0 = get_clock();
     qemu_mutex_lock(&d->lock);
     d->lab_prep_lock_ns += get_clock() - tl0;

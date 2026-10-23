@@ -51,6 +51,12 @@ uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
 
 /* Release a token. Safe from any thread; a stale or zero token is ignored. */
 void reims_vgpu_dirty_untrack(ReimsVgpuDirty *d, uint64_t token);
+/*
+ * TEMP lab LAZY_SYNC: take `count` page-aligned GPAs away from the guest until reims_vgpu_dirty_fence_open; a vCPU
+ * touching them waits. 0 when refused. Safe from any thread.
+ */
+uint64_t reims_vgpu_dirty_fence_close(ReimsVgpuDirty *d, const uint64_t *gpas, size_t count, size_t page_size);
+void reims_vgpu_dirty_fence_open(ReimsVgpuDirty *d, uint64_t token);
 
 /*
  * Monotonic count of harvests that saw some page of the set written, or 0 for

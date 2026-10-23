@@ -588,14 +588,14 @@ int whpx_populate_write(const uint64_t *ranges, unsigned n)
     return FAILED(hr) ? -2 : 0;
 }
 
-int whpx_wp_remap(uint64_t gpa, uint64_t size, bool writable)
+/*
+ * TEMP lab LAZY_SYNC: the host mapping of writable guest RAM [gpa, gpa+size), one RAM region, as the remaps need it
+ * - looked up once by a caller under QEMU's RCU, so a thread outside it (the device's landing thread) can remap the
+ * same range later through the `_at` forms without a flat-view walk. 0, or -1 when not such RAM.
+ */
+int whpx_ram_lookup(uint64_t gpa, uint64_t size, void **mem, uint64_t *ram_addr)
 {
-    struct whpx_state *whpx = &whpx_global;
     MemoryRegionSection sec = memory_region_find(get_system_memory(), gpa, size);
-    HRESULT hr;
-    void *mem;
-    int64_t t_rm;
-    int rc = 0;
 
     if (!sec.mr) {
         return -1;
@@ -605,8 +605,30 @@ int whpx_wp_remap(uint64_t gpa, uint64_t size, bool writable)
         memory_region_unref(sec.mr);
         return -1;
     }
-    mem = memory_region_get_ram_ptr(sec.mr) + sec.offset_within_region;
+    *mem = memory_region_get_ram_ptr(sec.mr) + sec.offset_within_region;
+    *ram_addr = memory_region_get_ram_addr(sec.mr) + sec.offset_within_region;
     memory_region_unref(sec.mr);
+    return 0;
+}
+
+int whpx_wp_remap(uint64_t gpa, uint64_t size, bool writable)
+{
+    void *mem;
+    uint64_t ram_addr;
+
+    if (whpx_ram_lookup(gpa, size, &mem, &ram_addr)) {
+        return -1;
+    }
+    return whpx_wp_remap_at(gpa, size, writable, mem);
+}
+
+int whpx_wp_remap_at(uint64_t gpa, uint64_t size, bool writable, void *mem)
+{
+    struct whpx_state *whpx = &whpx_global;
+    HRESULT hr;
+    int64_t t_rm;
+    int rc = 0;
+
     t_rm = get_clock();
     qatomic_inc(&whpx_wp_busy);
     {
@@ -686,6 +708,97 @@ done:
 }
 
 /*
+ * TEMP lab LAZY_SYNC (Opus 10-21): a fence. `closed` takes [gpa, gpa+size) away from the guest (no read, write or
+ * execute: an access exits as a memory access, which `whpx_fence_fault_hook` holds until the fence opens); the host
+ * keeps writing it through its own mapping. Closing first moves the range's dirty bits into QEMU's bitmap, as a log
+ * sync would - the remap drops them. `!closed` maps it writable and tracked again (the caller then re-protects what
+ * DIRTY_WP holds read-only). 0, or < 0 when refused - the range is then as it was.
+ */
+bool (*whpx_fence_fault_hook)(uint64_t gpa);
+/* How many ranges are fenced now: a dirty query failing meanwhile is not a reason to stop tracking. */
+static int whpx_fenced;
+
+int whpx_fence_remap(uint64_t gpa, uint64_t size, bool closed)
+{
+    void *mem;
+    uint64_t ram_addr;
+
+    if (whpx_ram_lookup(gpa, size, &mem, &ram_addr)) {
+        return -1;
+    }
+    return whpx_fence_remap_at(gpa, size, closed, mem, ram_addr);
+}
+
+int whpx_fence_remap_at(uint64_t gpa, uint64_t size, bool closed, void *mem, uint64_t ram_addr)
+{
+    struct whpx_state *whpx = &whpx_global;
+    const WHV_MAP_GPA_RANGE_FLAGS open_flags = WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagExecute |
+                                               WHvMapGpaRangeFlagWrite | WHvMapGpaRangeFlagTrackDirtyPages;
+    HRESULT hr;
+    void *hv;
+    int rc = 0;
+
+    if (!QEMU_IS_ALIGNED(gpa | size, 4096)) {
+        return -1;
+    }
+    qatomic_inc(&whpx_wp_busy);
+    if (closed && whpx_dirty_tracking && whp_dispatch.WHvQueryGpaRangeDirtyBitmap) {
+        uint64_t pages = size >> 12, words = DIV_ROUND_UP(pages, 64);
+        g_autofree uint64_t *bm = g_new0(uint64_t, words);
+
+        hr = whp_dispatch.WHvQueryGpaRangeDirtyBitmap(whpx->partition, gpa, size, bm, words * 8);
+        if (FAILED(hr)) {
+            rc = -4;   /* unknown dirty state: do not drop it */
+            goto done;
+        }
+        physical_memory_set_dirty_lebitmap((unsigned long *)bm, ram_addr, pages);
+    }
+    hv = qemu_win_ram_hv_view(mem, size);
+    if (hv != mem) {
+        DWORD old;
+
+        if (!VirtualProtect(hv, size, closed ? PAGE_NOACCESS : PAGE_READWRITE, &old)) {
+            rc = -2;
+        }
+        goto done;
+    }
+    /*
+     * Closed keeps the dirty tracking flag (a query over the slot then still walks these pages, as it walks
+     * DIRTY_WP's read-only ones); a hypervisor that refuses it refuses the fence.
+     */
+    hr = whp_dispatch.WHvMapGpaRange(whpx->partition, mem, gpa, size,
+                                     closed ? WHvMapGpaRangeFlagTrackDirtyPages : open_flags);
+    if (FAILED(hr)) {
+        static int said;
+
+        if (said++ < 4) {
+            fprintf(stderr, "reims-fence: remap %s of 0x%" PRIx64 "+0x%" PRIx64 " refused hr=0x%lx\n",
+                    closed ? "close" : "open", gpa, size, (long)hr);
+        }
+        if (!closed) {
+            /* Never leave guest RAM taken away. */
+            if (FAILED(whp_dispatch.WHvUnmapGpaRange(whpx->partition, gpa, size)) ||
+                FAILED(whp_dispatch.WHvMapGpaRange(whpx->partition, mem, gpa, size, open_flags))) {
+                error_report("WHPX: fence could not give back 0x%" PRIx64, gpa);
+                abort();
+            }
+        }
+        rc = -3;
+    }
+done:
+    if (rc == 0) {
+        if (closed) {
+            qatomic_inc(&whpx_fenced);
+        } else if (qatomic_read(&whpx_fenced) > 0) {
+            qatomic_dec(&whpx_fenced);
+        }
+    }
+    qatomic_inc(&whpx_wp_gen);
+    qatomic_dec(&whpx_wp_busy);
+    return rc;
+}
+
+/*
  * TEMP (lab, n128): the hypervisor fills in its second-level translation for a
  * freshly mapped stretch of guest RAM at once (WHvAdviseGpaRange Populate),
  * instead of one exit per page on the guest's first touch. On by default with
@@ -761,7 +874,29 @@ static void whpx_lab_resident(void *mem, uint64_t size, bool ram)
             lk ? 0UL : GetLastError(), (get_clock() - t0) / 1000000);
 }
 
+static void whpx_set_phys_mem_inner(MemoryRegionSection *section, bool add);
+
+/*
+ * TEMP lab LAZY_SYNC: QEMU remapping guest RAM would map a fenced range accessible again under its landing; the
+ * fences are let out first and no new one closes until the remap is done (`whpx_fence_remap_guard_hook`, set by the
+ * device that fences).
+ */
+void (*whpx_fence_remap_guard_hook)(bool begin);
+
 static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
+{
+    bool guard = whpx_fence_remap_guard_hook && memory_region_is_ram(section->mr);
+
+    if (guard) {
+        whpx_fence_remap_guard_hook(true);
+    }
+    whpx_set_phys_mem_inner(section, add);
+    if (guard) {
+        whpx_fence_remap_guard_hook(false);
+    }
+}
+
+static void whpx_set_phys_mem_inner(MemoryRegionSection *section, bool add)
 {
     struct whpx_state *whpx = &whpx_global;
     MemoryRegion *area = section->mr;
@@ -991,6 +1126,11 @@ static void whpx_log_sync(MemoryListener *listener,
              */
             physical_memory_set_dirty_lebitmap((unsigned long *)bitmap,
                                                ram_addr, pages);
+            return;
+        }
+        if (qatomic_read(&whpx_fenced)) {
+            /* TEMP lab LAZY_SYNC: a fence may be why; this round says "all written", tracking stays on. */
+            memory_region_set_dirty(mr, 0, size);
             return;
         }
         whpx_dirty_tracking_disable("bitmap query failed", hr);
