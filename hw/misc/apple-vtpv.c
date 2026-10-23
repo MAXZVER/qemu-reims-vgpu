@@ -179,6 +179,12 @@ typedef struct AppleVtpvSlot {
      * stops draining while its pool waits for displayed buffers (ox13) and
      * a lost 'dfrm' reply or 'Demt' would strand its session. */
     GQueue outbox;
+    /* the guest's pump drains on a notification and stops at a message it
+     * cannot dispatch; what is left waits for the next one - re-notify a
+     * queue whose head stood still (vtpv_outbox_tick) */
+    uint32_t seen_head;
+    int64_t seen_ms;
+    int stall_tries;
 } AppleVtpvSlot;
 
 struct AppleVtpv {
@@ -236,6 +242,7 @@ struct AppleVtpv {
     uint32_t ob_sample_len;
     bool ob_first;                  /* this dfrm's picture was decoded in place (stream start) */
     uint64_t host_msg_id;
+    uint64_t h2g_renotify;          /* stalled host->guest queues notified again */
     /* outbuf=on: the app's own output buffers - each decoded picture is held
      * until the guest answers our 'Dbuf' with a pool buffer (its IOSurface
      * attached), then written into that surface and completed by 'Demt' */
@@ -423,20 +430,59 @@ static bool vtpv_outbox_flush(AppleVtpv *s, int slot)
     return moved;
 }
 
+#define VTPV_STALL_MS 3
+#define VTPV_STALL_TRIES 20
+
+/* entries the guest has not taken yet: re-notify when its head stood still
+ * VTPV_STALL_MS (a pump that stopped at an undispatchable message), at most
+ * VTPV_STALL_TRIES times without progress (a client that died); true while
+ * the queue holds entries */
+static bool vtpv_h2g_watch(AppleVtpv *s, int slot, int64_t now)
+{
+    AppleVtpvSlot *sl = &s->slot[slot];
+    struct io_dq_header h;
+    if (!sl->h2g_gpa ||
+        dma_memory_read(pci_get_address_space(PCI_DEVICE(s)), sl->h2g_gpa, &h, sizeof(h),
+                        MEMTXATTRS_UNSPECIFIED)) {
+        return false;
+    }
+    uint32_t head = le32_to_cpu(h.head), tail = le32_to_cpu(h.tail);
+    if (head == tail) {
+        sl->stall_tries = 0;
+        return false;
+    }
+    if (head != sl->seen_head) {
+        sl->seen_head = head;
+        sl->seen_ms = now;
+        sl->stall_tries = 0;
+    } else if (now - sl->seen_ms >= VTPV_STALL_MS && sl->stall_tries < VTPV_STALL_TRIES) {
+        sl->seen_ms = now;
+        sl->stall_tries++;
+        s->h2g_renotify++;
+        fprintf(stderr, "apple-vtpv: slot%d h2g head %u tail %u untouched %d ms - notify again (%d)\n",
+                slot, head, tail, VTPV_STALL_MS, sl->stall_tries);
+        vtpv_raise(s, slot);
+    }
+    return sl->stall_tries < VTPV_STALL_TRIES;
+}
+
 /* the outbox drains as the guest consumes: retried every millisecond while
- * anything waits, and before every new message */
+ * anything waits, and before every new message; queued entries are watched
+ * the same way */
 static void vtpv_outbox_tick(void *opaque)
 {
     AppleVtpv *s = opaque;
     bool left = false;
+    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
     for (int i = 0; i < VTPV_MAX_SLOT; i++) {
         if (vtpv_outbox_flush(s, i)) {
             vtpv_raise(s, i);
         }
         left |= !g_queue_is_empty(&s->slot[i].outbox);
+        left |= vtpv_h2g_watch(s, i, now);
     }
     if (left) {
-        timer_mod(s->outbox_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1);
+        timer_mod(s->outbox_timer, now + 1);
     }
 }
 
@@ -446,6 +492,9 @@ static bool vtpv_dq_push(AppleVtpv *s, int slot, const uint8_t *data, uint32_t l
     AppleVtpvSlot *sl = &s->slot[slot];
     vtpv_outbox_flush(s, slot);
     if (g_queue_is_empty(&sl->outbox) && vtpv_dq_enqueue(s, slot, data, len)) {
+        if (!timer_pending(s->outbox_timer)) {      /* watch it being taken */
+            timer_mod(s->outbox_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1);
+        }
         return true;
     }
     VtpvOut *o = g_malloc(sizeof(*o) + len);
@@ -1086,6 +1135,20 @@ static void vtpv_sess_drop(AppleVtpv *s, const uint8_t *uuid16)
                 s->cur = NULL;
             }
             vtpv_sess_free(s, se);
+        }
+    }
+    /* what still waits for room and names the UUID would reach a guest that
+     * no longer dispatches it, and its pump stops at such a message */
+    for (int i = 0; i < VTPV_MAX_SLOT; i++) {
+        GQueue *q = &s->slot[i].outbox;
+        for (GList *l = q->head; l;) {
+            GList *next = l->next;
+            VtpvOut *o = l->data;
+            if (o->len >= 0x20 && memcmp(o->data + 0x10, uuid16, 16) == 0) {
+                g_free(o);
+                g_queue_delete_link(q, l);
+            }
+            l = next;
         }
     }
 }
@@ -2402,11 +2465,17 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
         patch_type = !s->reply_dsup && s->reply_generic;
         reply_tpl = vtpv_tpl_dsup;
         reply_tpl_len = sizeof(vtpv_tpl_dsup);
-    } else if (!(flags & 0x8)) {
+    } else if (flags & 1) {
         /* 'dsta' (StartSession validation) and 'dinv' need only ',err' per the
          * disassembly; the generic template's type field gets the request's.
-         * flags 0x8 = the guest's REPLY to one of our requests (its ',err' for
-         * 'Demt'/'Dpba') - answering it would only add a stray message */
+         * Only a request (flags bit 0) waits for a reply. flags 0x8 is the
+         * guest's REPLY to one of our requests (its ',err' for 'Demt'/'Dpba');
+         * '-dec' (flags 0) is sent as the decoder goes and its UUID is gone
+         * from the guest's handler table by the time a reply lands: the
+         * guest's host-to-guest pump stops draining at a message it cannot
+         * dispatch, so every reply queued behind the stray one waited for the
+         * guest's next send - 1.1 s reply-clerk timeouts on 'dtil' (Maps, TV,
+         * Weather crashed in CMPhoto after them). */
         reply_file = s->reply_generic;
         reply_tpl = vtpv_tpl_generic;
         reply_tpl_len = sizeof(vtpv_tpl_generic);
