@@ -1734,6 +1734,56 @@ static int reims_vgpu_dirty_cmp_u64(const void *a, const void *b)
 }
 
 /*
+ * TEMP lab (Opus 2026-10-23): sort `n` page addresses (multiples of 1 << `shift`) ascending - an LSD radix sort on
+ * the page numbers, 11 bits a pass. A WebGL drawing surface comes back every frame on 10350 scattered pages (b999D:
+ * physical_runs=10350), and ucrt's qsort through a comparator call was still 2.3 % of the drain in that scene.
+ */
+static void reims_vgpu_dirty_sort_pages(uint64_t *a, size_t n, unsigned shift)
+{
+    uint64_t *tmp, *src = a, *dst, top = 0;
+    unsigned bits, sh;
+    size_t i;
+
+    if (n < 64) {
+        qsort(a, n, sizeof(*a), reims_vgpu_dirty_cmp_u64);
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        top |= a[i] >> shift;
+    }
+    if (!top) {
+        return;
+    }
+    bits = 64 - clz64(top);
+    tmp = g_new(uint64_t, n);
+    dst = tmp;
+    for (sh = 0; sh < bits; sh += 11) {
+        size_t cnt[2048] = { 0 }, sum = 0;
+        uint64_t *t;
+
+        for (i = 0; i < n; i++) {
+            cnt[(src[i] >> (shift + sh)) & 2047]++;
+        }
+        for (i = 0; i < 2048; i++) {
+            size_t c = cnt[i];
+
+            cnt[i] = sum;
+            sum += c;
+        }
+        for (i = 0; i < n; i++) {
+            dst[cnt[(src[i] >> (shift + sh)) & 2047]++] = src[i];
+        }
+        t = src;
+        src = dst;
+        dst = t;
+    }
+    if (src != a) {
+        memcpy(a, src, n * sizeof(*a));
+    }
+    g_free(tmp);
+}
+
+/*
  * One guest page a harvest found written, with the geometry it was tracked at.
  * The size travels with the page because the clear must cover the whole guest
  * page and the two pathways do not share a page shift.
@@ -2114,7 +2164,7 @@ uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
      * contiguous run, 10350 pages); ucrt's qsort does not notice and was 3.3 % of the drain in b994's webgl.
      */
     if (!n) {
-        qsort(pages, count, sizeof(*pages), reims_vgpu_dirty_cmp_u64);
+        reims_vgpu_dirty_sort_pages(pages, count, ctz64(page_size));
     }
     n = 0;
     for (i = 0; i < count; i++) {
