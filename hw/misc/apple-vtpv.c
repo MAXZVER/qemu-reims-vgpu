@@ -1810,6 +1810,31 @@ static void vtpv_tdem_send(AppleVtpv *s, VtpvTdem *t)
 /* a window held by an ack that never comes (the dispatcher sends none when
  * the 'TDem's group lookup fails) opens again after this long */
 #define VTPV_TDEM_STALL_US 250000
+/* a 'TDem' waits at most this long for its slot's queue to drain (24g): the
+ * wait is bounded by the session burst itself (the queue empties between
+ * the app's round trips), so a lone tile still emits at once */
+#define VTPV_TDEM_DRAIN_US 3000000
+
+/* entries of this slot the guest has not taken yet?  The real host's emits
+ * follow its actual decode latency, so every 'dtil' reply of a session burst
+ * enters the guest's serial queue BEFORE the earlier tiles' emits; ours used
+ * to leave 0.2 ms after their reply and each later reply queued behind a
+ * 10-70 ms CMPhoto handler - past the reply clerk's 1.1 s at a ~17-session
+ * burst, and the whole image fell back to a late guest decode (Opus: every
+ * timeout is a second-late, CPU-decoded picture).  Holding a 'TDem' while
+ * its queue holds anything gives the replies the real host's ordering; a
+ * lone tile's emit goes out at once (the queue is empty then). */
+static bool vtpv_h2g_busy(AppleVtpv *s, int slot)
+{
+    AppleVtpvSlot *sl = &s->slot[slot];
+    struct io_dq_header h;
+    if (!sl->h2g_gpa ||
+        dma_memory_read(pci_get_address_space(PCI_DEVICE(s)), sl->h2g_gpa, &h, sizeof(h),
+                        MEMTXATTRS_UNSPECIFIED)) {
+        return false;
+    }
+    return le32_to_cpu(h.head) != le32_to_cpu(h.tail);
+}
 
 /* send queued 'TDem's while their slot's unacked window is open: the ack
  * (message flags 8) follows EmitDecodedTile - the tile handler included -
@@ -1827,6 +1852,10 @@ static void vtpv_tdem_pump(AppleVtpv *s)
         if (s->tdem_unacked[t->slot] >= s->tdem_window &&
             now - s->tdem_last_us < VTPV_TDEM_STALL_US) {
             timer_mod(s->tdem_timer, s->tdem_last_us + VTPV_TDEM_STALL_US);
+            return;
+        }
+        if (vtpv_h2g_busy(s, t->slot) && now < t->due_us + VTPV_TDEM_DRAIN_US) {
+            timer_mod(s->tdem_timer, now + 3000);
             return;
         }
         g_queue_pop_head(&s->tdem_q);
