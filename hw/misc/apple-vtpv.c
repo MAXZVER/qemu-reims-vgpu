@@ -161,6 +161,12 @@ static const char *const vtpv_api_name[] = { "d3d12", "cuda", "sw" };
 #define VTPV_SURFDESC   0x128   /* W1  u64: GPA of the VtpvSurfDesc describing
                                  * the surfaces of the next kick (0 = none) */
 #define VTPV_SURFDESC_MAGIC 0x31445356u /* 'VSD1' */
+#define VTPV_KICK_HOLD  0x138   /* W1  u64: GPA of the sender's u32 pair {token,
+                                 * done}: the kext keeps this kick's surfaces
+                                 * pinned when the device writes a nonzero token,
+                                 * and unpins them once done (written later, in
+                                 * token order per slot) reaches it.  0 / never
+                                 * written = the surfaces live for the kick only */
 #define VTPV_REG_SIZE   0x1000
 
 #define VTPV_MAGIC_VAL  0x31505456  /* "VTP1" */
@@ -290,6 +296,25 @@ struct AppleVtpv {
     bool tile_fake_error;          /* DIAG: dtil replies + error TDem without the
                                     * in-kick decode - isolates the kick's hold of
                                     * the guest kext spinlock (clerk timeouts) */
+    /* 25p (Opus): a 'dtil' decodes on the tile thread, not in the kick.  The
+     * guest's DecodeTile wants its reply a few ms after the send (25oc msglog vs
+     * the guest log: Weather's clerk timeouts land ~8 ms after the send, right
+     * as our kick - reply enqueued at +1 ms, then a 4-5 ms decode - returned,
+     * and every kext access waited out the decode on the BQL): 12 of 12 Weather
+     * tile sessions failed (clerk timeout or CMPhoto -17104) and the images
+     * were decoded again on the guest CPU.  The kick now returns right after
+     * the reply; the kext holds the canvas pins until the device's done word
+     * passes the kick's token (VTPV_KICK_HOLD) */
+    bool tile_async;
+    bool tdem_ver;                 /* A/B: ',ver' in the 'TDem' too */
+    bool tile_sync;                /* A/B: decode, then an ',inf' 0 reply, no 'TDem' */
+    uint64_t kick_hold_gpa;        /* VTPV_KICK_HOLD of the kick being handled */
+    uint32_t tile_token[VTPV_MAX_SLOT];
+    QemuThread tile_thread;
+    GQueue tile_q;                 /* VtpvTileJob, waiting (under dec_lock) */
+    GQueue tile_done;              /* decoded, for vtpv_tile_complete (under dec_lock) */
+    struct VtpvTileJob *tile_busy;
+    QEMUBH *tile_bh;
     char *dec_gpu_str;             /* "nv" (default) / "int" */
     VtpvDecoder *dec;
     uint8_t avcC_sps[64];          /* SPS/PPS cached from dsts ',fds' avcC */
@@ -1135,6 +1160,8 @@ static void vtpv_sbf_codec_first(AppleVtpv *s, const uint8_t *sbf, uint32_t n)
 
 /* wait until the decode thread holds nothing of this session: queued frames
  * are finished first (they belong to the stream as it was) */
+static void vtpv_tile_drain(AppleVtpv *s, VtpvSess *se, bool cancel);
+
 static void vtpv_dec_drain(AppleVtpv *s, VtpvSess *se)
 {
     qemu_mutex_lock(&s->dec_lock);
@@ -1154,6 +1181,7 @@ static void vtpv_dec_drain(AppleVtpv *s, VtpvSess *se)
 static void vtpv_dx_reset(AppleVtpv *s)
 {
     vtpv_dec_drain(s, s->cur);
+    vtpv_tile_drain(s, s->cur, false);
     vtpv_dx_close(s->cur->dx);
     s->cur->dx = NULL;
     s->cur->dx_api = VTPV_API_D3D12;
@@ -1167,6 +1195,7 @@ static void vtpv_dx_reset(AppleVtpv *s)
 static void vtpv_sess_free(AppleVtpv *s, VtpvSess *se)
 {
     vtpv_dec_drain(s, se);
+    vtpv_tile_drain(s, se, true);
     vtpv_dx_close(se->dx);
     for (int i = 0; i < VTPV_FRAMES; i++) {
         g_free(se->frame[i].nv12);
@@ -1799,7 +1828,7 @@ typedef struct {
     int64_t due_us;
     uint8_t uuid16[16];
     uint32_t n;
-    uint8_t paras[96];
+    uint8_t paras[128];
 } VtpvTdem;
 
 static void vtpv_tdem_send(AppleVtpv *s, VtpvTdem *t)
@@ -1930,6 +1959,179 @@ static void vtpv_tdem_purge_slot(AppleVtpv *s, int slot)
     s->tdem_unacked[slot] = 0;
 }
 
+/* the 'TDem' of one tile - success or error: never both leaves the guest's
+ * tile record queued and the surface group alive.  kVTDecodeInfo_
+ * Asynchronous in it too: the real host's decoder finishes a
+ * paravirtualized tile asynchronously and passes the same flag to its emit. */
+static void vtpv_tile_tdem(AppleVtpv *s, int slot, const uint8_t *uuid16, uint64_t tile_id,
+                           int32_t err, const uint8_t *uui)
+{
+    uint8_t paras[128];
+    uint32_t n = 0;
+    int32_t be_err = cpu_to_be32(err);
+    uint32_t be_inf = cpu_to_be32(1);
+    uint64_t be_til = cpu_to_be64(tile_id);
+    if (s->tdem_ver) {
+        uint32_t be_ver = cpu_to_be32(6);
+        n += vtpv_para_put(paras + n, 0x2c766572u /* ',ver' */, "=u32", &be_ver, 4);
+    }
+    n += vtpv_para_put(paras + n, 0x2c74696cu /* ',til' */, "=s64", &be_til, 8);
+    n += vtpv_para_put(paras + n, 0x2c657272u /* ',err' */, "=s32", &be_err, 4);
+    n += vtpv_para_put(paras + n, 0x2c696e66u /* ',inf' */, "=u32", &be_inf, 4);
+    if (uui) {
+        n += vtpv_para_put(paras + n, 0x2c757569u /* ',uui' */, "=uui", uui, 16);
+    }
+    VtpvTdem *t = g_new0(VtpvTdem, 1);
+    t->slot = slot;
+    memcpy(t->uuid16, uuid16, 16);
+    memcpy(t->paras, paras, n);
+    t->n = n;
+    t->due_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) + s->tdem_delay_us;
+    g_queue_push_tail(&s->tdem_q, t);
+    vtpv_tdem_pump(s);
+}
+
+/* one 'dtil' for the tile thread: everything the kick lent us is copied (the
+ * message buffer and the surface descriptor are reused by the next kick; the
+ * canvas pages themselves stay pinned by the kext until our done word) */
+typedef struct VtpvTileJob {
+    int slot;
+    VtpvSess *se;
+    uint8_t uuid16[16];
+    uint64_t tile_id;
+    VtpvKickSurf ks;               /* .pages owned */
+    uint32_t sx, sy, tw, th, ox, oy;
+    bool has_uui;
+    uint8_t uui[16];
+    uint8_t *sample;
+    uint32_t sl;
+    uint64_t hold_gpa;
+    uint32_t token;
+    bool cancel;                   /* its session ended: no fill, no 'TDem' - done still advances */
+    bool ok;
+    uint8_t *pic;                  /* the decoded stage (vtpv_dx_put layout) */
+    uint32_t w, h;
+    uint8_t csx, csy;
+    bool gray;
+} VtpvTileJob;
+
+static void *vtpv_tile_thread(void *opaque)
+{
+    AppleVtpv *s = opaque;
+    qemu_mutex_lock(&s->dec_lock);
+    for (;;) {
+        VtpvTileJob *j;
+        while (!(j = g_queue_pop_head(&s->tile_q))) {
+            qemu_cond_wait(&s->dec_cond, &s->dec_lock);
+        }
+        s->tile_busy = j;
+        bool cancel = j->cancel;
+        qemu_mutex_unlock(&s->dec_lock);
+        if (!cancel) {
+            VtpvDxSink *k = &j->se->dx_sink;
+            k->to_stage = true;
+            if (vtpv_dx_decode_sample(s, j->se, j->sample, j->sl, j->tile_id)) {
+                j->pic = k->stage;  /* the job owns this picture now */
+                k->stage = NULL;
+                k->stage_cap = 0;
+                j->w = k->w;
+                j->h = k->h;
+                j->csx = k->csx;
+                j->csy = k->csy;
+                j->gray = k->cgray;
+                j->ok = true;
+            }
+            k->to_stage = false;
+        }
+        g_free(j->sample);
+        j->sample = NULL;
+        qemu_mutex_lock(&s->dec_lock);
+        s->tile_busy = NULL;
+        g_queue_push_tail(&s->tile_done, j);
+        qemu_cond_broadcast(&s->dec_cond);
+        qemu_bh_schedule(s->tile_bh);
+    }
+    return NULL;
+}
+
+/* decoded tiles -> their canvases, the kext's done word, their 'TDem's (BQL;
+ * in decode order, so done only ever moves forward) */
+static void vtpv_tile_complete(AppleVtpv *s)
+{
+    AddressSpace *as = pci_get_address_space(PCI_DEVICE(s));
+    for (;;) {
+        qemu_mutex_lock(&s->dec_lock);
+        VtpvTileJob *j = g_queue_pop_head(&s->tile_done);
+        qemu_mutex_unlock(&s->dec_lock);
+        if (!j) {
+            break;
+        }
+        int32_t err = -12909;       /* kVTVideoDecoderBadDataErr */
+        if (!j->cancel && j->ok &&
+            vtpv_fill_tile(s, &j->ks, j->pic, j->gray, j->csx, j->csy, j->w, j->h, j->sx, j->sy,
+                           j->tw ? j->tw : j->w, j->th ? j->th : j->h, j->ox, j->oy)) {
+            vtpv_note_surface(&j->ks);
+            err = 0;
+        }
+        uint32_t le_done = cpu_to_le32(j->token);
+        dma_memory_write(as, j->hold_gpa + 4, &le_done, 4, MEMTXATTRS_UNSPECIFIED);
+        if (!j->cancel) {
+            vtpv_tile_tdem(s, j->slot, j->uuid16, j->tile_id, err, j->has_uui ? j->uui : NULL);
+        }
+        if (s->verbose) {
+            fprintf(stderr, "apple-vtpv: tile %llu -> canvas %u (%.4s) at %u,%u err=%d token %u%s\n",
+                    (unsigned long long)j->tile_id, j->ks.id, (const char *)&j->ks.pixfmt, j->ox,
+                    j->oy, err, j->token, j->cancel ? " (session gone)" : ", TDem queued");
+        }
+        g_free(j->pic);
+        g_free(j->ks.pages);
+        g_free(j);
+    }
+}
+
+static void vtpv_tile_bh(void *opaque)
+{
+    vtpv_tile_complete(opaque);
+}
+
+/* wait out a session's tiles on the thread (cancel: they only release their
+ * pins), then complete what is done - before the session's decoder goes or a
+ * message that ends its tiles is answered */
+static void vtpv_tile_drain(AppleVtpv *s, VtpvSess *se, bool cancel)
+{
+    if (!se) {
+        return;
+    }
+    qemu_mutex_lock(&s->dec_lock);
+    for (;;) {
+        bool pending = s->tile_busy && s->tile_busy->se == se;
+        if (pending && cancel) {
+            s->tile_busy->cancel = true;
+        }
+        for (GList *l = s->tile_q.head; l; l = l->next) {
+            VtpvTileJob *j = l->data;
+            if (j->se == se) {
+                j->cancel |= cancel;
+                pending = true;
+            }
+        }
+        if (!pending) {
+            break;
+        }
+        qemu_cond_wait(&s->dec_cond, &s->dec_lock);
+    }
+    if (cancel) {
+        for (GList *l = s->tile_done.head; l; l = l->next) {
+            VtpvTileJob *j = l->data;
+            if (j->se == se) {
+                j->cancel = true;
+            }
+        }
+    }
+    qemu_mutex_unlock(&s->dec_lock);
+    vtpv_tile_complete(s);
+}
+
 /* 'dtil' on the D3D12 decoder - the real host decoder's shape: the reply
  * goes out at once (',err'=0, ',inf'=kVTDecodeInfo_Asynchronous - the tile
  * was ACCEPTED), the decode runs after it and the outcome travels in the
@@ -1941,7 +2143,8 @@ static void vtpv_tdem_purge_slot(AppleVtpv *s, int slot)
  * second tile of a session, every build through 24a); the real host's decode
  * latency is the caller's head start.  A 'TDem' with its error also consumes
  * the guest's queued tile record and its surface-group entry on the paths a
- * sync-error reply used to leak them. */
+ * sync-error reply used to leak them.  With a kext that holds the canvas
+ * (VTPV_KICK_HOLD) the decode leaves the kick for the tile thread (25p). */
 static void vtpv_dtil_dx(AppleVtpv *s, int slot, uint64_t total, uint64_t tile_id,
                          const VtpvKickSurf *ks, uint32_t sx, uint32_t sy, uint32_t tw,
                          uint32_t th, uint32_t ox, uint32_t oy, const uint8_t *uui)
@@ -1950,6 +2153,42 @@ static void vtpv_dtil_dx(AppleVtpv *s, int slot, uint64_t total, uint64_t tile_i
     uint32_t n = 0;
     int32_t be_ok = 0;
     uint32_t be_inf_async = cpu_to_be32(1);
+    uint32_t be_ver = cpu_to_be32(6);
+    if (s->tile_sync) {
+        /* 25r A/B: the synchronous contract - decode into the canvas first,
+         * then one reply (',err' = the outcome, ',inf' = 0: done, no 'TDem');
+         * the guest emits the tile from its canvas itself (11e: what it does
+         * on an ',inf' 0 reply - it failed then only for want of a canvas) */
+        int32_t err = -12909;
+        uint32_t sl = 0;
+        const uint8_t *sample = vtpv_dx_sbf_sample(s, total, tile_id, &sl);
+        if (sample) {
+            VtpvDxSink *k = &s->cur->dx_sink;
+            bool was_stage = k->to_stage;
+            k->to_stage = true;
+            bool ok = vtpv_dx_decode_sample(s, s->cur, sample, sl, tile_id);
+            k->to_stage = was_stage;
+            if (ok && vtpv_fill_tile(s, ks, k->stage, k->cgray, k->csx, k->csy, k->w, k->h, sx, sy,
+                                     tw ? tw : k->w, th ? th : k->h, ox, oy)) {
+                vtpv_note_surface(ks);
+                err = 0;
+            }
+        }
+        int32_t be_err = cpu_to_be32(err);
+        uint32_t be_inf0 = 0;
+        n += vtpv_para_put(paras + n, 0x2c766572u /* ',ver' */, "=u32", &be_ver, 4);
+        n += vtpv_para_put(paras + n, 0x2c657272u /* ',err' */, "=s32", &be_err, 4);
+        n += vtpv_para_put(paras + n, 0x2c696e66u /* ',inf' */, "=u32", &be_inf0, 4);
+        vtpv_send_h2g2(s, slot, 0x6474696cu /* 'dtil' */, 4, s->msg + 0x10, s->msg + 0x20, paras, n);
+        if (s->verbose) {
+            fprintf(stderr, "apple-vtpv: tile %llu -> canvas %u sync err=%d\n",
+                    (unsigned long long)tile_id, ks->id, err);
+        }
+        return;
+    }
+    /* 25q: ',ver' first, as in every reply the guest's real host sends (our
+     * template replies carry it) - the 'dtil' reply alone went without */
+    n += vtpv_para_put(paras + n, 0x2c766572u /* ',ver' */, "=u32", &be_ver, 4);
     n += vtpv_para_put(paras + n, 0x2c657272u /* ',err' */, "=s32", &be_ok, 4);
     n += vtpv_para_put(paras + n, 0x2c696e66u /* ',inf' */, "=u32", &be_inf_async, 4);
     vtpv_send_h2g2(s, slot, 0x6474696cu /* 'dtil' */, 4, s->msg + 0x10, s->msg + 0x20, paras, n);
@@ -1958,6 +2197,35 @@ static void vtpv_dtil_dx(AppleVtpv *s, int slot, uint64_t total, uint64_t tile_i
     uint32_t sl = 0;
     const uint8_t *sample = s->tile_fake_error ?
         NULL : vtpv_dx_sbf_sample(s, total, tile_id, &sl);
+    if (sample && s->tile_async && s->kick_hold_gpa) {
+        VtpvTileJob *j = g_new0(VtpvTileJob, 1);
+        j->slot = slot;
+        j->se = s->cur;
+        memcpy(j->uuid16, s->msg + 0x10, 16);
+        j->tile_id = tile_id;
+        j->ks = *ks;
+        j->ks.pages = g_memdup2(ks->pages, (gsize)(ks->npages ? ks->npages : 1) * 8);
+        j->sx = sx, j->sy = sy, j->tw = tw, j->th = th, j->ox = ox, j->oy = oy;
+        if (uui) {
+            j->has_uui = true;
+            memcpy(j->uui, uui, 16);
+        }
+        j->sample = g_memdup2(sample, sl);
+        j->sl = sl;
+        j->hold_gpa = s->kick_hold_gpa;
+        if (!++s->tile_token[slot]) {
+            ++s->tile_token[slot];  /* 0 means "not held" */
+        }
+        j->token = s->tile_token[slot];
+        uint32_t le_tok = cpu_to_le32(j->token);
+        dma_memory_write(pci_get_address_space(PCI_DEVICE(s)), j->hold_gpa, &le_tok, 4,
+                         MEMTXATTRS_UNSPECIFIED);
+        qemu_mutex_lock(&s->dec_lock);
+        g_queue_push_tail(&s->tile_q, j);
+        qemu_cond_broadcast(&s->dec_cond);
+        qemu_mutex_unlock(&s->dec_lock);
+        return;
+    }
     if (sample) {
         VtpvDxSink *k = &s->cur->dx_sink;
         bool was_stage = k->to_stage;
@@ -1970,29 +2238,7 @@ static void vtpv_dtil_dx(AppleVtpv *s, int slot, uint64_t total, uint64_t tile_i
             err = 0;
         }
     }
-    /* the 'TDem' always follows, success or error - never both leaves the
-     * guest's tile record queued and the surface group alive. kVTDecodeInfo_
-     * Asynchronous in it too: the real host's decoder finishes a
-     * paravirtualized tile asynchronously and passes the same flag to its
-     * emit. */
-    int32_t be_err = cpu_to_be32(err);
-    uint32_t be_inf = cpu_to_be32(1);
-    n = 0;
-    uint64_t be_til = cpu_to_be64(tile_id);
-    n += vtpv_para_put(paras + n, 0x2c74696cu /* ',til' */, "=s64", &be_til, 8);
-    n += vtpv_para_put(paras + n, 0x2c657272u /* ',err' */, "=s32", &be_err, 4);
-    n += vtpv_para_put(paras + n, 0x2c696e66u /* ',inf' */, "=u32", &be_inf, 4);
-    if (uui) {
-        n += vtpv_para_put(paras + n, 0x2c757569u /* ',uui' */, "=uui", uui, 16);
-    }
-    VtpvTdem *t = g_new0(VtpvTdem, 1);
-    t->slot = slot;
-    memcpy(t->uuid16, s->msg + 0x10, 16);
-    memcpy(t->paras, paras, n);
-    t->n = n;
-    t->due_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) + s->tdem_delay_us;
-    g_queue_push_tail(&s->tdem_q, t);
-    vtpv_tdem_pump(s);
+    vtpv_tile_tdem(s, slot, s->msg + 0x10, tile_id, err, uui);
     if (s->verbose) {
         fprintf(stderr, "apple-vtpv: tile %llu -> canvas %u (%.4s) at %u,%u err=%d, TDem queued\n",
                 (unsigned long long)tile_id, ks->id, (const char *)&ks->pixfmt, ox, oy, err);
@@ -2030,8 +2276,10 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
     char t4[5];
     vtpv_log4cc(t4, type);
     if (type == 0x64746669u /* 'dtfi' */ || type == 0x64696e76u /* 'dinv' */) {
+        vtpv_tile_drain(s, s->cur, false);          /* its decodes finished, */
         vtpv_tdem_flush(s, s->msg + 0x10, false);   /* its tiles out before the answer */
     } else if (type == 0x2d646563u /* '-dec' */) {
+        vtpv_tile_drain(s, s->cur, true);
         vtpv_tdem_flush(s, s->msg + 0x10, true);    /* the decoder is gone */
     } else if (type == 0x5444656du /* 'TDem' */ && (flags & 8)) {
         /* the ack of a 'TDem' we sent: EmitDecodedTile - the guest's tile
@@ -3094,6 +3342,7 @@ static void vtpv_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned si
         vtpv_handle_message(s, s->client_id, val, nsurf);
         int64_t k2 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         vtpv_drop_surfdesc(s);
+        s->kick_hold_gpa = 0;       /* the kext programs it for every kick it can hold */
         memset(sl->surf, 0, sizeof(sl->surf));
         if (s->kick_open_us && k0 - s->kick_open_us > 20000) {
             /* the kext's register writes before the kick, under its spin lock:
@@ -3111,6 +3360,13 @@ static void vtpv_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned si
         }
         break;
     }
+    case VTPV_KICK_HOLD ... VTPV_KICK_HOLD + 7:
+        if (addr & 4) {
+            s->kick_hold_gpa = (s->kick_hold_gpa & 0xffffffffu) | (val << 32);
+        } else {
+            s->kick_hold_gpa = (s->kick_hold_gpa & ~0xffffffffull) | (val & 0xffffffffu);
+        }
+        break;
     case VTPV_SURFDESC ... VTPV_SURFDESC + 7:
         if (addr & 4) {
             s->surfdesc_gpa = (s->surfdesc_gpa & 0xffffffffu) | (val << 32);
@@ -3541,6 +3797,11 @@ static void vtpv_realize(PCIDevice *dev, Error **errp)
     s->outbox_timer = timer_new_ms(QEMU_CLOCK_REALTIME, vtpv_outbox_tick, s);
     s->tdem_timer = timer_new_us(QEMU_CLOCK_REALTIME, vtpv_tdem_tick, s);
     g_queue_init(&s->tdem_q);
+    g_queue_init(&s->tile_q);
+    g_queue_init(&s->tile_done);
+    s->tile_bh = qemu_bh_new(vtpv_tile_bh, s);
+    qemu_thread_create(&s->tile_thread, "vtpv-tiles", vtpv_tile_thread, s,
+                       QEMU_THREAD_DETACHED);
 
     fprintf(stderr, "apple-vtpv: realized v3 transport (msi+intx), msglog=%s verbose=%u "
             "hwbackend=%s\n", s->msglog ? s->msglog : "(stderr)", s->verbose,
@@ -3582,6 +3843,9 @@ static const Property vtpv_properties[] = {
     DEFINE_PROP_BOOL("writeback", AppleVtpv, writeback, true),
     DEFINE_PROP_BOOL("hwdecode", AppleVtpv, hwdecode, true),
     DEFINE_PROP_BOOL("tile_fake_error", AppleVtpv, tile_fake_error, false),
+    DEFINE_PROP_BOOL("tile-async", AppleVtpv, tile_async, true),
+    DEFINE_PROP_BOOL("tdem-ver", AppleVtpv, tdem_ver, false),
+    DEFINE_PROP_BOOL("tile-sync", AppleVtpv, tile_sync, false),
     DEFINE_PROP_STRING("decgpu", AppleVtpv, dec_gpu_str),
     DEFINE_PROP_STRING("hwbackend", AppleVtpv, hwbackend_str),
     DEFINE_PROP_UINT32("verbose", AppleVtpv, verbose, 1),
