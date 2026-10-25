@@ -287,6 +287,9 @@ struct AppleVtpv {
     /* write-back: pages + layout of the canvas the kext exported (SURFMAP regs) */
     bool writeback;
     bool hwdecode;                 /* ',sbf' -> host Vulkan H.264 decode */
+    bool tile_fake_error;          /* DIAG: dtil replies + error TDem without the
+                                    * in-kick decode - isolates the kick's hold of
+                                    * the guest kext spinlock (clerk timeouts) */
     char *dec_gpu_str;             /* "nv" (default) / "int" */
     VtpvDecoder *dec;
     uint8_t avcC_sps[64];          /* SPS/PPS cached from dsts ',fds' avcC */
@@ -1811,9 +1814,13 @@ static void vtpv_tdem_send(AppleVtpv *s, VtpvTdem *t)
  * the 'TDem's group lookup fails) opens again after this long */
 #define VTPV_TDEM_STALL_US 250000
 /* a 'TDem' waits at most this long for its slot's queue to drain (24g): the
- * wait is bounded by the session burst itself (the queue empties between
- * the app's round trips), so a lone tile still emits at once */
-#define VTPV_TDEM_DRAIN_US 3000000
+ * probe drained its ring in milliseconds, but a real app's reply pump takes
+ * 10-300 ms and gives up on the tile after ~8 ms (ins6b: 24 dtil, 0 TDem out,
+ * every session -dec'd before a 3 s drain cap could expire). The real host's
+ * emit just follows its decode latency (1-5 ms) - it never waits for empty.
+ * 3 ms: probe bursts still drain fully (ordering kept), real apps get their
+ * emit inside their patience window. */
+#define VTPV_TDEM_DRAIN_US 3000
 
 /* entries of this slot the guest has not taken yet?  The real host's emits
  * follow its actual decode latency, so every 'dtil' reply of a session burst
@@ -1844,20 +1851,25 @@ static void vtpv_tdem_pump(AppleVtpv *s)
 {
     int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     VtpvTdem *t;
+    static int p;
     while ((t = g_queue_peek_head(&s->tdem_q)) != NULL) {
         if (t->due_us > now) {
+            if (p < 40) { p++; fprintf(stderr, "apple-vtpv: pump hold due (%lld > %lld) qlen=%d\n", (long long)t->due_us, (long long)now, g_queue_get_length(&s->tdem_q)); }
             timer_mod(s->tdem_timer, t->due_us);
             return;
         }
         if (s->tdem_unacked[t->slot] >= s->tdem_window &&
             now - s->tdem_last_us < VTPV_TDEM_STALL_US) {
+            if (p < 40) { p++; fprintf(stderr, "apple-vtpv: pump hold stall unacked=%d\n", s->tdem_unacked[t->slot]); }
             timer_mod(s->tdem_timer, s->tdem_last_us + VTPV_TDEM_STALL_US);
             return;
         }
         if (vtpv_h2g_busy(s, t->slot) && now < t->due_us + VTPV_TDEM_DRAIN_US) {
+            if (p < 40) { p++; fprintf(stderr, "apple-vtpv: pump hold busy drain (dt %lld us)\n", (long long)(now - t->due_us)); }
             timer_mod(s->tdem_timer, now + 3000);
             return;
         }
+        if (p < 40) { p++; fprintf(stderr, "apple-vtpv: pump SEND dt %lld us busy=%d\n", (long long)(now - t->due_us), vtpv_h2g_busy(s, t->slot)); }
         g_queue_pop_head(&s->tdem_q);
         vtpv_tdem_send(s, t);
         s->tdem_unacked[t->slot]++;
@@ -1868,6 +1880,12 @@ static void vtpv_tdem_pump(AppleVtpv *s)
 
 static void vtpv_tdem_tick(void *opaque)
 {
+    static int n;
+    if (n < 40) {
+        n++;
+        fprintf(stderr, "apple-vtpv: tdem tick #%d qlen=%d\n", n,
+                g_queue_get_length(&((AppleVtpv *)opaque)->tdem_q));
+    }
     vtpv_tdem_pump(opaque);
 }
 
@@ -1930,7 +1948,8 @@ static void vtpv_dtil_dx(AppleVtpv *s, int slot, uint64_t total, uint64_t tile_i
 
     int32_t err = -12909;           /* kVTVideoDecoderBadDataErr */
     uint32_t sl = 0;
-    const uint8_t *sample = vtpv_dx_sbf_sample(s, total, tile_id, &sl);
+    const uint8_t *sample = s->tile_fake_error ?
+        NULL : vtpv_dx_sbf_sample(s, total, tile_id, &sl);
     if (sample) {
         VtpvDxSink *k = &s->cur->dx_sink;
         bool was_stage = k->to_stage;
@@ -3554,6 +3573,7 @@ static const Property vtpv_properties[] = {
     DEFINE_PROP_BOOL("tiles", AppleVtpv, tiles, true),
     DEFINE_PROP_BOOL("writeback", AppleVtpv, writeback, true),
     DEFINE_PROP_BOOL("hwdecode", AppleVtpv, hwdecode, true),
+    DEFINE_PROP_BOOL("tile_fake_error", AppleVtpv, tile_fake_error, false),
     DEFINE_PROP_STRING("decgpu", AppleVtpv, dec_gpu_str),
     DEFINE_PROP_STRING("hwbackend", AppleVtpv, hwbackend_str),
     DEFINE_PROP_UINT32("verbose", AppleVtpv, verbose, 1),
