@@ -1811,8 +1811,16 @@ static void vtpv_tdem_send(AppleVtpv *s, VtpvTdem *t)
 }
 
 /* a window held by an ack that never comes (the dispatcher sends none when
- * the 'TDem's group lookup fails) opens again after this long */
-#define VTPV_TDEM_STALL_US 250000
+ * the 'TDem's group lookup fails) opens again after this long.  25ob (Opus):
+ * 250 ms -> 5 ms. Real apps DO ack (Maps stress boot: 1152 acks for 1157
+ * 'dtil' on its slot), but the few missing acks each held the next 'TDem'
+ * 250 ms - far past an app's ~8 ms patience: it gave the tile up and freed
+ * its CMPhoto state, and the late emit's handler ran on freed memory (Maps
+ * crash reports 10-25 14:10 / 14:48: EmitDecodedTile -> CMPhoto ->
+ * CVPixelBufferGetAttributes / dispatch_semaphore_signal; 10-14 such stalls
+ * a boot). Acks normally land in milliseconds, so the reply-before-handler
+ * ordering the window buys is kept; a lost ack now costs 5 ms, not a tile. */
+#define VTPV_TDEM_STALL_US 5000
 /* a 'TDem' waits at most this long for its slot's queue to drain (24g): the
  * probe drained its ring in milliseconds, but a real app's reply pump takes
  * 10-300 ms and gives up on the tile after ~8 ms (ins6b: 24 dtil, 0 TDem out,
