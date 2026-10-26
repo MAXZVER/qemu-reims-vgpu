@@ -285,6 +285,13 @@ struct AppleVtpv {
     uint32_t dtil_reply_flags;
     uint32_t dtil_reply_delay_us;
     int64_t reply_due_us[VTPV_MAX_SLOT];
+    /* tdem-kick-gated: a slot's 'TDem' waits for that client's NEXT kick -
+     * proof its previous DecodeTile caller returned and armed CMPhoto's
+     * per-tile state (the taint happens-before gap; 8/40 ms lags did not
+     * close it).  Cap so a stream's last tile still leaves. */
+    bool tdem_kick_gated;
+    uint64_t kick_count[VTPV_MAX_SLOT];
+    int64_t tdem_gate_cap_us;
     /* 24c: one live HW tile session at a time - the parallel tile sessions one
      * image runs (Maps/TV/Weather/Podcasts) crashed CMPhoto's tile handler on
      * every build through 24b; while they are parallel, a second 'dsts' fails
@@ -1608,13 +1615,33 @@ static unsigned vtpv_stream_class(const VtpvSess *se)
  * tile's 'TDem' came (TV crashed in CMPhoto's handler) */
 static uint8_t vtpv_learned_api[64];
 
+/* tiles never ride the CUDA rung: a video stream learns cuda for its class
+ * and the session's TILE decodes then inherit it, but an odd HEIF tile NALU
+ * ("Duplicate POC / Skipping invalid undecodable NALU") corrupts nvdec's
+ * hwaccel context with avcodec still reporting rc=0 - the next tile packet
+ * dereferenced ctx->decoder==NULL and crashed QEMU in nvdec start_frame
+ * (Opus's symbolization, 04:23/04:40 rfq8 arms).  D3D12 is the tile decoder;
+ * call at every 'dtil' entry (BQL). */
+static void vtpv_tile_off_cuda(VtpvSess *se)
+{
+    if (se->dx_api == VTPV_API_CUDA) {
+        if (se->dx) {
+            vtpv_dx_discard(se->dx);
+            se->dx = NULL;
+        }
+        se->dx_api = VTPV_API_D3D12;
+    }
+}
+
 static bool vtpv_dx_decode_sample(AppleVtpv *s, VtpvSess *se, const uint8_t *sample,
                                   uint32_t sl, uint64_t tag)
 {
     unsigned cls = vtpv_stream_class(se);
     int64_t t_in = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     if (!se->dx && se->dx_api == VTPV_API_D3D12) {
-        if (vtpv_learned_api[cls]) {
+        if (vtpv_learned_api[cls] && !se->tile_live) {
+            /* a tile session never inherits the class's cuda rung - nvdec
+             * does not survive an odd HEIF tile NALU (see vtpv_tile_off_cuda) */
             se->dx_api = vtpv_learned_api[cls] - 1;
         } else if (se->dx_codec == VTPV_DX_HEVC && ((cls >> 2) & 3) == 0) {
             /* monochrome HEVC: no D3D12 or NVDEC profile on either GPU here */
@@ -1632,7 +1659,9 @@ static bool vtpv_dx_decode_sample(AppleVtpv *s, VtpvSess *se, const uint8_t *sam
             if (!se->dx) {
                 fprintf(stderr, "apple-vtpv: dx: %s decoder open failed (codec %d)\n",
                         vtpv_api_name[se->dx_api], se->dx_codec);
-                se->dx_api++;
+                do {
+                    se->dx_api++;   /* a tile session skips cuda on the walk too */
+                } while (se->tile_live && se->dx_api == VTPV_API_CUDA);
                 continue;
             }
         }
@@ -1658,7 +1687,9 @@ static bool vtpv_dx_decode_sample(AppleVtpv *s, VtpvSess *se, const uint8_t *sam
         }
         vtpv_dx_discard(se->dx);
         se->dx = NULL;
-        se->dx_api++;
+        do {
+            se->dx_api++;       /* a tile session skips cuda on the walk too */
+        } while (se->tile_live && se->dx_api == VTPV_API_CUDA);
     }
 }
 
@@ -1849,6 +1880,7 @@ typedef struct {
     uint32_t flags;
     bool id_set;                /* false = host_msg_id at send time */
     uint8_t id8[8];
+    uint64_t gate_kick;         /* tdem-kick-gated: send only after kick_count[slot] passes this */
 } VtpvTdem;
 
 static void vtpv_tdem_send(AppleVtpv *s, VtpvTdem *t)
@@ -1919,6 +1951,13 @@ static void vtpv_tdem_pump(AppleVtpv *s)
     VtpvTdem *t;
     static int p;
     while ((t = g_queue_peek_head(&s->tdem_q)) != NULL) {
+        if (s->tdem_kick_gated && !t->type &&
+            s->kick_count[t->slot] <= t->gate_kick &&
+            now < t->due_us + s->tdem_gate_cap_us) {
+            /* not before that client's next kick (or the cap / session flush) */
+            timer_mod(s->tdem_timer, t->due_us + s->tdem_gate_cap_us);
+            return;
+        }
         if (t->due_us > now) {
             if (p < 40) { p++; fprintf(stderr, "apple-vtpv: pump hold due (%lld > %lld) qlen=%d\n", (long long)t->due_us, (long long)now, g_queue_get_length(&s->tdem_q)); }
             timer_mod(s->tdem_timer, t->due_us);
@@ -2023,6 +2062,7 @@ static void vtpv_tile_tdem(AppleVtpv *s, int slot, const uint8_t *uuid16, uint64
     if (t->due_us < s->reply_due_us[slot] + 1000) {
         t->due_us = s->reply_due_us[slot] + 1000;
     }
+    t->gate_kick = s->kick_count[slot];
     g_queue_push_tail(&s->tdem_q, t);
     vtpv_tdem_pump(s);
 }
@@ -2094,6 +2134,12 @@ static void *vtpv_tile_thread(void *opaque)
         }
         s->tile_busy = j;
         bool cancel = j->cancel;
+        /* one decoder per session: if the VIDEO thread is decoding this
+         * session's frames, wait it out (it holds no lock while decoding,
+         * so no cycle); the tile side of the pair is the drain below */
+        while (s->dec_busy == j->se && !cancel) {
+            qemu_cond_wait(&s->dec_cond, &s->dec_lock);
+        }
         qemu_mutex_unlock(&s->dec_lock);
         if (!cancel) {
             VtpvDxSink *k = &j->se->dx_sink;
@@ -2222,6 +2268,7 @@ static void vtpv_dtil_dx(AppleVtpv *s, int slot, uint64_t total, uint64_t tile_i
     int32_t be_ok = 0;
     uint32_t be_inf_async = cpu_to_be32(1);
     uint32_t be_ver = cpu_to_be32(6);
+    vtpv_tile_off_cuda(s->cur);
     if (s->tile_sync) {
         /* 25r A/B: the synchronous contract - decode into the canvas first,
          * then one reply (',err' = the outcome, ',inf' = 0: done, no 'TDem');
@@ -2231,6 +2278,7 @@ static void vtpv_dtil_dx(AppleVtpv *s, int slot, uint64_t total, uint64_t tile_i
         uint32_t sl = 0;
         const uint8_t *sample = vtpv_dx_sbf_sample(s, total, tile_id, &sl);
         if (sample) {
+            vtpv_tile_drain(s, s->cur, false);   /* one sink per session - see the branch below */
             VtpvDxSink *k = &s->cur->dx_sink;
             bool was_stage = k->to_stage;
             k->to_stage = true;
@@ -2295,6 +2343,13 @@ static void vtpv_dtil_dx(AppleVtpv *s, int slot, uint64_t total, uint64_t tile_i
         return;
     }
     if (sample) {
+        /* the session's sink is ONE decoder: the tile thread may still be
+         * decoding this session's earlier jobs (the in-kick branch runs when
+         * the kext lent no hold slot - its table full or the lookup failed);
+         * concurrent sink use tore the ffmpeg/dx state and crashed QEMU
+         * (0xc0000005 in the decode path, both 40 ms rfq8 arms).  The jobs
+         * hold se, so the wait also keeps j->se alive here. */
+        vtpv_tile_drain(s, s->cur, false);
         VtpvDxSink *k = &s->cur->dx_sink;
         bool was_stage = k->to_stage;
         k->to_stage = true;
@@ -2317,6 +2372,7 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                                 uint32_t nsurf)
 {
     AppleVtpvSlot *sl = &s->slot[slot];
+    s->kick_count[slot]++;      /* tdem-kick-gated: this client kicked again */
 
     if (total < 0x30 || total > sl->g2h_len || total > VTPV_MSG_MAX) {
         if (s->verbose) {
@@ -3916,6 +3972,8 @@ static const Property vtpv_properties[] = {
     DEFINE_PROP_BOOL("tile-sync", AppleVtpv, tile_sync, false),
     DEFINE_PROP_UINT32("dtil-reply-flags", AppleVtpv, dtil_reply_flags, 4),
     DEFINE_PROP_UINT32("dtil-reply-delay-us", AppleVtpv, dtil_reply_delay_us, 0),
+    DEFINE_PROP_BOOL("tdem-kick-gated", AppleVtpv, tdem_kick_gated, false),
+    DEFINE_PROP_UINT64("tdem-gate-cap-us", AppleVtpv, tdem_gate_cap_us, 100000),
     DEFINE_PROP_STRING("decgpu", AppleVtpv, dec_gpu_str),
     DEFINE_PROP_STRING("hwbackend", AppleVtpv, hwbackend_str),
     DEFINE_PROP_UINT32("verbose", AppleVtpv, verbose, 1),
