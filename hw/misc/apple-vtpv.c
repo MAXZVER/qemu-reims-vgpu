@@ -291,7 +291,7 @@ struct AppleVtpv {
      * close it).  Cap so a stream's last tile still leaves. */
     bool tdem_kick_gated;
     uint64_t kick_count[VTPV_MAX_SLOT];
-    int64_t tdem_gate_cap_us;
+    uint64_t tdem_gate_cap_us;
     /* 24c: one live HW tile session at a time - the parallel tile sessions one
      * image runs (Maps/TV/Weather/Podcasts) crashed CMPhoto's tile handler on
      * every build through 24b; while they are parallel, a second 'dsts' fails
