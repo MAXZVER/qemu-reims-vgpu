@@ -161,6 +161,10 @@ static const char *const vtpv_api_name[] = { "d3d12", "cuda", "sw" };
 #define VTPV_SURFDESC   0x128   /* W1  u64: GPA of the VtpvSurfDesc describing
                                  * the surfaces of the next kick (0 = none) */
 #define VTPV_SURFDESC_MAGIC 0x31445356u /* 'VSD1' */
+#define VTPV_KICKDESC   0x130   /* W1  u64 (v3): GPA of the VtpvKickDesc - one
+                                 * MMIO write for a send's whole register
+                                 * sequence (slot, surf[], total, surfdesc) */
+#define VTPV_KICKDESC_MAGIC 0x31494b56u /* 'VKI1' */
 #define VTPV_KICK_HOLD  0x138   /* W1  u64: GPA of the sender's u32 pair {token,
                                  * done}: the kext keeps this kick's surfaces
                                  * pinned when the device writes a nonzero token,
@@ -305,6 +309,8 @@ struct AppleVtpv {
     bool decthread;                 /* decode ahead on the decode thread (A/B: off = at the reply) */
     bool tiles;                     /* off: refuse tile sessions ('dsts'), the guest decodes HEIF itself */
     uint64_t surfdesc_gpa;          /* VTPV_SURFDESC of the next kick */
+    uint64_t kickdesc_gpa;          /* VTPV_KICKDESC latch (two 32-bit halves) */
+    bool kickdesc;                  /* report version 3 + take one-write sends */
     VtpvKickSurf ksurf[5];
     uint32_t nksurf;
     uint64_t last_frame_id;
@@ -3319,7 +3325,7 @@ static uint64_t vtpv_mmio_read(void *opaque, hwaddr addr, unsigned size)
         v = VTPV_MAGIC_VAL;
         break;
     case VTPV_VERSION:
-        v = 2;
+        v = s->kickdesc ? 3 : 2;
         break;
     case VTPV_CLIENT_ID:
         v = s->client_id;
@@ -3491,6 +3497,55 @@ static void vtpv_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned si
             s->kick_hold_gpa = (s->kick_hold_gpa & ~0xffffffffull) | (val & 0xffffffffu);
         }
         break;
+    case VTPV_KICKDESC ... VTPV_KICKDESC + 7: {
+        /* kickdesc=on (version 3): the kext's whole register sequence of a
+         * send in ONE MMIO write (slot, surfaces, kick size, surfdesc GPA),
+         * DMA-read here.  The v2 path cost one MMIO exit per register under
+         * the kext's locks - the kext send-path measured p50 0.53 / p90 2.7 /
+         * max 6.3 ms, most of it these exits plus the per-send page walk. */
+        uint64_t gpa = (addr & 4) ? ((s->kickdesc_gpa & 0xffffffffu) | ((uint64_t)val << 32))
+                                  : ((s->kickdesc_gpa & ~0xffffffffull) | (val & 0xffffffffu));
+        s->kickdesc_gpa = gpa;
+        if (!(addr & 4)) {
+            break;      /* the low half alone is not a doorbell */
+        }
+        struct {
+            uint32_t magic, slot, nsurf, total;
+            uint32_t surf[5];
+            uint32_t pad;
+            uint64_t surfdesc;
+        } QEMU_PACKED d;
+        if (dma_memory_read(pci_get_address_space(PCI_DEVICE(s)), gpa, &d, sizeof(d),
+                            MEMTXATTRS_UNSPECIFIED) ||
+            d.magic != VTPV_KICKDESC_MAGIC || d.slot >= VTPV_MAX_SLOT) {
+            fprintf(stderr, "apple-vtpv: bad kick descriptor at %#llx\n",
+                    (unsigned long long)gpa);
+            break;
+        }
+        uint32_t nsurf = MIN(d.nsurf, 5u);
+        s->client_id = d.slot;
+        sl = &s->slot[d.slot];
+        for (uint32_t i = 0; i < 5; i++) {
+            sl->surf[i] = i < nsurf ? d.surf[i] : 0;
+        }
+        s->surfdesc_gpa = d.surfdesc;
+        sl->last_kick = d.total;
+        int64_t k0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        vtpv_load_surfdesc(s);
+        int64_t k1 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        vtpv_handle_message(s, d.slot, d.total, nsurf);
+        int64_t k2 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        vtpv_drop_surfdesc(s);
+        s->kick_hold_gpa = 0;
+        memset(sl->surf, 0, sizeof(sl->surf));
+        if (k2 - k0 > 20000) {
+            char t5[5];
+            vtpv_log4cc(t5, ldl_be_p(s->msg + 8));
+            fprintf(stderr, "apple-vtpv: slot%d long kickdesc %.4s %lld us (surfdesc %lld us)\n",
+                    d.slot, t5, (long long)(k2 - k0), (long long)(k1 - k0));
+        }
+        break;
+    }
     case VTPV_SURFDESC ... VTPV_SURFDESC + 7:
         if (addr & 4) {
             s->surfdesc_gpa = (s->surfdesc_gpa & 0xffffffffu) | (val << 32);
@@ -3973,6 +4028,7 @@ static const Property vtpv_properties[] = {
     DEFINE_PROP_UINT32("dtil-reply-flags", AppleVtpv, dtil_reply_flags, 4),
     DEFINE_PROP_UINT32("dtil-reply-delay-us", AppleVtpv, dtil_reply_delay_us, 0),
     DEFINE_PROP_BOOL("tdem-kick-gated", AppleVtpv, tdem_kick_gated, false),
+    DEFINE_PROP_BOOL("kickdesc", AppleVtpv, kickdesc, false),
     DEFINE_PROP_UINT64("tdem-gate-cap-us", AppleVtpv, tdem_gate_cap_us, 100000),
     DEFINE_PROP_STRING("decgpu", AppleVtpv, dec_gpu_str),
     DEFINE_PROP_STRING("hwbackend", AppleVtpv, hwbackend_str),
