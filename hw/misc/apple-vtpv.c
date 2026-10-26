@@ -100,6 +100,7 @@ typedef struct VtpvSess {
         bool dbuf_sent;
         bool queued;                /* handed to the decode thread (dec_lock) */
         bool decoded;               /* the decode thread is done: nv12 or nothing */
+        bool shed;                  /* backlog: decoded for its references only, completed dropped */
         uint8_t *nv12;              /* outbuf: decoded picture waiting for its buffer */
         uint32_t w, h;
         uint8_t *sample;            /* outbuf: or the compressed sample, decoded at the reply */
@@ -107,6 +108,8 @@ typedef struct VtpvSess {
     } frame[VTPV_FRAMES];
     uint64_t next_seq;
     uint32_t dbuf_out;              /* 'Dbuf's sent and not answered yet */
+    uint32_t shed_n;                /* frames shed and not completed yet */
+    int slot;                       /* the slot its 'Dbuf's go out on */
     bool dpba_sent;
     uint32_t dpba_w, dpba_h;        /* size the last 'Dpba' announced */
     VtpvDx *dx;
@@ -309,6 +312,8 @@ struct AppleVtpv {
      * attached), then written into that surface and completed by 'Demt' */
     bool outbuf;
     bool decthread;                 /* decode ahead on the decode thread (A/B: off = at the reply) */
+    uint32_t backlog;               /* frames waiting for a 'Dbuf' past which the oldest are shed (0: never) */
+    uint64_t shed_total;
     bool tiles;                     /* off: refuse tile sessions ('dsts'), the guest decodes HEIF itself */
     uint64_t surfdesc_gpa;          /* VTPV_SURFDESC of the next kick */
     uint64_t kickdesc_gpa;          /* VTPV_KICKDESC latch (two 32-bit halves) */
@@ -615,11 +620,19 @@ static bool vtpv_h2g_watch(AppleVtpv *s, int slot, int64_t now)
 /* the outbox drains as the guest consumes: retried every millisecond while
  * anything waits, and before every new message; queued entries are watched
  * the same way */
+static void vtpv_shed_reap(AppleVtpv *s, VtpvSess *se);
+
 static void vtpv_outbox_tick(void *opaque)
 {
     AppleVtpv *s = opaque;
     bool left = false;
     int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    for (int i = 0; i < VTPV_SESS; i++) {
+        if (s->sess[i].used && s->sess[i].shed_n) {
+            vtpv_shed_reap(s, &s->sess[i]);
+            left |= s->sess[i].shed_n != 0;
+        }
+    }
     for (int i = 0; i < VTPV_MAX_SLOT; i++) {
         if (vtpv_outbox_flush(s, i)) {
             vtpv_raise(s, i);
@@ -870,7 +883,8 @@ static void vtpv_send_demt2(AppleVtpv *s, int slot, uint64_t frame_id,
                             int32_t err, uint32_t inf, const uint8_t *uuid16,
                             const uint8_t *uuid);
 static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16);
-static void vtpv_dec_queue(AppleVtpv *s, VtpvSess *se, int idx);
+static bool vtpv_dec_queue(AppleVtpv *s, VtpvSess *se, int idx);
+static void vtpv_shed(AppleVtpv *s, VtpvSess *se);
 
 static void vtpv_send_dbuf(AppleVtpv *s, int slot, uint64_t frame_id,
                            const uint8_t *uuid16)
@@ -898,6 +912,7 @@ static void vtpv_send_dbuf(AppleVtpv *s, int slot, uint64_t frame_id,
     s->cur->frame[free_i].dbuf_sent = false;
     s->cur->frame[free_i].queued = false;
     s->cur->frame[free_i].decoded = false;
+    s->cur->frame[free_i].shed = false;
     g_free(s->cur->frame[free_i].nv12);
     s->cur->frame[free_i].nv12 = NULL;
     g_free(s->cur->frame[free_i].sample);
@@ -913,6 +928,7 @@ static void vtpv_send_dbuf(AppleVtpv *s, int slot, uint64_t frame_id,
         s->cur->frame[free_i].h = k->h;
     }
     vtpv_pump_dbuf(s, slot, uuid16);
+    vtpv_shed(s, s->cur);
 }
 
 /* ask the guest for buffers for the oldest waiting frames, at most
@@ -920,10 +936,12 @@ static void vtpv_send_dbuf(AppleVtpv *s, int slot, uint64_t frame_id,
 static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
 {
     VtpvSess *se = s->cur;
+    se->slot = slot;
+    vtpv_shed_reap(s, se);
     while (se->dbuf_out < VTPV_DBUF_INFLIGHT) {
         int next = -1;
         for (int i = 0; i < VTPV_FRAMES; i++) {
-            if (se->frame[i].in_use && !se->frame[i].dbuf_sent &&
+            if (se->frame[i].in_use && !se->frame[i].dbuf_sent && !se->frame[i].shed &&
                 (next < 0 || se->frame[i].seq < se->frame[next].seq)) {
                 next = i;
             }
@@ -953,6 +971,84 @@ static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
                     (unsigned long long)se->frame[next].frame_id,
                     (unsigned long long)s->host_msg_id, se->dbuf_out);
         }
+    }
+}
+
+/* backlog=N: a player decodes ahead of display, and while the guest's pool
+ * has no buffer for our 'Dbuf's its frames pile up here.  AMD work VM 10-26:
+ * the 4K HEVC live wallpaper sat at 1024 waiting (~7 s behind) - every frame
+ * it got back was late, so it discarded it and fed more (235 'dfrm'/s, 92/s
+ * dropped at the full table, and each drop broke the references of the
+ * frames after it: 70k "Could not find ref with POC").  Past N waiting the
+ * oldest frames are decoded anyway (the frames after them reference them),
+ * in decode order on the decode thread, and completed as dropped without a
+ * buffer - the backlog, and so the latency, stays at N and the player catches
+ * up with the clock. */
+static void vtpv_shed(AppleVtpv *s, VtpvSess *se)
+{
+    if (!s->backlog || !s->decthread) {
+        return;
+    }
+    uint32_t waiting = 0;
+    for (int i = 0; i < VTPV_FRAMES; i++) {
+        waiting += se->frame[i].in_use && !se->frame[i].dbuf_sent && !se->frame[i].shed;
+    }
+    while (waiting > s->backlog) {
+        int old = -1;
+        for (int i = 0; i < VTPV_FRAMES; i++) {
+            if (se->frame[i].in_use && !se->frame[i].dbuf_sent && !se->frame[i].shed &&
+                (old < 0 || se->frame[i].seq < se->frame[old].seq)) {
+                old = i;
+            }
+        }
+        if (old < 0) {
+            break;
+        }
+        if (se->frame[old].sample && !se->frame[old].nv12 && !vtpv_dec_queue(s, se, old)) {
+            break;                  /* the decode queue is full: shed later */
+        }
+        se->frame[old].shed = true;
+        se->shed_n++;
+        s->shed_total++;
+        waiting--;
+    }
+    if (se->shed_n && !timer_pending(s->outbox_timer)) {
+        timer_mod(s->outbox_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1);
+    }
+}
+
+/* complete the shed frames the decode thread is done with, as dropped */
+static void vtpv_shed_reap(AppleVtpv *s, VtpvSess *se)
+{
+    if (!se->shed_n) {
+        return;
+    }
+    uint64_t done[VTPV_FRAMES];
+    uint32_t n = 0;
+    qemu_mutex_lock(&s->dec_lock);
+    for (int i = 0; i < VTPV_FRAMES; i++) {
+        if (se->frame[i].in_use && se->frame[i].shed &&
+            (se->frame[i].decoded || !se->frame[i].queued)) {
+            done[n++] = se->frame[i].frame_id;
+            g_free(se->frame[i].nv12);
+            se->frame[i].nv12 = NULL;
+            g_free(se->frame[i].sample);
+            se->frame[i].sample = NULL;
+            se->frame[i].in_use = false;
+            se->frame[i].queued = false;
+            se->frame[i].decoded = false;
+            se->frame[i].shed = false;
+            se->shed_n--;
+        }
+    }
+    qemu_mutex_unlock(&s->dec_lock);
+    uint8_t zero_uuid[16] = { 0 };
+    for (uint32_t i = 0; i < n; i++) {
+        vtpv_send_demt2(s, se->slot, done[i], 0, 1u << 1, se->uuid, zero_uuid);
+    }
+    if (n && s->verbose) {
+        fprintf(stderr, "apple-vtpv: shed %u frames (%llu in all, %u left)\n", n,
+                (unsigned long long)s->shed_total, se->shed_n);
     }
 }
 
@@ -1836,8 +1932,9 @@ static void *vtpv_dec_thread(void *opaque)
     return NULL;
 }
 
-static void vtpv_dec_queue(AppleVtpv *s, VtpvSess *se, int idx)
+static bool vtpv_dec_queue(AppleVtpv *s, VtpvSess *se, int idx)
 {
+    bool ok = false;
     qemu_mutex_lock(&s->dec_lock);
     if (s->dec_n < ARRAY_SIZE(s->dec_job)) {
         uint32_t t = (s->dec_head + s->dec_n) % ARRAY_SIZE(s->dec_job);
@@ -1846,8 +1943,10 @@ static void vtpv_dec_queue(AppleVtpv *s, VtpvSess *se, int idx)
         s->dec_n++;
         se->frame[idx].queued = true;
         qemu_cond_broadcast(&s->dec_cond);
+        ok = true;
     }
     qemu_mutex_unlock(&s->dec_lock);
+    return ok;
 }
 
 /* a queued frame's picture is needed now: wait for the thread; false if the
@@ -4135,6 +4234,7 @@ static const Property vtpv_properties[] = {
     DEFINE_PROP_UINT32("dtil-reply-delay-us", AppleVtpv, dtil_reply_delay_us, 0),
     DEFINE_PROP_BOOL("tdem-kick-gated", AppleVtpv, tdem_kick_gated, false),
     DEFINE_PROP_BOOL("kickdesc", AppleVtpv, kickdesc, false),
+    DEFINE_PROP_UINT32("tile-dump", AppleVtpv, tile_dump_left, 0),
     DEFINE_PROP_UINT64("tdem-gate-cap-us", AppleVtpv, tdem_gate_cap_us, 100000),
     DEFINE_PROP_STRING("decgpu", AppleVtpv, dec_gpu_str),
     DEFINE_PROP_STRING("hwbackend", AppleVtpv, hwbackend_str),
