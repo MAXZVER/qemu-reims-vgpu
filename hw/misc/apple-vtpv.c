@@ -1547,7 +1547,9 @@ static bool vtpv_ksurf_read(AppleVtpv *s, const VtpvKickSurf *ks, uint64_t off,
         uint32_t pg = sa >> 12;
         uint32_t chunk = MIN(len, 4096 - (uint32_t)(sa & 0xfff));
         if (pg < ks->npages) {
-            vtpv_host_store(ks->pages[pg]);
+            /* no vtpv_host_store here: a read must not arm the write-fault
+             * tracker - it poisoned the GPU's page coherence and killed the
+             * D3D12 device at dump time (kt1/kt1v2, 0xc0000374) */
             dma_memory_read(pci_get_address_space(PCI_DEVICE(s)),
                             (ks->pages[pg] & ~(uint64_t)0xfff) + (sa & 0xfff), dst, chunk,
                             MEMTXATTRS_UNSPECIFIED);
@@ -1598,7 +1600,10 @@ static void vtpv_tile_dump(AppleVtpv *s, const VtpvKickSurf *ks, const uint8_t *
         hdr.coff[p] = ks->off[p]; hdr.cbpr[p] = ks->bpr[p];
     }
     fwrite(&hdr, sizeof(hdr), 1, f);
-    fwrite(stage, (size_t)pw * ph + (size_t)((pw + 1) / 2) * ((ph + 1) / 2) * 2, 1, f);
+    size_t stage_n = ks->planes > 1
+        ? (size_t)pw * ph + (size_t)((pw + 1) / 2) * ((ph + 1) / 2) * 2
+        : (size_t)pw * ph;
+    fwrite(stage, stage_n, 1, f);
     /* read the whole Y plane + chroma plane back from the guest canvas */
     g_autofree uint8_t *rb = g_malloc(ks->bpr[0] * (uint64_t)ks->ph[0] + 16);
     if (vtpv_ksurf_read(s, ks, ks->off[0], rb, ks->bpr[0] * (uint64_t)ks->ph[0])) {
