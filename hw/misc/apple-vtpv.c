@@ -2012,6 +2012,7 @@ static bool vtpv_fill_tile(AppleVtpv *s, const VtpvKickSurf *ks, const uint8_t *
                          stage + (size_t)(sy + y) * pw + sx, dw);
     }
     if (one) {
+        vtpv_tile_dump(s, ks, stage, gray, pw, ph, sx, sy, w, h, ox, oy, dw, dh);
         return true;
     }
     uint32_t cols = (dw + (1u << kx) - 1) >> kx, rows = (dh + (1u << ky) - 1) >> ky;
