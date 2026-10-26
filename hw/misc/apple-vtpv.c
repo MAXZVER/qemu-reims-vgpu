@@ -4289,7 +4289,7 @@ static const Property vtpv_properties[] = {
     DEFINE_PROP_BOOL("kickdesc", AppleVtpv, kickdesc, false),
     DEFINE_PROP_UINT32("tile-dump", AppleVtpv, tile_dump_left, 0),
     DEFINE_PROP_BOOL("tile-dump-read", AppleVtpv, tile_dump_read, false),
-    DEFINE_PROP_BOOL("tdem-fast", AppleVtpv, tdem_fast, false),
+    DEFINE_PROP_BOOL("tdem-fast", AppleVtpv, tdem_fast, true),   /* A/B won 10-26: tail p99 124->72-86ms, 0 errors, 108/108; off = rollback */
     DEFINE_PROP_UINT64("tdem-gate-cap-us", AppleVtpv, tdem_gate_cap_us, 100000),
     DEFINE_PROP_STRING("decgpu", AppleVtpv, dec_gpu_str),
     DEFINE_PROP_STRING("hwbackend", AppleVtpv, hwbackend_str),
