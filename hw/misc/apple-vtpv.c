@@ -269,6 +269,22 @@ struct AppleVtpv {
     uint32_t tdem_unacked[VTPV_MAX_SLOT];
     uint32_t tdem_window;
     int64_t tdem_last_us;
+    /* RE 25x (Ghidra, guest VideoToolbox + VideoToolboxParavirtualizationSupport)
+     * + rfq1/rfq3 matrix: the guest takes TWO reply paths.  The plain sync sends
+     * (decs/+dec/dsts/dsup, the Dbuf request) complete their wait with our old
+     * flags=4 replies (Opus: CreateInstance ok every run) - but the 'dtil'
+     * reply must be delivered by the pump through DeliverReply, which the
+     * dispatchers reach only on flags bit 3 (0x8; the guest's own 'TDem' acks
+     * carry 0x8 on the wire).  With 4 the 'dtil' reply was routed to the event
+     * handler, dropped as an unknown 4CC and the clerk timed out (-19093 from
+     * DeliverReply's lookup) -> CMPhoto fell back to CPU decode.  flags=8
+     * EVERYWHERE is worse: the 'decs' handshake breaks, apps never open the HW
+     * path at all and the "clean" logs are the same CPU fallback one level
+     * earlier (rfq3 f8b: zero dtil in the msglog).  So: 8 on the 'dtil' reply
+     * only, 4 everywhere else (Opus's split, COORD 23:1x).  Property for A/B. */
+    uint32_t dtil_reply_flags;
+    uint32_t dtil_reply_delay_us;
+    int64_t reply_due_us[VTPV_MAX_SLOT];
     /* 24c: one live HW tile session at a time - the parallel tile sessions one
      * image runs (Maps/TV/Weather/Podcasts) crashed CMPhoto's tile handler on
      * every build through 24b; while they are parallel, a second 'dsts' fails
@@ -1829,14 +1845,27 @@ typedef struct {
     uint8_t uuid16[16];
     uint32_t n;
     uint8_t paras[128];
+    uint32_t type;              /* 0 = 'TDem' (the queue's native cargo) */
+    uint32_t flags;
+    bool id_set;                /* false = host_msg_id at send time */
+    uint8_t id8[8];
 } VtpvTdem;
 
 static void vtpv_tdem_send(AppleVtpv *s, VtpvTdem *t)
 {
     uint8_t id8[8];
-    s->host_msg_id++;
-    stq_be_p(id8, s->host_msg_id);
-    vtpv_send_h2g2(s, t->slot, 0x5444656du /* 'TDem' */, 2, t->uuid16, id8, t->paras, t->n);
+    if (t->id_set) {
+        memcpy(id8, t->id8, 8);
+    } else if (t->type) {
+        stq_be_p(id8, 0);       /* queued non-'TDem' cargo carries its own id */
+    } else {
+        /* 'TDem' is a pure event: identifier 0 - a nonzero id made the
+         * guest's dispatcher try DeliverReply and spray -19093 (rfq) */
+        stq_be_p(id8, 0);
+        s->host_msg_id++;
+    }
+    vtpv_send_h2g2(s, t->slot, t->type ? t->type : 0x5444656du /* 'TDem' */,
+                   t->type ? t->flags : 2, t->uuid16, id8, t->paras, t->n);
 }
 
 /* a window held by an ack that never comes (the dispatcher sends none when
@@ -1909,8 +1938,10 @@ static void vtpv_tdem_pump(AppleVtpv *s)
         if (p < 40) { p++; fprintf(stderr, "apple-vtpv: pump SEND dt %lld us busy=%d\n", (long long)(now - t->due_us), vtpv_h2g_busy(s, t->slot)); }
         g_queue_pop_head(&s->tdem_q);
         vtpv_tdem_send(s, t);
-        s->tdem_unacked[t->slot]++;
-        s->tdem_last_us = now;
+        if (!t->type) {
+            s->tdem_unacked[t->slot]++;
+            s->tdem_last_us = now;
+        }
         g_free(t);
     }
 }
@@ -1987,6 +2018,43 @@ static void vtpv_tile_tdem(AppleVtpv *s, int slot, const uint8_t *uuid16, uint64
     memcpy(t->paras, paras, n);
     t->n = n;
     t->due_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) + s->tdem_delay_us;
+    /* a tile's 'TDem' never passes its reply: EmitDecodedTile before the
+     * reply completes DecodeTile is the caller's-head-start crash class */
+    if (t->due_us < s->reply_due_us[slot] + 1000) {
+        t->due_us = s->reply_due_us[slot] + 1000;
+    }
+    g_queue_push_tail(&s->tdem_q, t);
+    vtpv_tdem_pump(s);
+}
+
+/* the 'dtil' reply leaves the kick: our in-kick reply reached the guest's
+ * dispatcher before the sender had returned from the kick MMIO and the reply
+ * clerk's entry was there to receive it (-19093 in DeliverReply, then the
+ * wait's timeout, then CMPhoto's CPU fallback).  The queue's timer sends it
+ * dtil_reply_delay_us after the kick; stock flags 4 (bit 3 on this wire
+ * means EVENT - rfq3/rfq4: with 8 the guest logs "unhandled message dtil"). */
+static void vtpv_queue_dtil_reply(AppleVtpv *s, int slot, const uint8_t *paras, uint32_t n)
+{
+    if (s->dtil_reply_delay_us == 0) {
+        /* the one shape never actually tested: the reply leaves INSIDE the
+         * kick MMIO - the kext signals the port at kick return and the pump
+         * completes the clerk while the sender is still in the syscall */
+        s->reply_due_us[slot] = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        vtpv_send_h2g2(s, slot, 0x6474696cu /* 'dtil' */, s->dtil_reply_flags,
+                       s->msg + 0x10, s->msg + 0x20, paras, n);
+        return;
+    }
+    VtpvTdem *t = g_new0(VtpvTdem, 1);
+    t->slot = slot;
+    t->type = 0x6474696cu /* 'dtil' */;
+    t->flags = s->dtil_reply_flags;
+    t->id_set = true;
+    memcpy(t->id8, s->msg + 0x20, 8);
+    memcpy(t->uuid16, s->msg + 0x10, 16);
+    memcpy(t->paras, paras, MIN(n, sizeof(t->paras)));
+    t->n = n;
+    t->due_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) + s->dtil_reply_delay_us;
+    s->reply_due_us[slot] = t->due_us;
     g_queue_push_tail(&s->tdem_q, t);
     vtpv_tdem_pump(s);
 }
@@ -2179,7 +2247,7 @@ static void vtpv_dtil_dx(AppleVtpv *s, int slot, uint64_t total, uint64_t tile_i
         n += vtpv_para_put(paras + n, 0x2c766572u /* ',ver' */, "=u32", &be_ver, 4);
         n += vtpv_para_put(paras + n, 0x2c657272u /* ',err' */, "=s32", &be_err, 4);
         n += vtpv_para_put(paras + n, 0x2c696e66u /* ',inf' */, "=u32", &be_inf0, 4);
-        vtpv_send_h2g2(s, slot, 0x6474696cu /* 'dtil' */, 4, s->msg + 0x10, s->msg + 0x20, paras, n);
+        vtpv_queue_dtil_reply(s, slot, paras, n);
         if (s->verbose) {
             fprintf(stderr, "apple-vtpv: tile %llu -> canvas %u sync err=%d\n",
                     (unsigned long long)tile_id, ks->id, err);
@@ -2191,7 +2259,7 @@ static void vtpv_dtil_dx(AppleVtpv *s, int slot, uint64_t total, uint64_t tile_i
     n += vtpv_para_put(paras + n, 0x2c766572u /* ',ver' */, "=u32", &be_ver, 4);
     n += vtpv_para_put(paras + n, 0x2c657272u /* ',err' */, "=s32", &be_ok, 4);
     n += vtpv_para_put(paras + n, 0x2c696e66u /* ',inf' */, "=u32", &be_inf_async, 4);
-    vtpv_send_h2g2(s, slot, 0x6474696cu /* 'dtil' */, 4, s->msg + 0x10, s->msg + 0x20, paras, n);
+    vtpv_queue_dtil_reply(s, slot, paras, n);
 
     int32_t err = -12909;           /* kVTVideoDecoderBadDataErr */
     uint32_t sl = 0;
@@ -3846,6 +3914,8 @@ static const Property vtpv_properties[] = {
     DEFINE_PROP_BOOL("tile-async", AppleVtpv, tile_async, true),
     DEFINE_PROP_BOOL("tdem-ver", AppleVtpv, tdem_ver, false),
     DEFINE_PROP_BOOL("tile-sync", AppleVtpv, tile_sync, false),
+    DEFINE_PROP_UINT32("dtil-reply-flags", AppleVtpv, dtil_reply_flags, 4),
+    DEFINE_PROP_UINT32("dtil-reply-delay-us", AppleVtpv, dtil_reply_delay_us, 0),
     DEFINE_PROP_STRING("decgpu", AppleVtpv, dec_gpu_str),
     DEFINE_PROP_STRING("hwbackend", AppleVtpv, hwbackend_str),
     DEFINE_PROP_UINT32("verbose", AppleVtpv, verbose, 1),
