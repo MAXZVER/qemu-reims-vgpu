@@ -275,6 +275,7 @@ struct AppleVtpv {
      * this spread for free: its emits follow the actual GPU decode. */
     uint32_t tdem_unacked[VTPV_MAX_SLOT];
     uint32_t tdem_window;
+    bool tdem_fast;               /* tdem-fast=on: pace by h2g ring free space, no fixed holds */
     int64_t tdem_last_us;
     /* RE 25x (Ghidra, guest VideoToolbox + VideoToolboxParavirtualizationSupport)
      * + rfq1/rfq3 matrix: the guest takes TWO reply paths.  The plain sync sends
@@ -301,6 +302,8 @@ struct AppleVtpv {
     uint64_t tdem_gate_cap_us;
     uint32_t tile_dump_left;       /* tile-dump=N: dump the first N fills */
     uint32_t tile_dump_total;
+    bool tile_dump_read;           /* tile-dump-read=on: canvas readback too (raced
+                                    * the memory layer twice - default off) */
     /* 24c: one live HW tile session at a time - the parallel tile sessions one
      * image runs (Maps/TV/Weather/Podcasts) crashed CMPhoto's tile handler on
      * every build through 24b; while they are parallel, a second 'dsts' fails
@@ -471,6 +474,29 @@ static bool vtpv_dq_enqueue(AppleVtpv *s, int slot, const uint8_t *data, uint32_
 
     s->msgs_out++;
     return true;
+}
+
+/* conservative free-bytes test of the slot's h2g ring (the enqueue fit rules,
+ * read-only) - tdem-fast paces its sends by this instead of fixed holds */
+static bool vtpv_dq_room(AppleVtpv *s, int slot, uint32_t entry)
+{
+    AppleVtpvSlot *sl = &s->slot[slot];
+    struct io_dq_header h;
+    if (!sl->h2g_gpa || sl->h2g_len < sizeof(h) + 16 + entry) {
+        return false;
+    }
+    if (dma_memory_read(pci_get_address_space(PCI_DEVICE(s)), sl->h2g_gpa, &h, sizeof(h),
+                        MEMTXATTRS_UNSPECIFIED)) {
+        return false;
+    }
+    uint32_t qsize = le32_to_cpu(h.queue_size);
+    uint32_t head = le32_to_cpu(h.head);
+    uint32_t tail = le32_to_cpu(h.tail);
+    if (qsize == 0 || qsize + sizeof(h) > sl->h2g_len) {
+        qsize = sl->h2g_len - sizeof(h);
+    }
+    uint32_t fr = tail >= head ? qsize - (tail - head) : head - tail;
+    return fr >= entry + 64;
 }
 
 static void vtpv_raise(AppleVtpv *s, int slot)
@@ -1604,18 +1630,22 @@ static void vtpv_tile_dump(AppleVtpv *s, const VtpvKickSurf *ks, const uint8_t *
         ? (size_t)pw * ph + (size_t)((pw + 1) / 2) * ((ph + 1) / 2) * 2
         : (size_t)pw * ph;
     fwrite(stage, stage_n, 1, f);
-    /* read the whole Y plane + chroma plane back from the guest canvas */
-    g_autofree uint8_t *rb = g_malloc(ks->bpr[0] * (uint64_t)ks->ph[0] + 16);
-    if (vtpv_ksurf_read(s, ks, ks->off[0], rb, ks->bpr[0] * (uint64_t)ks->ph[0])) {
-        fwrite(rb, ks->bpr[0] * (uint64_t)ks->ph[0], 1, f);
+    /* canvas readback only behind tile-dump-read=on: it raced the memory
+     * layer at dump time twice (0xc0000374), and the canvas is verified
+     * byte-exact (kt1v2 dump: Y 0/262144, C 0/65536) so the stage suffices */
+    if (s->tile_dump_read) {
+        g_autofree uint8_t *rb = g_malloc(ks->bpr[0] * (uint64_t)ks->ph[0] + 16);
+        if (vtpv_ksurf_read(s, ks, ks->off[0], rb, ks->bpr[0] * (uint64_t)ks->ph[0])) {
+            fwrite(rb, ks->bpr[0] * (uint64_t)ks->ph[0], 1, f);
+        }
+        g_free(rb);
+        g_autofree uint8_t *rbc = g_malloc((uint64_t)ks->bpr[1] * ks->ph[1] + 16);
+        if (ks->planes > 1 && vtpv_ksurf_read(s, ks, ks->off[1], rbc,
+                                              (uint64_t)ks->bpr[1] * ks->ph[1])) {
+            fwrite(rbc, (uint64_t)ks->bpr[1] * ks->ph[1], 1, f);
+        }
+        g_free(rbc);
     }
-    g_free(rb);
-    g_autofree uint8_t *rbc = g_malloc((uint64_t)ks->bpr[1] * ks->ph[1] + 16);
-    if (ks->planes > 1 && vtpv_ksurf_read(s, ks, ks->off[1], rbc,
-                                          (uint64_t)ks->bpr[1] * ks->ph[1])) {
-        fwrite(rbc, (uint64_t)ks->bpr[1] * ks->ph[1], 1, f);
-    }
-    g_free(rbc);
     fclose(f);
     fprintf(stderr, "apple-vtpv: tile dump %u -> %s (%.4s %ux%u at %u,%u dw %u dh %u)\n",
             n, path, (const char *)&ks->pixfmt, ks->pw[0], ks->ph[0], ox, oy, dw, dh);
@@ -2158,15 +2188,24 @@ static void vtpv_tdem_pump(AppleVtpv *s)
             timer_mod(s->tdem_timer, t->due_us);
             return;
         }
-        if (s->tdem_unacked[t->slot] >= s->tdem_window &&
+        if (!s->tdem_fast &&
+            s->tdem_unacked[t->slot] >= s->tdem_window &&
             now - s->tdem_last_us < VTPV_TDEM_STALL_US) {
             if (p < 40) { p++; fprintf(stderr, "apple-vtpv: pump hold stall unacked=%d\n", s->tdem_unacked[t->slot]); }
             timer_mod(s->tdem_timer, s->tdem_last_us + VTPV_TDEM_STALL_US);
             return;
         }
-        if (vtpv_h2g_busy(s, t->slot) && now < t->due_us + VTPV_TDEM_DRAIN_US) {
+        if (!s->tdem_fast &&
+            vtpv_h2g_busy(s, t->slot) && now < t->due_us + VTPV_TDEM_DRAIN_US) {
             if (p < 40) { p++; fprintf(stderr, "apple-vtpv: pump hold busy drain (dt %lld us)\n", (long long)(now - t->due_us)); }
             timer_mod(s->tdem_timer, now + 3000);
+            return;
+        }
+        if (s->tdem_fast && !vtpv_dq_room(s, t->slot, 4096)) {
+            /* ring-free pacing: no fixed holds, but keep room for the next
+             * kick's in-kick reply - it must never wait behind outboxed
+             * TDems; recheck on a short timer */
+            timer_mod(s->tdem_timer, now + 200);
             return;
         }
         if (p < 40) { p++; fprintf(stderr, "apple-vtpv: pump SEND dt %lld us busy=%d\n", (long long)(now - t->due_us), vtpv_h2g_busy(s, t->slot)); }
@@ -2363,6 +2402,9 @@ static void *vtpv_tile_thread(void *opaque)
     return NULL;
 }
 
+/* bounded serial-log budget for the tile-stage timing prints (kfill/ktile) */
+static int g_klog;
+
 /* decoded tiles -> their canvases, the kext's done word, their 'TDem's (BQL;
  * in decode order, so done only ever moves forward) */
 static void vtpv_tile_complete(AppleVtpv *s)
@@ -2376,11 +2418,17 @@ static void vtpv_tile_complete(AppleVtpv *s)
             break;
         }
         int32_t err = -12909;       /* kVTVideoDecoderBadDataErr */
+        int64_t f0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         if (!j->cancel && j->ok &&
             vtpv_fill_tile(s, &j->ks, j->pic, j->gray, j->csx, j->csy, j->w, j->h, j->sx, j->sy,
                            j->tw ? j->tw : j->w, j->th ? j->th : j->h, j->ox, j->oy)) {
             vtpv_note_surface(&j->ks);
             err = 0;
+        }
+        int64_t f1 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        if (qatomic_fetch_inc(&g_klog) < 120 && f1 - f0 > 500) {
+            fprintf(stderr, "apple-vtpv: kfill %lld us (canvas %u %ux%u)\n",
+                    (long long)(f1 - f0), j->ks.id, j->ks.pw[0], j->ks.ph[0]);
         }
         uint32_t le_done = cpu_to_le32(j->token);
         dma_memory_write(as, j->hold_gpa + 4, &le_done, 4, MEMTXATTRS_UNSPECIFIED);
@@ -2460,7 +2508,6 @@ static void vtpv_dtil_dx(AppleVtpv *s, int slot, uint64_t total, uint64_t tile_i
 {
     /* 25rm regression hunt (g0b/g1b: reply p50 ~860 ms with the gate OFF):
      * bounded per-stage timing of the dtil kick, to the serial log. */
-    static int g_klog;
     bool ktiming = qatomic_fetch_inc(&g_klog) < 120;
     int64_t kt0 = ktiming ? qemu_clock_get_us(QEMU_CLOCK_REALTIME) : 0;
     int64_t kt1 = 0, kt2 = 0;
@@ -4241,6 +4288,8 @@ static const Property vtpv_properties[] = {
     DEFINE_PROP_BOOL("tdem-kick-gated", AppleVtpv, tdem_kick_gated, false),
     DEFINE_PROP_BOOL("kickdesc", AppleVtpv, kickdesc, false),
     DEFINE_PROP_UINT32("tile-dump", AppleVtpv, tile_dump_left, 0),
+    DEFINE_PROP_BOOL("tile-dump-read", AppleVtpv, tile_dump_read, false),
+    DEFINE_PROP_BOOL("tdem-fast", AppleVtpv, tdem_fast, false),
     DEFINE_PROP_UINT64("tdem-gate-cap-us", AppleVtpv, tdem_gate_cap_us, 100000),
     DEFINE_PROP_STRING("decgpu", AppleVtpv, dec_gpu_str),
     DEFINE_PROP_STRING("hwbackend", AppleVtpv, hwbackend_str),
