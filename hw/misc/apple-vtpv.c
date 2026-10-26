@@ -276,6 +276,9 @@ struct AppleVtpv {
     uint32_t tdem_unacked[VTPV_MAX_SLOT];
     uint32_t tdem_window;
     bool tdem_fast;               /* tdem-fast=on: pace by h2g ring free space, no fixed holds */
+    bool tile_uui;                /* tile-uui=off: 'TDem' carries no ',uui' - the guest emits its own
+                                   * canvas (rec[+0x20], retained at DecodeTile) instead of resolving
+                                   * our echoed UUID in its registry; immune to late-emit staleness */
     int64_t tdem_last_us;
     /* RE 25x (Ghidra, guest VideoToolbox + VideoToolboxParavirtualizationSupport)
      * + rfq1/rfq3 matrix: the guest takes TWO reply paths.  The plain sync sends
@@ -2282,7 +2285,7 @@ static void vtpv_tile_tdem(AppleVtpv *s, int slot, const uint8_t *uuid16, uint64
     n += vtpv_para_put(paras + n, 0x2c74696cu /* ',til' */, "=s64", &be_til, 8);
     n += vtpv_para_put(paras + n, 0x2c657272u /* ',err' */, "=s32", &be_err, 4);
     n += vtpv_para_put(paras + n, 0x2c696e66u /* ',inf' */, "=u32", &be_inf, 4);
-    if (uui) {
+    if (uui && s->tile_uui) {
         n += vtpv_para_put(paras + n, 0x2c757569u /* ',uui' */, "=uui", uui, 16);
     }
     VtpvTdem *t = g_new0(VtpvTdem, 1);
@@ -4290,6 +4293,8 @@ static const Property vtpv_properties[] = {
     DEFINE_PROP_UINT32("tile-dump", AppleVtpv, tile_dump_left, 0),
     DEFINE_PROP_BOOL("tile-dump-read", AppleVtpv, tile_dump_read, false),
     DEFINE_PROP_BOOL("tdem-fast", AppleVtpv, tdem_fast, true),   /* A/B won 10-26: tail p99 124->72-86ms, 0 errors, 108/108; off = rollback */
+    DEFINE_PROP_BOOL("tile-uui", AppleVtpv, tile_uui, true),     /* off = A/B 10-27: emit without ',uui' (the guest uses its own
+                                                                   * retained canvas) against the 16 ms-p50 late-emit retry loop */
     DEFINE_PROP_UINT64("tdem-gate-cap-us", AppleVtpv, tdem_gate_cap_us, 100000),
     DEFINE_PROP_STRING("decgpu", AppleVtpv, dec_gpu_str),
     DEFINE_PROP_STRING("hwbackend", AppleVtpv, hwbackend_str),
