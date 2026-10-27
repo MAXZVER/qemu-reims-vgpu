@@ -1021,8 +1021,11 @@ static void vtpv_gate_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
         se->gate_seen_i = (se->gate_seen_i + 1) & 63;
     }
     if (warm) {
-        if (se->gate_on) {
-            se->gate_on = false;
+        /* do NOT lift on a single warm answer: the hidden pool keeps recycling
+         * its decode-ahead buffers (yt21: 30 instant ON/LIFT flaps); the lift
+         * is a whole window whose cold count collapsed (below) */
+        return;
+    }
             fprintf(stderr, "apple-vtpv: dbuf-gate LIFTED (surface %u recycled)\n", surf0);
         }
         return;
@@ -1032,6 +1035,12 @@ static void vtpv_gate_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
         se->gate_cold_prev = se->gate_cold_win;
         se->gate_win_us = now;
         se->gate_cold_win = 0;
+        if (se->gate_on && se->gate_cold_prev < 4) {
+            se->gate_on = false;
+            fprintf(stderr, "apple-vtpv: dbuf-gate LIFTED (a clean window: %u cold)
+",
+                    se->gate_cold_prev);
+        }
     }
     se->gate_cold_win++;
     if (s->dbuf_gate && se->gate_cold_win % 16 == 0) {
