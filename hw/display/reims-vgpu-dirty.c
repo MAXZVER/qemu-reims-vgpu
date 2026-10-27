@@ -424,6 +424,22 @@ struct ReimsVgpuDirty {
     uint64_t lab_gen_fast;    /* TEMP lab: fast-path answers since the last report */
     uint64_t lab_gen_lagged;  /* TEMP lab: lagged answers since the last report */
     /*
+     * TEMP lab REIMS_VGPU_LAB_DIRTY_GEN_REPEEK=N (0 = off): after the lock-free
+     * fast path misses, re-peek under RCU instead of queueing on `lock` at
+     * once. The miss usually means the epoch rolled and the on-demand worker
+     * is mid-sync of exactly this set (i1146/sp9, 2026-10-27: of ~135k
+     * stale-path reads a boot, 99.9 % found the set already synced once they
+     * got the lock - the whole cost was the two lock round-trips). The
+     * worker publishes the set's generation before it releases `lock`, so a
+     * trylock that FAILS is the signal a publish is in flight: peek until it
+     * lands. A trylock that SUCCEEDS means the tracker is idle - the locked
+     * path is the right answer at once, no spin. The peek is the same
+     * acquire-load the fast path runs, so a hit carries the same guarantee;
+     * bounded by N rounds whether or not anything lands.
+     */
+    uint32_t gen_repeek;
+    uint64_t lab_repeek_hit, lab_repeek_miss, lab_repeek_trylock, lab_repeek_rounds;
+    /*
      * The prefetch batch's page union: one bit per target page frame, set for
      * every page of every claimed set and cleared again as the runs are read
      * back out, so it is all-zero between batches. Scanning it yields the
@@ -5449,6 +5465,38 @@ uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token)
         }
         return gen;
     }
+    /* TEMP lab REIMS_VGPU_LAB_DIRTY_GEN_REPEEK: see the field's doc. Only on
+     * the RCU peek (lf_mode 1): a re-peek through the locked variant would
+     * take sets_lock per round and be the queue it exists to avoid. Lagged
+     * and nosync reads must not wait for a publish at all. */
+    if (d->gen_repeek && d->lf_mode == 1 && !lagged && !d->lab_nosync &&
+        qatomic_read(&d->ondemand)) {
+        uint32_t rounds;
+        bool hit = false;
+
+        for (rounds = 0; rounds < d->gen_repeek; rounds++) {
+            if (qemu_mutex_trylock(&d->lock) == 0) {
+                qemu_mutex_unlock(&d->lock);
+                qatomic_inc(&d->lab_repeek_trylock);
+                break;   /* the tracker is idle: nothing is about to publish */
+            }
+            if (reims_vgpu_dirty_gen_synced(d, token, &gen)) {
+                hit = true;
+                break;
+            }
+            cpu_relax();
+        }
+        if (hit) {
+            qatomic_inc(&d->lab_repeek_hit);
+            if (lt0) {
+                qatomic_add(&d->lab_fast_ns, get_clock() - lt0);
+                qatomic_inc(&d->lab_fast_n);
+            }
+            return gen;
+        }
+        qatomic_inc(&d->lab_repeek_miss);
+        qatomic_add(&d->lab_repeek_rounds, rounds);
+    }
     if ((lagged || d->lab_nosync) && qatomic_read(&d->ondemand)) {
         return reims_vgpu_dirty_gen_lagged(d, token);
     }
@@ -8323,6 +8371,16 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                     d->lab_settle_skips, d->lab_settle_skip_cand, d->ticket_batch,
                     d->lab_tb_syncs, d->lab_tb_batches);
             reims_vgpu_dirty_gap_refresh();   /* TEMP lab live DIRTY_GAP */
+            if (d->gen_repeek) {   /* TEMP lab REIMS_VGPU_LAB_DIRTY_GEN_REPEEK */
+                fprintf(stderr, "reims-dirty-genrepeek epoch_ms=%" PRId64
+                        " hit=%" PRIu64 " miss=%" PRIu64 " trylock=%" PRIu64
+                        " miss_rounds=%" PRIu64 "\n",
+                        g_get_real_time() / 1000,
+                        qatomic_xchg(&d->lab_repeek_hit, 0),
+                        qatomic_xchg(&d->lab_repeek_miss, 0),
+                        qatomic_xchg(&d->lab_repeek_trylock, 0),
+                        qatomic_xchg(&d->lab_repeek_rounds, 0));
+            }
             {   /* TEMP lab: who syncs the large sets in the foreground */
                 int c;
 
@@ -8909,6 +8967,11 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
         d->epoch_named = reims_vgpu_dirty_lab_mode("REIMS_VGPU_LAB_EPOCH_NAMED") == 1;
         d->lf_mode = getenv("REIMS_VGPU_LAB_GEN_LOCKFREE")
                      ? reims_vgpu_dirty_lab_mode("REIMS_VGPU_LAB_GEN_LOCKFREE") : 1;
+        d->gen_repeek = getenv("REIMS_VGPU_LAB_DIRTY_GEN_REPEEK") ?   /* lab A/B */
+                        MAX(0, atoi(getenv("REIMS_VGPU_LAB_DIRTY_GEN_REPEEK"))) : 0;
+        if (d->gen_repeek) {
+            fprintf(stderr, "reims-dirty-genrepeek on rounds=%u\n", d->gen_repeek);
+        }
         d->period_mode = getenv("REIMS_VGPU_LAB_DIRTY_PERIOD") &&     /* lab A/B */
                          strcmp(getenv("REIMS_VGPU_LAB_DIRTY_PERIOD"), "on") == 0;
         d->hash_ns = getenv("REIMS_VGPU_LAB_DIRTY_HASH_NS") ?
