@@ -101,6 +101,7 @@ typedef struct VtpvSess {
         bool queued;                /* handed to the decode thread (dec_lock) */
         bool decoded;               /* the decode thread is done: nv12 or nothing */
         bool shed;                  /* backlog: decoded for its references only, completed dropped */
+        bool dno;                   /* TEMP lab dno: the player asked kVTDecodeFrame_DoNotOutputFrame */
         uint8_t *nv12;              /* outbuf: decoded picture waiting for its buffer */
         uint32_t w, h;
         uint8_t *sample;            /* outbuf: or the compressed sample, decoded at the reply */
@@ -321,6 +322,21 @@ struct AppleVtpv {
     bool decthread;                 /* decode ahead on the decode thread (A/B: off = at the reply) */
     uint32_t backlog;               /* frames waiting for a 'Dbuf' past which the oldest are shed (0: never) */
     uint64_t shed_total;
+    /* TEMP lab (prop dno=on): the 'dfrm' ',dfl' decode flags.  Bit 1 is
+     * kVTDecodeFrame_DoNotOutputFrame - a player that needs a frame only as a
+     * reference (catching up, seeking) asks for it decoded and NOT output; a
+     * real decoder then calls back with no image and kVTDecodeInfo_FrameDropped.
+     * This device asked the guest's pool for a buffer ('Dbuf') and emitted a
+     * picture for every such frame, so a player behind its clock spent its pool
+     * and its time on pictures it had said it would throw away - the live
+     * wallpaper's spiral (140+ 'dfrm'/s, 115 % CPU) is the suspect.  With dno
+     * on, such a frame is decoded for its references in decode order and
+     * completed dropped without a buffer, through the backlog's shed path. */
+    bool dno;
+    uint32_t cur_dfl;               /* ',dfl' of the 'dfrm' being handled */
+    uint32_t dfl_seen[8];           /* distinct ',dfl' values already printed */
+    uint32_t dfl_seen_n;
+    uint64_t dfl_dno_n;             /* frames that asked DoNotOutputFrame */
     bool tiles;                     /* off: refuse tile sessions ('dsts'), the guest decodes HEIF itself */
     uint64_t surfdesc_gpa;          /* VTPV_SURFDESC of the next kick */
     uint64_t kickdesc_gpa;          /* VTPV_KICKDESC latch (two 32-bit halves) */
@@ -943,6 +959,7 @@ static void vtpv_send_dbuf(AppleVtpv *s, int slot, uint64_t frame_id,
     s->cur->frame[free_i].queued = false;
     s->cur->frame[free_i].decoded = false;
     s->cur->frame[free_i].shed = false;
+    s->cur->frame[free_i].dno = s->dno && s->decthread && (s->cur_dfl & (1u << 1));
     g_free(s->cur->frame[free_i].nv12);
     s->cur->frame[free_i].nv12 = NULL;
     g_free(s->cur->frame[free_i].sample);
@@ -968,7 +985,7 @@ static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
     VtpvSess *se = s->cur;
     se->slot = slot;
     vtpv_shed_reap(s, se);
-    while (se->dbuf_out < VTPV_DBUF_INFLIGHT) {
+    for (;;) {
         int next = -1;
         for (int i = 0; i < VTPV_FRAMES; i++) {
             if (se->frame[i].in_use && !se->frame[i].dbuf_sent && !se->frame[i].shed &&
@@ -977,6 +994,25 @@ static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
             }
         }
         if (next < 0) {
+            return;
+        }
+        /* TEMP lab dno: the oldest waiting frame was asked not to be output -
+         * decode it now, in decode order (every older frame is already queued
+         * or shed), and complete it dropped without a buffer */
+        if (se->frame[next].dno) {
+            if (se->frame[next].sample && !se->frame[next].nv12 &&
+                !vtpv_dec_queue(s, se, next)) {
+                return;             /* the decode queue is full: next pump */
+            }
+            se->frame[next].shed = true;
+            se->shed_n++;
+            s->shed_total++;
+            if (!timer_pending(s->outbox_timer)) {
+                timer_mod(s->outbox_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1);
+            }
+            continue;
+        }
+        if (se->dbuf_out >= VTPV_DBUF_INFLIGHT) {
             return;
         }
         uint8_t paras[128];
@@ -2729,6 +2765,26 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
         non_tile_dfrm = !til && frm && vlen == 8;
         if (non_tile_dfrm) {
             s->last_frame_id = ldq_be_p(frm);
+            uint32_t dlen = 0;
+            const uint8_t *dfl = vtpv_para_find(s->msg, total, 0x2c64666cu /* ',dfl' */, &dlen);
+            s->cur_dfl = dfl && dlen == 4 ? ldl_be_p(dfl) : 0;
+            bool fresh = true;
+            for (uint32_t k = 0; k < s->dfl_seen_n; k++) {
+                fresh &= s->dfl_seen[k] != s->cur_dfl;
+            }
+            if (fresh && s->dfl_seen_n < ARRAY_SIZE(s->dfl_seen)) {
+                s->dfl_seen[s->dfl_seen_n++] = s->cur_dfl;
+                fprintf(stderr, "apple-vtpv: dfrm dfl=0x%x first seen (frame %llu, dno=%d)\n",
+                        s->cur_dfl, (unsigned long long)s->last_frame_id, s->dno);
+            }
+            if (s->cur_dfl & (1u << 1)) {
+                s->dfl_dno_n++;
+                if ((s->dfl_dno_n & 255) == 1) {
+                    fprintf(stderr, "apple-vtpv: dfrm DoNotOutputFrame n=%llu shed_total=%llu\n",
+                            (unsigned long long)s->dfl_dno_n,
+                            (unsigned long long)s->shed_total);
+                }
+            }
             if (s->outbuf && s->hwdecode && vtpv_use_dx(s)) {
                 /* the first picture of a stream is decoded now - its size
                  * goes into 'Dpba' before the first 'Dbuf'; later samples
@@ -4295,6 +4351,7 @@ static const Property vtpv_properties[] = {
     DEFINE_PROP_BOOL("outbuf", AppleVtpv, outbuf, true),
     DEFINE_PROP_BOOL("decthread", AppleVtpv, decthread, true),
     DEFINE_PROP_UINT32("backlog", AppleVtpv, backlog, 0),
+    DEFINE_PROP_BOOL("dno", AppleVtpv, dno, false),
     DEFINE_PROP_BOOL("tiles", AppleVtpv, tiles, true),
     DEFINE_PROP_BOOL("writeback", AppleVtpv, writeback, true),
     DEFINE_PROP_BOOL("hwdecode", AppleVtpv, hwdecode, true),
