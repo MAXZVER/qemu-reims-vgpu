@@ -994,9 +994,10 @@ static void vtpv_send_dbuf(AppleVtpv *s, int slot, uint64_t frame_id,
     vtpv_shed(s, s->cur);
 }
 
-#define DBUF_GATE_COLD_WIN 28      /* cold answers per 10 s window to trip; the measured hidden
-                                   * leak is ~32/10 s.  Two consecutive windows >= 20 confirm, so a
-                                   * resolution-switch burst (one hot window) cannot trip */
+#define DBUF_GATE_COLD_WIN 12      /* cold answers per 10 s window to trip; the measured hidden
+                                   * leak is 16-32/10 s across boots.  Two consecutive windows >= 8
+                                   * confirm, so a resolution-switch burst (one hot window) cannot
+                                   * trip */
 #define DBUF_GATE_PROBE_US 500000  /* one probe 'Dbuf' out per 500 ms while gated */
 
 /* a 'Dbuf' ANSWER arrived carrying these surfaces: cold = never seen for the
@@ -1037,7 +1038,7 @@ static void vtpv_gate_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
         fprintf(stderr, "apple-vtpv: gate-diag cold=%u in window (seen=%u)\n",
                 se->gate_cold_win, se->gate_seen_n);
     }
-    if (se->gate_cold_win >= DBUF_GATE_COLD_WIN && se->gate_cold_prev >= 20 && !se->gate_on) {
+    if (se->gate_cold_win >= DBUF_GATE_COLD_WIN && se->gate_cold_prev >= 8 && !se->gate_on) {
         se->gate_on = true;
         fprintf(stderr, "apple-vtpv: dbuf-gate ON (session: %u cold answer surfaces in 10 s)\n",
                 se->gate_cold_win);
