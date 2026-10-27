@@ -118,13 +118,6 @@ typedef struct VtpvSess {
      * goes quiet.  The held-back 'Dbuf's are the player's own back-pressure:
      * its buffer acquisition blocks, the pipeline pauses - what a real Mac's
      * display link does to a hidden layer. */
-    bool gate_on;
-    int64_t gate_probe_us;
-    uint32_t gate_cold_win;         /* cold answers inside the current 10 s window */
-    int64_t gate_win_us;
-    uint32_t gate_cold_prev;        /* the previous window's count, for the two-window confirm */
-    uint64_t gate_seen[64];         /* recent answer surface ids, ring */
-    uint32_t gate_seen_n, gate_seen_i;
     int slot;                       /* the slot its 'Dbuf's go out on */
     bool dpba_sent;
     uint32_t dpba_w, dpba_h;        /* size the last 'Dpba' announced */
@@ -296,6 +289,16 @@ struct AppleVtpv {
     bool canvas_probe;
     bool dbuf_gate;                /* TEMP lab: gate 'Dbuf's on the hidden-layer cold-surface signature */
     bool dbuf_gate_live;           /* TEMP lab: dbuf-gate=live - the flag file is the switch */
+    /* dbuf-gate state lives on the DEVICE: the hidden layer's sessions churn
+     * (dsts/dinv cycles restart a fresh decoder every few seconds) and the
+     * leak is continuous across them - a per-session window can never fill */
+    bool gate_on;
+    int64_t gate_probe_us;
+    uint32_t gate_cold_win;
+    int64_t gate_win_us;
+    uint32_t gate_cold_prev;
+    uint64_t gate_seen[64];
+    uint32_t gate_seen_n, gate_seen_i;
     int64_t gate_live_check_us;                /* tile-uui=off: 'TDem' carries no ',uui' - the guest emits its own
                                    * canvas (rec[+0x20], retained at DecodeTile) instead of resolving
                                    * our echoed UUID in its registry; immune to late-emit staleness */
@@ -1024,43 +1027,43 @@ static void vtpv_gate_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
         return;
     }
     bool warm = false;
-    for (uint32_t i = 0; i < se->gate_seen_n; i++) {
-        if (se->gate_seen[i] == surf0) {
+    for (uint32_t i = 0; i < s->gate_seen_n; i++) {
+        if (s->gate_seen[i] == surf0) {
             warm = true;
             break;
         }
     }
-    if (se->gate_seen_n < 64) {
-        se->gate_seen[se->gate_seen_n++] = surf0;
+    if (s->gate_seen_n < 64) {
+        s->gate_seen[s->gate_seen_n++] = surf0;
     } else {
-        se->gate_seen[se->gate_seen_i] = surf0;
-        se->gate_seen_i = (se->gate_seen_i + 1) & 63;
+        s->gate_seen[s->gate_seen_i] = surf0;
+        s->gate_seen_i = (s->gate_seen_i + 1) & 63;
     }
     int64_t now_ans = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     /* the window runs on EVERY answer (v3's bug: the warm early-return made
      * the clean-window lift unreachable and deadlocked the gate ON) */
-    if (se->gate_win_us == 0 || now_ans - se->gate_win_us >= 5000000) {
-        se->gate_cold_prev = se->gate_cold_win;
-        se->gate_win_us = now_ans;
-        se->gate_cold_win = 0;
-        if (se->gate_on && se->gate_cold_prev < 3) {
-            se->gate_on = false;
+    if (s->gate_win_us == 0 || now_ans - s->gate_win_us >= 5000000) {
+        s->gate_cold_prev = s->gate_cold_win;
+        s->gate_win_us = now_ans;
+        s->gate_cold_win = 0;
+        if (s->gate_on && s->gate_cold_prev < 3) {
+            s->gate_on = false;
             fprintf(stderr, "apple-vtpv: dbuf-gate LIFTED (clean window: %u cold)\nn",
-                    se->gate_cold_prev);
+                    s->gate_cold_prev);
         }
     }
     if (warm) {
         return;
     }
-    se->gate_cold_win++;
-    if (s->dbuf_gate && se->gate_cold_win % 8 == 0) {
+    s->gate_cold_win++;
+    if (s->dbuf_gate && s->gate_cold_win % 8 == 0) {
         fprintf(stderr, "apple-vtpv: gate-diag cold=%u in window (seen=%u)\nn",
-                se->gate_cold_win, se->gate_seen_n);
+                s->gate_cold_win, s->gate_seen_n);
     }
-    if (se->gate_cold_win >= DBUF_GATE_COLD_WIN && se->gate_cold_prev >= 4 && !se->gate_on) {
-        se->gate_on = true;
+    if (s->gate_cold_win >= DBUF_GATE_COLD_WIN && s->gate_cold_prev >= 4 && !s->gate_on) {
+        s->gate_on = true;
         fprintf(stderr, "apple-vtpv: dbuf-gate ON (session: %u cold answer surfaces in 5 s)\nn",
-                se->gate_cold_win);
+                s->gate_cold_win);
     }
 }
 
@@ -1101,16 +1104,16 @@ static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
         if (se->dbuf_out >= VTPV_DBUF_INFLIGHT) {
             return;
         }
-        if (s->dbuf_gate && se->gate_on) {
+        if (s->dbuf_gate && s->gate_on) {
             /* hidden-like: throttle to ~8 'Dbuf'/s (the player degrades to a
              * hidden-tab cadence instead of freezing - v3's hard hold worked
              * but stalled the switch-back 824 ms; v4's probe-lift flapped on
              * the pool's recycled stock).  Lift = the clean window (v5). */
             int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
-            if (now < se->gate_probe_us) {
+            if (now < s->gate_probe_us) {
                 return;
             }
-            se->gate_probe_us = now + DBUF_GATE_PROBE_US;
+            s->gate_probe_us = now + DBUF_GATE_PROBE_US;
         }
         uint8_t paras[128];
         uint32_t n = 0;
@@ -1523,9 +1526,6 @@ static VtpvSess *vtpv_sess_get(AppleVtpv *s, const uint8_t *uuid16)
         }
     }
     vtpv_sess_free(s, se);
-    memset(&se->gate_on, 0, sizeof(se->gate_on) + sizeof(se->gate_probe_us) +
-           sizeof(se->gate_cold_win) + sizeof(se->gate_cold_prev) + sizeof(se->gate_win_us) + sizeof(se->gate_seen) +
-           sizeof(se->gate_seen_n) + sizeof(se->gate_seen_i));
     se->used = true;
     memcpy(se->uuid, uuid16, 16);
     se->last_use = ++s->sess_clock;
