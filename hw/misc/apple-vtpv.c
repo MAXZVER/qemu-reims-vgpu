@@ -1026,10 +1026,6 @@ static void vtpv_gate_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
          * is a whole window whose cold count collapsed (below) */
         return;
     }
-            fprintf(stderr, "apple-vtpv: dbuf-gate LIFTED (surface %u recycled)\n", surf0);
-        }
-        return;
-    }
     int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     if (se->gate_win_us == 0 || now - se->gate_win_us >= 10000000) {
         se->gate_cold_prev = se->gate_cold_win;
@@ -1037,8 +1033,7 @@ static void vtpv_gate_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
         se->gate_cold_win = 0;
         if (se->gate_on && se->gate_cold_prev < 4) {
             se->gate_on = false;
-            fprintf(stderr, "apple-vtpv: dbuf-gate LIFTED (a clean window: %u cold)
-",
+            fprintf(stderr, "apple-vtpv: dbuf-gate LIFTED (a clean window: %u cold)\n",
                     se->gate_cold_prev);
         }
     }
