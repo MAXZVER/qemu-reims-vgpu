@@ -1021,9 +1021,16 @@ static void vtpv_gate_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
         se->gate_seen_i = (se->gate_seen_i + 1) & 63;
     }
     if (warm) {
-        /* do NOT lift on a single warm answer: the hidden pool keeps recycling
-         * its decode-ahead buffers (yt21: 30 instant ON/LIFT flaps); the lift
-         * is a whole window whose cold count collapsed (below) */
+        /* while gated, the ONLY 'Dbuf' in flight is our probe (the rest are
+         * held): a warm PROBE answer means the layer consumes again - visible
+         * again - so lift at once.  Ungated warm answers (the pool's own
+         * decode-ahead recycles) never reach a lift (yt21's 30 flaps) */
+        if (se->gate_on) {
+            se->gate_on = false;
+            se->gate_cold_win = 0;
+            fprintf(stderr, "apple-vtpv: dbuf-gate LIFTED (probe surface %u recycled)\n",
+                    surf0);
+        }
         return;
     }
     int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
