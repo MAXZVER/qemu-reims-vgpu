@@ -449,6 +449,14 @@ struct ReimsVgpuDirty {
     bool gen_hist;
     uint64_t lab_genh[6];   /* <1us, <3, <10, <40, <200, rest */
     /*
+     * TEMP lab REIMS_VGPU_LAB_DIRTY_EPOCH_HOTSYNC=on: at every doorbell (epoch
+     * open), hand the sets the previous epoch read to the od workers through
+     * the ahead queue, so their sync races the packet's walk instead of its
+     * first bind. Counters in the reims-dirty-hotsync report line.
+     */
+    bool epoch_hotsync;
+    uint64_t lab_hotq_n, lab_hotq_epochs, lab_hotq_full;
+    /*
      * The prefetch batch's page union: one bit per target page frame, set for
      * every page of every claimed set and cleared again as the runs are read
      * back out, so it is all-zero between batches. Scanning it yields the
@@ -4899,6 +4907,9 @@ bool reims_vgpu_dirty_tail_unnoted(ReimsVgpuDirty *d, uint32_t channel, uint32_t
  * Called before note_work_scope, which then makes the reads need that epoch.
  * Exact without any assumption about how many doorbells a batch rings.
  */
+/* Most tokens the ahead queue holds; past it a pass's names wait for its own reads. */
+#define REIMS_VGPU_DIRTY_AHEAD_MAX 1024
+
 bool reims_vgpu_dirty_note_ring_tail(ReimsVgpuDirty *d, uint32_t channel, uint32_t tail)
 {
     bool opened = false;
@@ -4931,6 +4942,9 @@ bool reims_vgpu_dirty_note_ring_tail(ReimsVgpuDirty *d, uint32_t channel, uint32
         qatomic_set(&d->cover_valid, true);
     }
     qemu_mutex_unlock(&d->lock);
+    /* epoch_hotsync wakes the od workers with its own broadcast above; the
+     * harvest wake this return drives is the old TAILWAKE shape (whole-epoch
+     * prefetch at the doorbell - measured drag-worse) and stays opt-in. */
     return opened && d->tailwake_mode && (qatomic_read(&d->log_wanted) || d->od_prefetch);
 }
 
@@ -8419,6 +8433,13 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                         qatomic_xchg(&d->lab_genh[2], 0), qatomic_xchg(&d->lab_genh[3], 0),
                         qatomic_xchg(&d->lab_genh[4], 0), qatomic_xchg(&d->lab_genh[5], 0));
             }
+            if (d->epoch_hotsync) {   /* TEMP lab REIMS_VGPU_LAB_DIRTY_EPOCH_HOTSYNC */
+                fprintf(stderr, "reims-dirty-hotsync epoch_ms=%" PRId64
+                        " tokens=%" PRIu64 " epochs=%" PRIu64 " full=%" PRIu64 "\n",
+                        g_get_real_time() / 1000,
+                        qatomic_xchg(&d->lab_hotq_n, 0), qatomic_xchg(&d->lab_hotq_epochs, 0),
+                        qatomic_xchg(&d->lab_hotq_full, 0));
+            }
             {   /* TEMP lab: who syncs the large sets in the foreground */
                 int c;
 
@@ -8751,7 +8772,6 @@ static void *reims_vgpu_dirty_od_worker(void *opaque)
 }
 
 /* Most tokens the ahead queue holds; past it a pass's names wait for its own reads. */
-#define REIMS_VGPU_DIRTY_AHEAD_MAX 1024
 
 /*
  * TEMP lab SYNC_AHEAD: queue the sets of `tokens` for the prefetch workers to sync for the epoch
@@ -9012,6 +9032,8 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
         }
         d->gen_hist = getenv("REIMS_VGPU_LAB_DIRTY_GEN_HIST") &&   /* lab */
                       strcmp(getenv("REIMS_VGPU_LAB_DIRTY_GEN_HIST"), "on") == 0;
+        d->epoch_hotsync = getenv("REIMS_VGPU_LAB_DIRTY_EPOCH_HOTSYNC") &&   /* lab A/B */
+                           strcmp(getenv("REIMS_VGPU_LAB_DIRTY_EPOCH_HOTSYNC"), "on") == 0;
         d->period_mode = getenv("REIMS_VGPU_LAB_DIRTY_PERIOD") &&     /* lab A/B */
                          strcmp(getenv("REIMS_VGPU_LAB_DIRTY_PERIOD"), "on") == 0;
         d->hash_ns = getenv("REIMS_VGPU_LAB_DIRTY_HASH_NS") ?
@@ -9405,6 +9427,41 @@ bool reims_vgpu_dirty_note_doorbell(ReimsVgpuDirty *d, int channel)
     }
     d->lab_od_epochs++;
     d->doorbell_ns = get_clock();
+        /*
+         * TEMP lab REIMS_VGPU_LAB_DIRTY_EPOCH_HOTSYNC=on: the sets the previous
+         * epoch read are the ones THIS epoch's first bind of each window will
+         * ask for, and that first read is the one paying 40us-1ms (GEN_HIST,
+         * sp13: ~12k such reads a boot are the whole ng_gen cost). Hand them to
+         * the workers the moment the epoch opens, ahead of the drain's walk, so
+         * the worker's sync races the packet read instead of the bind. Same
+         * queue sync_ahead feeds (workers take it first), same guards.
+         */
+        if (d->epoch_hotsync && d->od_nworkers && !d->od_stop) {
+            GHashTableIter it;
+            uint64_t *tkp;
+            ReimsVgpuDirtySet *s;
+            size_t queued = 0;
+
+            g_hash_table_iter_init(&it, d->sets);
+            while (g_hash_table_iter_next(&it, (void **)&tkp, (void **)&s)) {
+                if (s->gen == 0 || s->wp_state == WP_ON ||
+                    s->last_query_epoch < d->epoch - 1 ||
+                    s->synced_epoch >= d->epoch) {
+                    continue;
+                }
+                if (d->ahead->len - d->ahead_next >= REIMS_VGPU_DIRTY_AHEAD_MAX) {
+                    d->lab_hotq_full++;
+                    break;
+                }
+                g_array_append_val(d->ahead, *tkp);
+                queued++;
+            }
+            if (queued) {
+                d->lab_hotq_n += queued;
+                d->lab_hotq_epochs++;
+                qemu_cond_broadcast(&d->od_work_cond);
+            }
+        }
     d->db_chans |= channel >= 0 && channel < 63 ? 1ULL << channel : 1ULL << 63;
     want = d->log_wanted || g_hash_table_size(d->logged) == 0 || d->od_prefetch;
     qemu_mutex_unlock(&d->lock);
