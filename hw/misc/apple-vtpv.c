@@ -1025,7 +1025,14 @@ static void vtpv_gate_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
         }
         return;
     }
-    if (++se->gate_cold_run >= DBUF_GATE_COLD_RUN && !se->gate_on) {
+    ++se->gate_cold_run;
+    if (s->dbuf_gate && (se->gate_cold_run == 32 || se->gate_cold_run == 64 ||
+                         se->gate_cold_run == DBUF_GATE_COLD_RUN)) {
+        fprintf(stderr, "apple-vtpv: gate-diag cold_run=%u (seen=%u warm-reset)
+",
+                se->gate_cold_run, se->gate_seen_n);
+    }
+    if (se->gate_cold_run >= DBUF_GATE_COLD_RUN && !se->gate_on) {
         se->gate_on = true;
         fprintf(stderr, "apple-vtpv: dbuf-gate ON (session: %u consecutive cold answer surfaces)\n",
                 se->gate_cold_run);
