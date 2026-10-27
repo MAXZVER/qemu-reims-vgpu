@@ -111,6 +111,9 @@ typedef struct VtpvSess {
     uint64_t next_seq;
     uint32_t dbuf_out;              /* 'Dbuf's sent and not answered yet */
     uint32_t shed_n;                /* frames shed and not completed yet */
+    int32_t pace_credit;            /* dec-pace: asks allowed beyond recycling */
+    uint64_t pace_seen[256];
+    uint32_t pace_seen_n, pace_seen_i;
     /* dbuf-gate (TEMP lab): the hidden-layer signature - the layer stops
      * returning displayed buffers, the pool answers every 'Dbuf' with a
      * NEVER-SEEN surface (cold), forever.  Gate: hold new 'Dbuf's (one probe
@@ -300,6 +303,17 @@ struct AppleVtpv {
     uint32_t gate_cold_prev;
     uint64_t gate_seen[64];
     uint32_t gate_seen_n, gate_seen_i;
+    /* dec-pace (TEMP lab): the pool is the clock - a 'Dbuf' ask costs one
+     * credit, a warm (recycled-surface) answer earns one back; cold answers
+     * (the pool growing = decode-ahead the display never consumes) earn
+     * nothing, so a session runs ahead of its consumer by VTPV_PACE_CREDIT
+     * frames at most - what a real Mac's full VT output queue does. */
+    bool dec_pace;
+    bool dec_pace_live;
+    int64_t pace_live_check_us;
+    QEMUTimer *pace_timer;
+    uint8_t pace_uuid[16];
+    uint32_t pace_holds;
     int64_t gate_live_check_us;
     int64_t gate_diag_us;                /* tile-uui=off: 'TDem' carries no ',uui' - the guest emits its own
                                    * canvas (rec[+0x20], retained at DecodeTile) instead of resolving
@@ -1006,6 +1020,8 @@ static void vtpv_send_dbuf(AppleVtpv *s, int slot, uint64_t frame_id,
                                    * confirm, so a resolution-switch burst (one hot window) cannot
                                    * trip */
 #define DBUF_GATE_PROBE_US 125000  /* gated: one 'Dbuf' out per 125 ms (8/s) */
+#define VTPV_PACE_CREDIT 4         /* dec-pace: how far ahead of recycling a session may run */
+#define VTPV_PACE_MAX 8            /* dec-pace: credit ceiling (a return burst cannot bank more) */
 
 /* a 'Dbuf' ANSWER arrived carrying these surfaces: cold = never seen for the
  * session (the pool is NOT recycling), warm = the layer returned it once */
@@ -1077,6 +1093,31 @@ static void vtpv_gate_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
     }
 }
 
+/* dec-pace: 'Dbuf' answers are the pool clock.  A warm (recycled) surface
+ * means the consumer returned a buffer: the session may ask one more. */
+static void vtpv_pace_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
+{
+    if (!s->dec_pace && !s->dec_pace_live) {
+        return;
+    }
+    bool warm = false;
+    for (uint32_t i = 0; i < se->pace_seen_n; i++) {
+        if (se->pace_seen[i] == surf0) {
+            warm = true;
+            break;
+        }
+    }
+    if (se->pace_seen_n < 256) {
+        se->pace_seen[se->pace_seen_n++] = surf0;
+    } else {
+        se->pace_seen[se->pace_seen_i] = surf0;
+        se->pace_seen_i = (se->pace_seen_i + 1) & 255u;
+    }
+    if (warm && se->pace_credit < VTPV_PACE_MAX) {
+        se->pace_credit++;
+    }
+}
+
 /* ask the guest for buffers for the oldest waiting frames, at most
  * VTPV_DBUF_INFLIGHT at a time (the next goes out when one is answered) */
 static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
@@ -1114,6 +1155,30 @@ static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
         if (se->dbuf_out >= VTPV_DBUF_INFLIGHT) {
             return;
         }
+        if (s->dec_pace_live) {
+            int64_t nowp = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+            if (nowp >= s->pace_live_check_us) {
+                s->pace_live_check_us = nowp + 250000;
+                gchar *txt = NULL;
+                if (g_file_get_contents("C:/reims-lab/live/vtpv-decpace", &txt, NULL, NULL) && txt) {
+                    bool pon = g_str_has_prefix(g_strchomp(txt), "on");
+                    g_free(txt);
+                    if (pon != s->dec_pace) {
+                        s->dec_pace = pon;
+                        lab_elog("apple-vtpv: dec-pace LIVE %s\n", pon ? "ON" : "OFF");
+                    }
+                }
+            }
+        }
+        if (s->dec_pace && s->outbuf && se->dx && se->pace_credit <= 0) {
+            s->pace_holds++;
+            memcpy(s->pace_uuid, uuid16, 16);
+            if (!timer_pending(s->pace_timer)) {
+                timer_mod(s->pace_timer,
+                          qemu_clock_get_us(QEMU_CLOCK_REALTIME) + 10000);
+            }
+            return;
+        }
         if (s->dbuf_gate && s->gate_on) {
             /* hidden-like: throttle to ~8 'Dbuf'/s (the player degrades to a
              * hidden-tab cadence instead of freezing - v3's hard hold worked
@@ -1139,6 +1204,9 @@ static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
         vtpv_send_h2g(s, slot, 0x44627566u /* 'Dbuf' */, uuid16, id8, paras, n);
         se->frame[next].dbuf_sent = true;  /* in the queue or its outbox: never lost */
         se->dbuf_out++;
+        if (s->dec_pace && s->outbuf && se->dx) {
+            se->pace_credit--;
+        }
         if (s->decthread && se->frame[next].sample && !se->frame[next].nv12) {
             vtpv_dec_queue(s, se, next);    /* decode while the guest finds a buffer */
         }
@@ -1147,6 +1215,16 @@ static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
                     (unsigned long long)se->frame[next].frame_id,
                     (unsigned long long)s->host_msg_id, se->dbuf_out);
         }
+    }
+}
+
+/* dec-pace re-pump: a hold left frames waiting and no answer may ever come
+ * (the guest is itself waiting on our ask) - retry every 10 ms. */
+static void vtpv_pace_tick(void *opaque)
+{
+    AppleVtpv *s = opaque;
+    if (s->cur && s->cur->used) {
+        vtpv_pump_dbuf(s, s->cur->slot, s->pace_uuid);
     }
 }
 
@@ -1537,6 +1615,9 @@ static VtpvSess *vtpv_sess_get(AppleVtpv *s, const uint8_t *uuid16)
     }
     vtpv_sess_free(s, se);
     se->used = true;
+    se->pace_credit = VTPV_PACE_CREDIT;
+    se->pace_seen_n = 0;
+    se->pace_seen_i = 0;
     memcpy(se->uuid, uuid16, 16);
     se->last_use = ++s->sess_clock;
     return se;
@@ -3397,6 +3478,7 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
         uint64_t frame_id = s->cur->frame[hit].frame_id;
         if (nsurf) {
             vtpv_gate_note_answer(s, s->cur, sl->surf[0]);
+            vtpv_pace_note_answer(s, s->cur, sl->surf[0]);
         }
         s->cur->frame[hit].dbuf_sent = false;
         if (s->cur->dbuf_out) {
@@ -4426,6 +4508,7 @@ static void vtpv_realize(PCIDevice *dev, Error **errp)
                        QEMU_THREAD_DETACHED);
     s->outbox_timer = timer_new_ms(QEMU_CLOCK_REALTIME, vtpv_outbox_tick, s);
     s->tdem_timer = timer_new_us(QEMU_CLOCK_REALTIME, vtpv_tdem_tick, s);
+    s->pace_timer = timer_new_us(QEMU_CLOCK_REALTIME, vtpv_pace_tick, s);
     g_queue_init(&s->tdem_q);
     g_queue_init(&s->tile_q);
     g_queue_init(&s->tile_done);
@@ -4489,6 +4572,8 @@ static const Property vtpv_properties[] = {
     DEFINE_PROP_BOOL("canvas-probe", AppleVtpv, canvas_probe, false),
     DEFINE_PROP_BOOL("dbuf-gate", AppleVtpv, dbuf_gate, true),  /* A/B WON 10-27 (yt24+yt29: hidden kernel 9-12 % vs 47-117 % off; visible clean; appsmoke all-alive) - DEFAULT ON; off = rollback */
     DEFINE_PROP_BOOL("dbuf-gate-live", AppleVtpv, dbuf_gate_live, false), /* A/B-in-one-boot */
+    DEFINE_PROP_BOOL("dec-pace", AppleVtpv, dec_pace, false), /* TEMP lab: pool-as-the-clock Dbuf credit */
+    DEFINE_PROP_BOOL("dec-pace-live", AppleVtpv, dec_pace_live, false), /* A/B-in-one-boot */
     DEFINE_PROP_UINT64("tdem-gate-cap-us", AppleVtpv, tdem_gate_cap_us, 100000),
     DEFINE_PROP_STRING("decgpu", AppleVtpv, dec_gpu_str),
     DEFINE_PROP_STRING("hwbackend", AppleVtpv, hwbackend_str),
