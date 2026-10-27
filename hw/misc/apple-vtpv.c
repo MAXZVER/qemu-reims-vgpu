@@ -316,6 +316,7 @@ struct AppleVtpv {
     QEMUTimer *pace_timer;
     uint8_t pace_uuid[16];
     uint32_t pace_holds;
+    int64_t pace_ivl_us;           /* dec-pace ask interval (REIMS_VGPU_LAB_DEC_PACE_US) */
     int64_t gate_live_check_us;
     int64_t gate_diag_us;                /* tile-uui=off: 'TDem' carries no ',uui' - the guest emits its own
                                    * canvas (rec[+0x20], retained at DecodeTile) instead of resolving
@@ -1180,21 +1181,21 @@ static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
         }
         if (s->dec_pace && s->outbuf && se->dx) {
             int64_t nowq = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
-            int64_t cap = (int64_t)VTPV_PACE_BURST * VTPV_PACE_IVL_US;
+            int64_t cap = (int64_t)VTPV_PACE_BURST * s->pace_ivl_us;
             if (se->pace_last_us == 0) {
                 se->pace_last_us = nowq;
             }
             se->pace_toks_us = MIN(cap, se->pace_toks_us + (nowq - se->pace_last_us));
             se->pace_last_us = nowq;
-            if (se->pace_toks_us < VTPV_PACE_IVL_US) {
+            if (se->pace_toks_us < s->pace_ivl_us) {
                 s->pace_holds++;
                 memcpy(s->pace_uuid, uuid16, 16);
                 if (!timer_pending(s->pace_timer)) {
-                    timer_mod(s->pace_timer, nowq + VTPV_PACE_IVL_US / 4);
+                    timer_mod(s->pace_timer, nowq + s->pace_ivl_us / 4);
                 }
                 return;
             }
-            se->pace_toks_us -= VTPV_PACE_IVL_US;
+            se->pace_toks_us -= s->pace_ivl_us;
         }
         if (s->dbuf_gate && s->gate_on) {
             /* hidden-like: throttle to ~8 'Dbuf'/s (the player degrades to a
@@ -1629,7 +1630,7 @@ static VtpvSess *vtpv_sess_get(AppleVtpv *s, const uint8_t *uuid16)
     }
     vtpv_sess_free(s, se);
     se->used = true;
-    se->pace_toks_us = (int64_t)VTPV_PACE_BURST * VTPV_PACE_IVL_US;
+    se->pace_toks_us = (int64_t)VTPV_PACE_BURST * s->pace_ivl_us;
     se->pace_last_us = 0;
     se->pace_warm = 0;
     se->pace_cold = 0;
@@ -4526,6 +4527,16 @@ static void vtpv_realize(PCIDevice *dev, Error **errp)
     s->outbox_timer = timer_new_ms(QEMU_CLOCK_REALTIME, vtpv_outbox_tick, s);
     s->tdem_timer = timer_new_us(QEMU_CLOCK_REALTIME, vtpv_tdem_tick, s);
     s->pace_timer = timer_new_us(QEMU_CLOCK_REALTIME, vtpv_pace_tick, s);
+    s->pace_ivl_us = VTPV_PACE_IVL_US;
+    {
+        const char *pv = getenv("REIMS_VGPU_LAB_DEC_PACE_US");
+        if (pv) {
+            long ivl = atol(pv);
+            if (ivl >= 1000 && ivl <= 1000000) {
+                s->pace_ivl_us = ivl;
+            }
+        }
+    }
     g_queue_init(&s->tdem_q);
     g_queue_init(&s->tile_q);
     g_queue_init(&s->tile_done);
