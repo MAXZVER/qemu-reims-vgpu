@@ -111,7 +111,9 @@ typedef struct VtpvSess {
     uint64_t next_seq;
     uint32_t dbuf_out;              /* 'Dbuf's sent and not answered yet */
     uint32_t shed_n;                /* frames shed and not completed yet */
-    int32_t pace_credit;            /* dec-pace: asks allowed beyond recycling */
+    int64_t pace_toks_us;          /* dec-pace v2: token bucket (ask costs VTPV_PACE_IVL_US) */
+    int64_t pace_last_us;
+    uint32_t pace_warm, pace_cold; /* diag: recycled vs fresh answer surfaces */
     uint64_t pace_seen[256];
     uint32_t pace_seen_n, pace_seen_i;
     /* dbuf-gate (TEMP lab): the hidden-layer signature - the layer stops
@@ -1020,8 +1022,8 @@ static void vtpv_send_dbuf(AppleVtpv *s, int slot, uint64_t frame_id,
                                    * confirm, so a resolution-switch burst (one hot window) cannot
                                    * trip */
 #define DBUF_GATE_PROBE_US 125000  /* gated: one 'Dbuf' out per 125 ms (8/s) */
-#define VTPV_PACE_CREDIT 4         /* dec-pace: how far ahead of recycling a session may run */
-#define VTPV_PACE_MAX 8            /* dec-pace: credit ceiling (a return burst cannot bank more) */
+#define VTPV_PACE_IVL_US 40000     /* dec-pace v2: min ask spacing (25/s) - a decoder this slow cannot feed a discard loop */
+#define VTPV_PACE_BURST 4          /* dec-pace v2: burst depth (startup jitter, the VT queue size ballpark) */
 
 /* a 'Dbuf' ANSWER arrived carrying these surfaces: cold = never seen for the
  * session (the pool is NOT recycling), warm = the layer returned it once */
@@ -1113,8 +1115,14 @@ static void vtpv_pace_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
         se->pace_seen[se->pace_seen_i] = surf0;
         se->pace_seen_i = (se->pace_seen_i + 1) & 255u;
     }
-    if (warm && se->pace_credit < VTPV_PACE_MAX) {
-        se->pace_credit++;
+    if (warm) {
+        se->pace_warm++;
+    } else {
+        se->pace_cold++;
+    }
+    if ((se->pace_warm + se->pace_cold) % 256 == 0) {
+        lab_elog("apple-vtpv: pace-diag warm=%u cold=%u holds=%u\n",
+                se->pace_warm, se->pace_cold, s->pace_holds);
     }
 }
 
@@ -1170,14 +1178,23 @@ static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
                 }
             }
         }
-        if (s->dec_pace && s->outbuf && se->dx && se->pace_credit <= 0) {
-            s->pace_holds++;
-            memcpy(s->pace_uuid, uuid16, 16);
-            if (!timer_pending(s->pace_timer)) {
-                timer_mod(s->pace_timer,
-                          qemu_clock_get_us(QEMU_CLOCK_REALTIME) + 10000);
+        if (s->dec_pace && s->outbuf && se->dx) {
+            int64_t nowq = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+            int64_t cap = (int64_t)VTPV_PACE_BURST * VTPV_PACE_IVL_US;
+            if (se->pace_last_us == 0) {
+                se->pace_last_us = nowq;
             }
-            return;
+            se->pace_toks_us = MIN(cap, se->pace_toks_us + (nowq - se->pace_last_us));
+            se->pace_last_us = nowq;
+            if (se->pace_toks_us < VTPV_PACE_IVL_US) {
+                s->pace_holds++;
+                memcpy(s->pace_uuid, uuid16, 16);
+                if (!timer_pending(s->pace_timer)) {
+                    timer_mod(s->pace_timer, nowq + VTPV_PACE_IVL_US / 4);
+                }
+                return;
+            }
+            se->pace_toks_us -= VTPV_PACE_IVL_US;
         }
         if (s->dbuf_gate && s->gate_on) {
             /* hidden-like: throttle to ~8 'Dbuf'/s (the player degrades to a
@@ -1204,9 +1221,6 @@ static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
         vtpv_send_h2g(s, slot, 0x44627566u /* 'Dbuf' */, uuid16, id8, paras, n);
         se->frame[next].dbuf_sent = true;  /* in the queue or its outbox: never lost */
         se->dbuf_out++;
-        if (s->dec_pace && s->outbuf && se->dx) {
-            se->pace_credit--;
-        }
         if (s->decthread && se->frame[next].sample && !se->frame[next].nv12) {
             vtpv_dec_queue(s, se, next);    /* decode while the guest finds a buffer */
         }
@@ -1615,7 +1629,10 @@ static VtpvSess *vtpv_sess_get(AppleVtpv *s, const uint8_t *uuid16)
     }
     vtpv_sess_free(s, se);
     se->used = true;
-    se->pace_credit = VTPV_PACE_CREDIT;
+    se->pace_toks_us = (int64_t)VTPV_PACE_BURST * VTPV_PACE_IVL_US;
+    se->pace_last_us = 0;
+    se->pace_warm = 0;
+    se->pace_cold = 0;
     se->pace_seen_n = 0;
     se->pace_seen_i = 0;
     memcpy(se->uuid, uuid16, 16);
