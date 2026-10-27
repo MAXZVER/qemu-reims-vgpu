@@ -276,7 +276,8 @@ struct AppleVtpv {
     uint32_t tdem_unacked[VTPV_MAX_SLOT];
     uint32_t tdem_window;
     bool tdem_fast;               /* tdem-fast=on: pace by h2g ring free space, no fixed holds */
-    bool tile_uui;                /* tile-uui=off: 'TDem' carries no ',uui' - the guest emits its own
+    bool tile_uui;
+    bool canvas_probe;                /* tile-uui=off: 'TDem' carries no ',uui' - the guest emits its own
                                    * canvas (rec[+0x20], retained at DecodeTile) instead of resolving
                                    * our echoed UUID in its registry; immune to late-emit staleness */
     int64_t tdem_last_us;
@@ -2407,6 +2408,7 @@ static void *vtpv_tile_thread(void *opaque)
 
 /* bounded serial-log budget for the tile-stage timing prints (kfill/ktile) */
 static int g_klog;
+static int g_probe;   /* canvas-probe readback budget */
 
 /* decoded tiles -> their canvases, the kext's done word, their 'TDem's (BQL;
  * in decode order, so done only ever moves forward) */
@@ -2427,6 +2429,20 @@ static void vtpv_tile_complete(AppleVtpv *s)
                            j->tw ? j->tw : j->w, j->th ? j->th : j->h, j->ox, j->oy)) {
             vtpv_note_surface(&j->ks);
             err = 0;
+            if (s->canvas_probe && j->ks.npages && qatomic_fetch_inc(&g_probe) < 40) {
+                /* read back the canvas's first bytes in the SAME context that just
+                 * wrote them (this BH's dma writes are the fill itself): zeros here
+                 * would mean the fill's writes vanish before the guest can read */
+                uint8_t rb[32] = { 0 };
+                dma_memory_read(as, (j->ks.pages[0] & ~(uint64_t)0xfff) + (j->ks.org & 0xfff),
+                                rb, sizeof(rb), MEMTXATTRS_UNSPECIFIED);
+                fprintf(stderr, "apple-vtpv: probe tile=%llu canvas=%u rb0=",
+                        (unsigned long long)j->tile_id, j->ks.id);
+                for (int k = 0; k < 16; k++) {
+                    fprintf(stderr, "%02x", rb[k]);
+                }
+                fprintf(stderr, " nz=%d\n", rb[0] || rb[1] || rb[2] || rb[3]);
+            }
         }
         int64_t f1 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         if (qatomic_fetch_inc(&g_klog) < 120 && f1 - f0 > 500) {
@@ -4293,7 +4309,9 @@ static const Property vtpv_properties[] = {
     DEFINE_PROP_UINT32("tile-dump", AppleVtpv, tile_dump_left, 0),
     DEFINE_PROP_BOOL("tile-dump-read", AppleVtpv, tile_dump_read, false),
     DEFINE_PROP_BOOL("tdem-fast", AppleVtpv, tdem_fast, true),   /* A/B won 10-26: tail p99 124->72-86ms, 0 errors, 108/108; off = rollback */
-    DEFINE_PROP_BOOL("tile-uui", AppleVtpv, tile_uui, true),     /* off = A/B 10-27: emit without ',uui' (the guest uses its own
+    DEFINE_PROP_BOOL("tile-uui", AppleVtpv, tile_uui, true),
+    DEFINE_PROP_BOOL("canvas-probe", AppleVtpv, canvas_probe, false), /* read back the canvas's first
+                                                                       * bytes right after the fill (BH) */     /* off = A/B 10-27: emit without ',uui' (the guest uses its own
                                                                    * retained canvas) against the 16 ms-p50 late-emit retry loop */
     DEFINE_PROP_UINT64("tdem-gate-cap-us", AppleVtpv, tdem_gate_cap_us, 100000),
     DEFINE_PROP_STRING("decgpu", AppleVtpv, dec_gpu_str),
