@@ -27,6 +27,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/lab-elog.h"
 #include "hw/misc/apple-vtpv-decode.h"
 #include "hw/misc/apple-vtpv-dx.h"
 #include "hw/misc/apple-vtpv-replies.h"
@@ -447,15 +448,15 @@ static bool vtpv_dq_enqueue(AppleVtpv *s, int slot, const uint8_t *data, uint32_
     uint32_t freesz, tail_off;
 
     if (!sl->h2g_gpa || sl->h2g_len < sizeof(h) + 16 + entry) {
-        fprintf(stderr, "apple-vtpv: enq fail: no h2g buffer\n");
+        lab_elog( "apple-vtpv: enq fail: no h2g buffer\n");
         return false;
     }
     if (entry > VTPV_H2G_ENTRY_MAX) {
-        fprintf(stderr, "apple-vtpv: enq fail: entry %#x too big\n", entry);
+        lab_elog( "apple-vtpv: enq fail: entry %#x too big\n", entry);
         return false;
     }
     if (dma_memory_read(pci_get_address_space(PCI_DEVICE(s)), sl->h2g_gpa, &h, sizeof(h), MEMTXATTRS_UNSPECIFIED)) {
-        fprintf(stderr, "apple-vtpv: enq fail: header read\n");
+        lab_elog( "apple-vtpv: enq fail: header read\n");
         return false;
     }
     h.queue_size = le32_to_cpu(h.queue_size);
@@ -484,7 +485,7 @@ static bool vtpv_dq_enqueue(AppleVtpv *s, int slot, const uint8_t *data, uint32_
     } else {
         freesz = h.tail >= h.head ? h.head : h.head - h.tail;
         if (s->verbose > 1) {       /* expected: the message waits in the outbox */
-            fprintf(stderr, "apple-vtpv: queue full: entry %#x >= free %#x "
+            lab_elog( "apple-vtpv: queue full: entry %#x >= free %#x "
                     "(head=%u tail=%u qsize=%u)\n",
                     entry, freesz, h.head, h.tail, h.queue_size);
         }
@@ -557,13 +558,13 @@ static void vtpv_raise(AppleVtpv *s, int slot)
     if (msi_enabled(PCI_DEVICE(s))) {
         if (s->verbose > 1) {
             MSIMessage msg = msi_get_message(PCI_DEVICE(s), 0);
-            fprintf(stderr, "apple-vtpv: msi_notify addr=%#llx data=%#x\n",
+            lab_elog( "apple-vtpv: msi_notify addr=%#llx data=%#x\n",
                     (unsigned long long)msg.address, msg.data);
         }
         msi_notify(PCI_DEVICE(s), 0);
     } else {
         if (s->verbose > 1) {
-            fprintf(stderr, "apple-vtpv: intx assert (msi off)\n");
+            lab_elog( "apple-vtpv: intx assert (msi off)\n");
         }
         pci_irq_assert(PCI_DEVICE(s));
     }
@@ -627,7 +628,7 @@ static bool vtpv_h2g_watch(AppleVtpv *s, int slot, int64_t now)
                 dropped++;
             }
             vtpv_tdem_purge_slot(s, slot);
-            fprintf(stderr, "apple-vtpv: slot%d queue gone (qsize %u head %u tail %u) - "
+            lab_elog( "apple-vtpv: slot%d queue gone (qsize %u head %u tail %u) - "
                     "dropped %d outbox entries\n", slot, qs, head, tail, dropped);
         }
         sl->stall_tries = 0;
@@ -649,7 +650,7 @@ static bool vtpv_h2g_watch(AppleVtpv *s, int slot, int64_t now)
                         MIN(sizeof(e), (size_t)(qs - head)), MEMTXATTRS_UNSPECIFIED);
         char t4[5];
         vtpv_log4cc(t4, ldl_be_p(e + 4 + 8));
-        fprintf(stderr, "apple-vtpv: slot%d h2g head %u tail %u qsize %u untouched %d ms - notify again (%d); "
+        lab_elog( "apple-vtpv: slot%d h2g head %u tail %u qsize %u untouched %d ms - notify again (%d); "
                 "head entry size %u type %s flags %#x uuid %02x%02x%02x%02x id %llu\n",
                 slot, head, tail, qs, VTPV_STALL_MS, sl->stall_tries, ldl_le_p(e), t4, ldl_be_p(e + 4 + 12),
                 e[4 + 16], e[4 + 17], e[4 + 18], e[4 + 19], (unsigned long long)ldq_be_p(e + 4 + 32));
@@ -670,7 +671,7 @@ static bool vtpv_h2g_watch(AppleVtpv *s, int slot, int64_t now)
             dropped++;
         }
         vtpv_tdem_purge_slot(s, slot);
-        fprintf(stderr, "apple-vtpv: slot%d h2g WEDGED %lld ms (head %u tail %u) - queue reset, "
+        lab_elog( "apple-vtpv: slot%d h2g WEDGED %lld ms (head %u tail %u) - queue reset, "
                 "outbox dropped %d\n", slot, (long long)(now - sl->stuck_since_ms), head, tail,
                 dropped);
         sl->seen_head = 0;
@@ -965,7 +966,7 @@ static void vtpv_send_dbuf(AppleVtpv *s, int slot, uint64_t frame_id,
         }
     }
     if (free_i < 0) {
-        fprintf(stderr, "apple-vtpv: frame table full, dropping frame %llu\n",
+        lab_elog( "apple-vtpv: frame table full, dropping frame %llu\n",
                 (unsigned long long)frame_id);
         if (s->outbuf) {
             /* never leave the session waiting on a frame: complete it dropped */
@@ -1028,7 +1029,7 @@ static void vtpv_gate_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
         static int g_note;
         if (g_note < 3) {
             g_note++;
-            fprintf(stderr, "apple-vtpv: note-answer #%d live=%d gate=%d\n",
+            lab_elog( "apple-vtpv: note-answer #%d live=%d gate=%d\n",
                     g_note, s->dbuf_gate_live, s->dbuf_gate);
         }
     }
@@ -1057,7 +1058,7 @@ static void vtpv_gate_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
         s->gate_cold_win = 0;
         if (s->gate_on && s->gate_cold_prev < 3) {
             s->gate_on = false;
-            fprintf(stderr, "apple-vtpv: dbuf-gate LIFTED (clean window: %u cold)\nn",
+            lab_elog("apple-vtpv: dbuf-gate LIFTED (clean window: %u cold)\n",
                     s->gate_cold_prev);
         }
     }
@@ -1066,12 +1067,12 @@ static void vtpv_gate_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
     }
     s->gate_cold_win++;
     if (s->dbuf_gate && s->gate_cold_win % 8 == 0) {
-        fprintf(stderr, "apple-vtpv: gate-diag cold=%u in window (seen=%u)\nn",
+        lab_elog("apple-vtpv: gate-diag cold=%u in window (seen=%u)\n",
                 s->gate_cold_win, s->gate_seen_n);
     }
     if (s->gate_cold_win >= DBUF_GATE_COLD_WIN && s->gate_cold_prev >= 4 && !s->gate_on) {
         s->gate_on = true;
-        fprintf(stderr, "apple-vtpv: dbuf-gate ON (session: %u cold answer surfaces in 5 s)\nn",
+        lab_elog("apple-vtpv: dbuf-gate ON (session: %u cold answer surfaces in 5 s)\n",
                 s->gate_cold_win);
     }
 }
@@ -1142,7 +1143,7 @@ static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
             vtpv_dec_queue(s, se, next);    /* decode while the guest finds a buffer */
         }
         if (s->verbose) {
-            fprintf(stderr, "apple-vtpv: frame %llu: Dbuf sent (id=%llu, %u out)\n",
+            lab_elog( "apple-vtpv: frame %llu: Dbuf sent (id=%llu, %u out)\n",
                     (unsigned long long)se->frame[next].frame_id,
                     (unsigned long long)s->host_msg_id, se->dbuf_out);
         }
@@ -1222,7 +1223,7 @@ static void vtpv_shed_reap(AppleVtpv *s, VtpvSess *se)
         vtpv_send_demt2(s, se->slot, done[i], 0, 1u << 1, se->uuid, zero_uuid);
     }
     if (n && s->verbose) {
-        fprintf(stderr, "apple-vtpv: shed %u frames (%llu in all, %u left)\n", n,
+        lab_elog( "apple-vtpv: shed %u frames (%llu in all, %u left)\n", n,
                 (unsigned long long)s->shed_total, se->shed_n);
     }
 }
@@ -1251,7 +1252,7 @@ static void vtpv_send_demt2(AppleVtpv *s, int slot, uint64_t frame_id,
     stq_be_p(id8, s->host_msg_id);
     s->frames_completed++;
     if (s->verbose) {
-        fprintf(stderr, "apple-vtpv: frame %llu: Demt sent err=%d "
+        lab_elog( "apple-vtpv: frame %llu: Demt sent err=%d "
                 "(frames_completed=%llu)\n",
                 (unsigned long long)frame_id, err,
                 (unsigned long long)s->frames_completed);
@@ -1284,7 +1285,7 @@ static void vtpv_send_dpba(AppleVtpv *s, int slot, const uint8_t *uuid16,
         s->cur->dpba_w = w;
         s->cur->dpba_h = h;
         if (s->verbose) {
-            fprintf(stderr, "apple-vtpv: Dpba sent %ux%u 420v (%u plist bytes)\n", w, h, pl);
+            lab_elog( "apple-vtpv: Dpba sent %ux%u 420v (%u plist bytes)\n", w, h, pl);
         }
         vtpv_send_h2g(s, slot, 0x44706261u /* 'Dpba' */, uuid16, id8, paras, n);
         return;
@@ -1296,7 +1297,7 @@ static void vtpv_send_dpba(AppleVtpv *s, int slot, const uint8_t *uuid16,
     } else {
         FILE *rf = fopen(s->dpba_file, "rb");
         if (!rf) {
-            fprintf(stderr, "apple-vtpv: dpba template unreadable (%s)\n", s->dpba_file);
+            lab_elog( "apple-vtpv: dpba template unreadable (%s)\n", s->dpba_file);
             return;
         }
         fseek(rf, 0, SEEK_END);
@@ -1322,7 +1323,7 @@ static void vtpv_send_dpba(AppleVtpv *s, int slot, const uint8_t *uuid16,
     uint8_t id8[8];
     stq_be_p(id8, s->host_msg_id);
     if (s->verbose) {
-        fprintf(stderr, "apple-vtpv: Dpba sent (%ld plist bytes)\n", rlen);
+        lab_elog( "apple-vtpv: Dpba sent (%ld plist bytes)\n", rlen);
     }
     vtpv_send_h2g(s, slot, 0x44706261u /* 'Dpba' */, uuid16, id8, paras, n);
 }
@@ -1529,7 +1530,7 @@ static VtpvSess *vtpv_sess_get(AppleVtpv *s, const uint8_t *uuid16)
     }
     VtpvSess *se = free_se ? free_se : lru;
     if (se->used) {
-        fprintf(stderr, "apple-vtpv: session table full, evicting the oldest\n");
+        lab_elog( "apple-vtpv: session table full, evicting the oldest\n");
         if (se->tile_live && s->tile_sessions) {
             s->tile_sessions--;
         }
@@ -1605,7 +1606,7 @@ static void vtpv_dx_set_fmt(AppleVtpv *s, const uint8_t *fd, uint32_t n)
     if (cfg_len) {
         memcpy(s->cur->dx_cfg, cfg, cfg_len);
     }
-    fprintf(stderr, "apple-vtpv: dx stream codec=%d cfg=%u bytes\n", codec, cfg_len);
+    lab_elog( "apple-vtpv: dx stream codec=%d cfg=%u bytes\n", codec, cfg_len);
 }
 
 /* exported surface pages: the indirect list when the kext gave one, else the
@@ -1796,7 +1797,7 @@ static void vtpv_tile_dump(AppleVtpv *s, const VtpvKickSurf *ks, const uint8_t *
         g_free(rbc);
     }
     fclose(f);
-    fprintf(stderr, "apple-vtpv: tile dump %u -> %s (%.4s %ux%u at %u,%u dw %u dh %u)\n",
+    lab_elog( "apple-vtpv: tile dump %u -> %s (%.4s %ux%u at %u,%u dw %u dh %u)\n",
             n, path, (const char *)&ks->pixfmt, ks->pw[0], ks->ph[0], ox, oy, dw, dh);
 }
 
@@ -1806,7 +1807,7 @@ static bool vtpv_fill_surface(AppleVtpv *s, const VtpvKickSurf *ks, const uint8_
 {
     if ((ks->pixfmt != 0x34323076u /* '420v' */ && ks->pixfmt != 0x34323066u /* '420f' */) ||
         ks->planes != 2) {
-        fprintf(stderr, "apple-vtpv: outbuf: surface %u is %.4s with %u planes - not NV12\n",
+        lab_elog( "apple-vtpv: outbuf: surface %u is %.4s with %u planes - not NV12\n",
                 ks->id, (const char *)&ks->pixfmt, ks->planes);
         return false;
     }
@@ -1889,7 +1890,7 @@ static void vtpv_dx_put(void *opaque, const VtpvDxFrame *f)
         return;
     }
     if (!nv12) {
-        fprintf(stderr, "apple-vtpv: a non-NV12 picture outside a staged decode - dropped\n");
+        lab_elog( "apple-vtpv: a non-NV12 picture outside a staged decode - dropped\n");
         return;
     }
 
@@ -1915,7 +1916,7 @@ static void vtpv_dx_put(void *opaque, const VtpvDxFrame *f)
                 }
             }
             const uint8_t *s0 = f->y, *s1 = f->y + (size_t)(dh / 2) * f->y_pitch;
-            fprintf(stderr, "apple-vtpv: dx put %ux%u org=%llu y0 src %02x%02x%02x%02x "
+            lab_elog( "apple-vtpv: dx put %ux%u org=%llu y0 src %02x%02x%02x%02x "
                     "ram %02x%02x%02x%02x | y%u src %02x%02x%02x%02x ram %02x%02x%02x%02x\n",
                     dw, dh, (unsigned long long)vtpv_surf_org(s), s0[0], s0[1], s0[2], s0[3],
                     rb[0][0], rb[0][1], rb[0][2], rb[0][3], dh / 2, s1[0], s1[1], s1[2], s1[3],
@@ -1936,7 +1937,7 @@ static const uint8_t *vtpv_dx_sbf_sample(AppleVtpv *s, uint64_t total, uint64_t 
     const uint8_t *sbf = vtpv_para_find(s->msg, total, 0x2c736266u /* ',sbf' */,
                                         &sbf_len);
     if (!sbf || sbf_len < 16) {
-        fprintf(stderr, "apple-vtpv: dx: no ',sbf' in frame %llu\n",
+        lab_elog( "apple-vtpv: dx: no ',sbf' in frame %llu\n",
                 (unsigned long long)tag);
         return false;
     }
@@ -1947,7 +1948,7 @@ static const uint8_t *vtpv_dx_sbf_sample(AppleVtpv *s, uint64_t total, uint64_t 
     }
     if (!sample || s->cur->dx_codec < 0) {
         static int dumps;
-        fprintf(stderr, "apple-vtpv: dx: frame %llu sample=%u codec=%d - not decodable\n",
+        lab_elog( "apple-vtpv: dx: frame %llu sample=%u codec=%d - not decodable\n",
                 (unsigned long long)tag, sample ? sl : 0, s->cur->dx_codec);
         if (s->msglog && dumps < 3) {
             /* keep the first unparsed sample buffers next to the wire log */
@@ -2025,7 +2026,7 @@ static bool vtpv_dx_decode_sample(AppleVtpv *s, VtpvSess *se, const uint8_t *sam
             se->dx = vtpv_dx_open(gpu, vtpv_api_name[se->dx_api], (VtpvDxCodec)se->dx_codec,
                                  se->dx_cfg_len ? se->dx_cfg : NULL, se->dx_cfg_len, vtpv_dx_put, se);
             if (!se->dx) {
-                fprintf(stderr, "apple-vtpv: dx: %s decoder open failed (codec %d)\n",
+                lab_elog( "apple-vtpv: dx: %s decoder open failed (codec %d)\n",
                         vtpv_api_name[se->dx_api], se->dx_codec);
                 do {
                     se->dx_api++;   /* a tile session skips cuda on the walk too */
@@ -2040,7 +2041,7 @@ static bool vtpv_dx_decode_sample(AppleVtpv *s, VtpvSess *se, const uint8_t *sam
         int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         int rc = vtpv_dx_decode(se->dx, sample, sl, (int64_t)tag);
         int64_t t1 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
-        fprintf(stderr, "apple-vtpv: HW-DECODE(%s) frame=%llu codec=%d %ux%u pictures=%d "
+        lab_elog( "apple-vtpv: HW-DECODE(%s) frame=%llu codec=%d %ux%u pictures=%d "
                 "-> canvas %llu bytes rc=%d %lld us (open %lld us)\n", vtpv_api_name[se->dx_api],
                 (unsigned long long)tag, se->dx_codec, k->w, k->h, k->pictures,
                 (unsigned long long)k->written, rc, (long long)(t1 - t0), (long long)(t0 - t_in));
@@ -2185,7 +2186,7 @@ static bool vtpv_fill_tile(AppleVtpv *s, const VtpvKickSurf *ks, const uint8_t *
     sy &= ~1u;
     bool one = ks->pixfmt == 0x4c303038u;
     if (kx > 1 || ks->planes != (one ? 1u : 2u) || ox >= ks->pw[0] || oy >= ks->ph[0] || sx >= pw || sy >= ph) {
-        fprintf(stderr, "apple-vtpv: tile: canvas %u is %.4s with %u planes, %ux%u, tile at %u,%u - "
+        lab_elog( "apple-vtpv: tile: canvas %u is %.4s with %u planes, %ux%u, tile at %u,%u - "
                 "not written\n", ks->id, (const char *)&ks->pixfmt, ks->planes, ks->pw[0],
                 ks->ph[0], ox, oy);
         return false;
@@ -2325,7 +2326,7 @@ static void vtpv_tdem_pump(AppleVtpv *s)
     /* TEMP lab gate diag: the flag/cold state every 2 s, independent of answers */
     if (s->dbuf_gate_live && now >= s->gate_diag_us) {
         s->gate_diag_us = now + 2000000;
-        fprintf(stderr, "apple-vtpv: gate-live flag=%d on=%d cold=%u prev=%u seen=%u\n",
+        lab_elog( "apple-vtpv: gate-live flag=%d on=%d cold=%u prev=%u seen=%u\n",
                 s->dbuf_gate, s->gate_on, s->gate_cold_win, s->gate_cold_prev, s->gate_seen_n);
     }
     VtpvTdem *t;
@@ -2339,20 +2340,20 @@ static void vtpv_tdem_pump(AppleVtpv *s)
             return;
         }
         if (t->due_us > now) {
-            if (p < 40) { p++; fprintf(stderr, "apple-vtpv: pump hold due (%lld > %lld) qlen=%d\n", (long long)t->due_us, (long long)now, g_queue_get_length(&s->tdem_q)); }
+            if (p < 40) { p++; lab_elog( "apple-vtpv: pump hold due (%lld > %lld) qlen=%d\n", (long long)t->due_us, (long long)now, g_queue_get_length(&s->tdem_q)); }
             timer_mod(s->tdem_timer, t->due_us);
             return;
         }
         if (!s->tdem_fast &&
             s->tdem_unacked[t->slot] >= s->tdem_window &&
             now - s->tdem_last_us < VTPV_TDEM_STALL_US) {
-            if (p < 40) { p++; fprintf(stderr, "apple-vtpv: pump hold stall unacked=%d\n", s->tdem_unacked[t->slot]); }
+            if (p < 40) { p++; lab_elog( "apple-vtpv: pump hold stall unacked=%d\n", s->tdem_unacked[t->slot]); }
             timer_mod(s->tdem_timer, s->tdem_last_us + VTPV_TDEM_STALL_US);
             return;
         }
         if (!s->tdem_fast &&
             vtpv_h2g_busy(s, t->slot) && now < t->due_us + VTPV_TDEM_DRAIN_US) {
-            if (p < 40) { p++; fprintf(stderr, "apple-vtpv: pump hold busy drain (dt %lld us)\n", (long long)(now - t->due_us)); }
+            if (p < 40) { p++; lab_elog( "apple-vtpv: pump hold busy drain (dt %lld us)\n", (long long)(now - t->due_us)); }
             timer_mod(s->tdem_timer, now + 3000);
             return;
         }
@@ -2363,7 +2364,7 @@ static void vtpv_tdem_pump(AppleVtpv *s)
             timer_mod(s->tdem_timer, now + 200);
             return;
         }
-        if (p < 40) { p++; fprintf(stderr, "apple-vtpv: pump SEND dt %lld us busy=%d\n", (long long)(now - t->due_us), vtpv_h2g_busy(s, t->slot)); }
+        if (p < 40) { p++; lab_elog( "apple-vtpv: pump SEND dt %lld us busy=%d\n", (long long)(now - t->due_us), vtpv_h2g_busy(s, t->slot)); }
         g_queue_pop_head(&s->tdem_q);
         vtpv_tdem_send(s, t);
         if (!t->type) {
@@ -2379,7 +2380,7 @@ static void vtpv_tdem_tick(void *opaque)
     static int n;
     if (n < 40) {
         n++;
-        fprintf(stderr, "apple-vtpv: tdem tick #%d qlen=%d\n", n,
+        lab_elog( "apple-vtpv: tdem tick #%d qlen=%d\n", n,
                 g_queue_get_length(&((AppleVtpv *)opaque)->tdem_q));
     }
     vtpv_tdem_pump(opaque);
@@ -2587,17 +2588,17 @@ static void vtpv_tile_complete(AppleVtpv *s)
                 uint8_t rb[32] = { 0 };
                 dma_memory_read(as, (j->ks.pages[0] & ~(uint64_t)0xfff) + (j->ks.org & 0xfff),
                                 rb, sizeof(rb), MEMTXATTRS_UNSPECIFIED);
-                fprintf(stderr, "apple-vtpv: probe tile=%llu canvas=%u rb0=",
+                lab_elog( "apple-vtpv: probe tile=%llu canvas=%u rb0=",
                         (unsigned long long)j->tile_id, j->ks.id);
                 for (int k = 0; k < 16; k++) {
-                    fprintf(stderr, "%02x", rb[k]);
+                    lab_elog( "%02x", rb[k]);
                 }
-                fprintf(stderr, " nz=%d\n", rb[0] || rb[1] || rb[2] || rb[3]);
+                lab_elog( " nz=%d\n", rb[0] || rb[1] || rb[2] || rb[3]);
             }
         }
         int64_t f1 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         if (qatomic_fetch_inc(&g_klog) < 120 && f1 - f0 > 500) {
-            fprintf(stderr, "apple-vtpv: kfill %lld us (canvas %u %ux%u)\n",
+            lab_elog( "apple-vtpv: kfill %lld us (canvas %u %ux%u)\n",
                     (long long)(f1 - f0), j->ks.id, j->ks.pw[0], j->ks.ph[0]);
         }
         uint32_t le_done = cpu_to_le32(j->token);
@@ -2606,7 +2607,7 @@ static void vtpv_tile_complete(AppleVtpv *s)
             vtpv_tile_tdem(s, j->slot, j->uuid16, j->tile_id, err, j->has_uui ? j->uui : NULL);
         }
         if (s->verbose) {
-            fprintf(stderr, "apple-vtpv: tile %llu -> canvas %u (%.4s) at %u,%u err=%d token %u%s\n",
+            lab_elog( "apple-vtpv: tile %llu -> canvas %u (%.4s) at %u,%u err=%d token %u%s\n",
                     (unsigned long long)j->tile_id, j->ks.id, (const char *)&j->ks.pixfmt, j->ox,
                     j->oy, err, j->token, j->cancel ? " (session gone)" : ", TDem queued");
         }
@@ -2715,7 +2716,7 @@ static void vtpv_dtil_dx(AppleVtpv *s, int slot, uint64_t total, uint64_t tile_i
         n += vtpv_para_put(paras + n, 0x2c696e66u /* ',inf' */, "=u32", &be_inf0, 4);
         vtpv_queue_dtil_reply(s, slot, paras, n);
         if (s->verbose) {
-            fprintf(stderr, "apple-vtpv: tile %llu -> canvas %u sync err=%d\n",
+            lab_elog( "apple-vtpv: tile %llu -> canvas %u sync err=%d\n",
                     (unsigned long long)tile_id, ks->id, err);
         }
         return;
@@ -2763,7 +2764,7 @@ static void vtpv_dtil_dx(AppleVtpv *s, int slot, uint64_t total, uint64_t tile_i
         qemu_mutex_unlock(&s->dec_lock);
         if (ktiming) {
             kt2 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
-            fprintf(stderr, "apple-vtpv: ktile #%d async reply=%lld job=%lld us\n",
+            lab_elog( "apple-vtpv: ktile #%d async reply=%lld job=%lld us\n",
                     (int)g_klog, (long long)(kt1 - kt0), (long long)(kt2 - kt1));
         }
         return;
@@ -2790,11 +2791,11 @@ static void vtpv_dtil_dx(AppleVtpv *s, int slot, uint64_t total, uint64_t tile_i
     vtpv_tile_tdem(s, slot, s->msg + 0x10, tile_id, err, uui);
     if (ktiming) {
         kt2 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
-        fprintf(stderr, "apple-vtpv: ktile #%d inkick reply=%lld dec=%lld us\n",
+        lab_elog( "apple-vtpv: ktile #%d inkick reply=%lld dec=%lld us\n",
                 (int)g_klog, (long long)(kt1 - kt0), (long long)(kt2 - kt1));
     }
     if (s->verbose) {
-        fprintf(stderr, "apple-vtpv: tile %llu -> canvas %u (%.4s) at %u,%u err=%d, TDem queued\n",
+        lab_elog( "apple-vtpv: tile %llu -> canvas %u (%.4s) at %u,%u err=%d, TDem queued\n",
                 (unsigned long long)tile_id, ks->id, (const char *)&ks->pixfmt, ox, oy, err);
     }
 }
@@ -2807,14 +2808,14 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
 
     if (total < 0x30 || total > sl->g2h_len || total > VTPV_MSG_MAX) {
         if (s->verbose) {
-            fprintf(stderr, "apple-vtpv: slot%d bad message size %llu\n",
+            lab_elog( "apple-vtpv: slot%d bad message size %llu\n",
                     slot, (unsigned long long)total);
         }
         return;
     }
     vtpv_msg_realloc(s, total);
     if (dma_memory_read(pci_get_address_space(PCI_DEVICE(s)), sl->g2h_gpa, s->msg, total, MEMTXATTRS_UNSPECIFIED)) {
-        fprintf(stderr, "apple-vtpv: slot%d g2h dma read failed\n", slot);
+        lab_elog( "apple-vtpv: slot%d g2h dma read failed\n", slot);
         return;
     }
     s->msgs_in++;
@@ -2860,7 +2861,7 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
         fclose(f);
     }
     if (s->verbose) {
-        fprintf(stderr, "apple-vtpv: slot%d msg size=%llu type=%s flags=%#x "
+        lab_elog( "apple-vtpv: slot%d msg size=%llu type=%s flags=%#x "
                 "nsurf=%u first=%02x %02x %02x %02x\n", slot,
                 (unsigned long long)total, t4, flags, nsurf,
                 s->msg[0x20], s->msg[0x21], s->msg[0x22], s->msg[0x23]);
@@ -2889,13 +2890,13 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
             }
             if (fresh && s->dfl_seen_n < ARRAY_SIZE(s->dfl_seen)) {
                 s->dfl_seen[s->dfl_seen_n++] = s->cur_dfl;
-                fprintf(stderr, "apple-vtpv: dfrm dfl=0x%x first seen (frame %llu, dno=%d)\n",
+                lab_elog( "apple-vtpv: dfrm dfl=0x%x first seen (frame %llu, dno=%d)\n",
                         s->cur_dfl, (unsigned long long)s->last_frame_id, s->dno);
             }
             if (s->cur_dfl & (1u << 1)) {
                 s->dfl_dno_n++;
                 if ((s->dfl_dno_n & 255) == 1) {
-                    fprintf(stderr, "apple-vtpv: dfrm DoNotOutputFrame n=%llu shed_total=%llu\n",
+                    lab_elog( "apple-vtpv: dfrm DoNotOutputFrame n=%llu shed_total=%llu\n",
                             (unsigned long long)s->dfl_dno_n,
                             (unsigned long long)s->shed_total);
                 }
@@ -2946,7 +2947,7 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
         const uint8_t *tcd = vtpv_para_find(s->msg, total, 0x2c746364u, &vlen);
         const uint8_t *opb = vtpv_para_find(s->msg, total, 0x2c6f7062u, &vlen);
         uint64_t tile_id = til ? ldq_be_p(til) : 0;
-        fprintf(stderr, "apple-vtpv: dtil tile=%llu surf=[%u,%u] "
+        lab_elog( "apple-vtpv: dtil tile=%llu surf=[%u,%u] "
                 "tco=%d,%d tcd=%dx%d opb=%d,%d\n",
                 (unsigned long long)tile_id,
                 sl->surf[0], sl->surf[1],
@@ -3092,7 +3093,7 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                                         o += nl;
                                     }
                                 }
-                                fprintf(stderr, "apple-vtpv: HEVC hvcC cached "
+                                lab_elog( "apple-vtpv: HEVC hvcC cached "
                                         "vps=%u sps=%u pps=%u\n",
                                         s->h265_vps_len, s->h265_sps_len,
                                         s->h265_pps_len);
@@ -3258,7 +3259,7 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                                 }
                             }
                         }
-                        fprintf(stderr, "apple-vtpv: HW-DECODE tile=%llu "
+                        lab_elog( "apple-vtpv: HW-DECODE tile=%llu "
                                 "%ux%d -> canvas %llu bytes (chroma=%d)\n",
                                 (unsigned long long)tile_id, dw, dh,
                                 (unsigned long long)written,
@@ -3266,14 +3267,14 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                         decoded = true;
                     }
                 } else {
-                    fprintf(stderr, "apple-vtpv: dtil sbf parse: sps=%u pps=%u "
+                    lab_elog( "apple-vtpv: dtil sbf parse: sps=%u pps=%u "
                             "slices=%u flen=%u (len=%u)\n",
                             sps ? sps_l : 0, pps ? pps_l : 0, nslices, flen,
                             sbf_len);
                 }
             }
             if (!decoded) {
-                fprintf(stderr, "apple-vtpv: hwdecode miss, no writeback\n");
+                lab_elog( "apple-vtpv: hwdecode miss, no writeback\n");
             }
         }
         if (!s->hwdecode && s->writeback && s->surfmap_count) {
@@ -3326,7 +3327,7 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                     i += chunk;
                 }
             }
-            fprintf(stderr, "apple-vtpv: writeback %llu bytes into %u pages "
+            lab_elog( "apple-vtpv: writeback %llu bytes into %u pages "
                     "(w=%u h=%u bpr0=%u p1@%u)\n", (unsigned long long)written,
                     s->surfmap_count, w, h, bpr0, p1);
         }
@@ -3365,7 +3366,7 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
              * a stray reply and answering it would loop) */
             uint32_t flen = 0;
             if (!vtpv_para_find(s->msg, total, 0x2c66726du /* ',frm' */, &flen)) {
-                fprintf(stderr, "apple-vtpv: stray Dbuf (no frame param) dropped\n");
+                lab_elog( "apple-vtpv: stray Dbuf (no frame param) dropped\n");
                 return;
             }
             uint8_t paras[64];
@@ -3379,7 +3380,7 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
             n += vtpv_para_put(paras + n, 0x2c757569u /* ',uui' */, "=uui",
                                s->mock_uuid, 16);
             if (s->verbose) {
-                fprintf(stderr, "apple-vtpv: their Dbuf request -> mock uuid "
+                lab_elog( "apple-vtpv: their Dbuf request -> mock uuid "
                         "(id=%llu)\n", (unsigned long long)s->host_msg_id);
             }
             vtpv_send_h2g2(s, slot, type, 4, s->msg + 0x10, s->msg + 0x20,
@@ -3443,12 +3444,12 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                 /* zlib crc32 of the tight NV12, as vtprobe11's .crc truth */
                 uLong c = crc32(0L, Z_NULL, 0);
                 c = crc32(c, pic, (uInt)((size_t)pw * ph + (size_t)((pw + 1) & ~1u) * ((ph + 1) / 2)));
-                fprintf(stderr, "apple-vtpv: frame %llu: picture crc %08lx%s\n",
+                lab_elog( "apple-vtpv: frame %llu: picture crc %08lx%s\n",
                         (unsigned long long)frame_id, (unsigned long)c,
                         was_queued ? " (decode thread)" : "");
             }
             if (s->verbose) {
-                fprintf(stderr, "apple-vtpv: frame %llu: Dbuf reply err=%d surf=%u %s -> %s "
+                lab_elog( "apple-vtpv: frame %llu: Dbuf reply err=%d surf=%u %s -> %s "
                         "(wait %lld us, fill %lld us, %u waiting, %u in outbox)\n",
                         (unsigned long long)frame_id, err, sl->surf[0],
                         ks ? "described" : "NOT described", ok ? "filled" : "NOT filled",
@@ -3527,7 +3528,7 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                     break;
                 }
             }
-            fprintf(stderr, "apple-vtpv: dsts avcC cached sps=%u pps=%u\n",
+            lab_elog( "apple-vtpv: dsts avcC cached sps=%u pps=%u\n",
                     s->avcC_sps_len, s->avcC_pps_len);
         }
     }
@@ -3570,7 +3571,7 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
         if (s->verbose) {
             char t5[5];
             vtpv_log4cc(t5, type);
-            fprintf(stderr, "apple-vtpv: reply %.4s <- %s%s\n", t5,
+            lab_elog( "apple-vtpv: reply %.4s <- %s%s\n", t5,
                     reply_file ? reply_file : "built-in",
                     patch_type ? " (type patched)" : "");
         }
@@ -3595,7 +3596,7 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
             fclose(rf);
         }
         if (!rep) {
-            fprintf(stderr, "apple-vtpv: reply template unreadable (%s)\n",
+            lab_elog( "apple-vtpv: reply template unreadable (%s)\n",
                     reply_file);
             return;
         }
@@ -3711,7 +3712,7 @@ static void vtpv_load_surfdesc(AppleVtpv *s)
             k->pages[j] = le64_to_cpu(k->pages[j]);
         }
         if (s->verbose) {
-            fprintf(stderr, "apple-vtpv: surface %u %.4s %ux%u planes=%u alloc=%u pages=%u "
+            lab_elog( "apple-vtpv: surface %u %.4s %ux%u planes=%u alloc=%u pages=%u "
                     "org=%u off=%u/%u bpr=%u/%u\n", k->id, (const char *)&k->pixfmt, k->width,
                     k->height, k->planes, k->alloc, k->npages, k->org, k->off[0], k->off[1],
                     k->bpr[0], k->bpr[1]);
@@ -3757,7 +3758,7 @@ static void vtpv_selftest(AppleVtpv *s, uint32_t size)
     if (vtpv_dq_enqueue(s, s->client_id, s->msg, n)) {
         vtpv_raise(s, s->client_id);
     } else {
-        fprintf(stderr, "apple-vtpv: selftest enqueue failed\n");
+        lab_elog( "apple-vtpv: selftest enqueue failed\n");
     }
 }
 
@@ -3816,7 +3817,7 @@ static uint64_t vtpv_mmio_read(void *opaque, hwaddr addr, unsigned size)
         case VTPV_UUID_GPA: cur = sl2->uuid_gpa; break;
         default:
             if (s->verbose) {
-                fprintf(stderr, "apple-vtpv: read %#llx\n", (unsigned long long)addr);
+                lab_elog( "apple-vtpv: read %#llx\n", (unsigned long long)addr);
             }
             return v;
         }
@@ -3884,7 +3885,7 @@ static void vtpv_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned si
                 fclose(f);
             }
             if (s->verbose) {
-                fprintf(stderr, "apple-vtpv: slot%d uuid op=%lld\n",
+                lab_elog( "apple-vtpv: slot%d uuid op=%lld\n",
                         s->client_id, (long long)val);
             }
             if (val == 2) {
@@ -3892,7 +3893,7 @@ static void vtpv_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned si
                 vtpv_sess_drop(s, uuid);    /* the guest session is gone */
                 int64_t d1 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
                 if (d1 - d0 > 5000) {
-                    fprintf(stderr, "apple-vtpv: slot%d long uuid drop %lld us\n", s->client_id,
+                    lab_elog( "apple-vtpv: slot%d long uuid drop %lld us\n", s->client_id,
                             (long long)(d1 - d0));
                 }
             }
@@ -3925,7 +3926,7 @@ static void vtpv_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned si
         if (s->kick_open_us && k0 - s->kick_open_us > 20000) {
             /* the kext's register writes before the kick, under its spin lock:
              * each one an MMIO exit that waits for the BQL */
-            fprintf(stderr, "apple-vtpv: slot%d slow kick prologue %lld us\n", s->client_id,
+            lab_elog( "apple-vtpv: slot%d slow kick prologue %lld us\n", s->client_id,
                     (long long)(k0 - s->kick_open_us));
         }
         if (k2 - k0 > 20000) {
@@ -3933,7 +3934,7 @@ static void vtpv_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned si
              * caller of the device - and its user lock chain - waits that long */
             char t5[5];
             vtpv_log4cc(t5, ldl_be_p(s->msg + 8));
-            fprintf(stderr, "apple-vtpv: slot%d long kick %.4s %lld us (surfdesc %lld us)\n",
+            lab_elog( "apple-vtpv: slot%d long kick %.4s %lld us (surfdesc %lld us)\n",
                     s->client_id, t5, (long long)(k2 - k0), (long long)(k1 - k0));
         }
         break;
@@ -3967,7 +3968,7 @@ static void vtpv_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned si
         if (dma_memory_read(pci_get_address_space(PCI_DEVICE(s)), gpa, &d, sizeof(d),
                             MEMTXATTRS_UNSPECIFIED) ||
             d.magic != VTPV_KICKDESC_MAGIC || d.slot >= VTPV_MAX_SLOT) {
-            fprintf(stderr, "apple-vtpv: bad kick descriptor at %#llx\n",
+            lab_elog( "apple-vtpv: bad kick descriptor at %#llx\n",
                     (unsigned long long)gpa);
             break;
         }
@@ -3991,7 +3992,7 @@ static void vtpv_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned si
         if (k2 - k0 > 20000) {
             char t5[5];
             vtpv_log4cc(t5, ldl_be_p(s->msg + 8));
-            fprintf(stderr, "apple-vtpv: slot%d long kickdesc %.4s %lld us (surfdesc %lld us)\n",
+            lab_elog( "apple-vtpv: slot%d long kickdesc %.4s %lld us (surfdesc %lld us)\n",
                     d.slot, t5, (long long)(k2 - k0), (long long)(k1 - k0));
         }
         break;
@@ -4018,7 +4019,7 @@ static void vtpv_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned si
     case VTPV_DEBUGVAL:
         s->debugval = val;    /* real scratch: the kext reports its MSI state here */
         if (s->verbose) {
-            fprintf(stderr, "apple-vtpv: debugval %#llx\n", (unsigned long long)val);
+            lab_elog( "apple-vtpv: debugval %#llx\n", (unsigned long long)val);
         }
         break;
     case VTPV_SURFMAP_COUNT:
@@ -4041,18 +4042,18 @@ static void vtpv_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned si
                 s->surfmap_list_n = n;
             } else {
                 g_free(l);
-                fprintf(stderr, "apple-vtpv: surfmap list read failed (%u pages)\n", n);
+                lab_elog( "apple-vtpv: surfmap list read failed (%u pages)\n", n);
             }
         }
         if (s->verbose) {
-            fprintf(stderr, "apple-vtpv: surfmap kick=%u pages=%u w=%u h=%u "
+            lab_elog( "apple-vtpv: surfmap kick=%u pages=%u w=%u h=%u "
                     "bpr=%u p1@%u bpr1=%u gpa0=%llx\n", s->surfmap_kick,
                     s->surfmap_count, s->surfmap_meta[0] >> 16,
                     s->surfmap_meta[0] & 0xffffu, s->surfmap_meta[1],
                     s->surfmap_meta[2], s->surfmap_meta[3],
                     s->surfmap_count ? (unsigned long long)s->surfmap_gpa[0] : 0ull);
             for (uint32_t i = 0; i < 8 && vtpv_page_ok(s, i); i++) {
-                fprintf(stderr, "apple-vtpv:   page %u gpa %llx\n", i,
+                lab_elog( "apple-vtpv:   page %u gpa %llx\n", i,
                         (unsigned long long)vtpv_page_gpa(s, i));
             }
         }
@@ -4078,7 +4079,7 @@ static void vtpv_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned si
         break;
     default:
         if (s->verbose) {
-            fprintf(stderr, "apple-vtpv: write %#llx <- %#llx\n",
+            lab_elog( "apple-vtpv: write %#llx <- %#llx\n",
                     (unsigned long long)addr, (unsigned long long)val);
         }
         break;
@@ -4218,7 +4219,7 @@ static void vtpv_hwdecode_dfrm(AppleVtpv *s, uint64_t total)
                                     o += nl;
                                 }
                             }
-                            fprintf(stderr, "apple-vtpv: HEVC hvcC cached "
+                            lab_elog( "apple-vtpv: HEVC hvcC cached "
                                     "vps=%u sps=%u pps=%u\n",
                                     s->h265_vps_len, s->h265_sps_len,
                                     s->h265_pps_len);
@@ -4384,7 +4385,7 @@ static void vtpv_hwdecode_dfrm(AppleVtpv *s, uint64_t total)
                             }
                         }
                     }
-                    fprintf(stderr, "apple-vtpv: HW-DECODE tile=%llu "
+                    lab_elog( "apple-vtpv: HW-DECODE tile=%llu "
                             "%ux%d -> canvas %llu bytes (chroma=%d)\n",
                             (unsigned long long)s->last_frame_id, dw, dh,
                             (unsigned long long)written,
@@ -4392,14 +4393,14 @@ static void vtpv_hwdecode_dfrm(AppleVtpv *s, uint64_t total)
                     decoded = true;
                 }
             } else {
-                fprintf(stderr, "apple-vtpv: dtil sbf parse: sps=%u pps=%u "
+                lab_elog( "apple-vtpv: dtil sbf parse: sps=%u pps=%u "
                         "slices=%u flen=%u (len=%u)\n",
                         sps ? sps_l : 0, pps ? pps_l : 0, nslices, flen,
                         sbf_len);
             }
         }
         if (!decoded) {
-            fprintf(stderr, "apple-vtpv: hwdecode miss, no writeback\n");
+            lab_elog( "apple-vtpv: hwdecode miss, no writeback\n");
         }
     }
 }
@@ -4432,7 +4433,7 @@ static void vtpv_realize(PCIDevice *dev, Error **errp)
     qemu_thread_create(&s->tile_thread, "vtpv-tiles", vtpv_tile_thread, s,
                        QEMU_THREAD_DETACHED);
 
-    fprintf(stderr, "apple-vtpv: realized v3 transport (msi+intx), msglog=%s verbose=%u "
+    lab_elog( "apple-vtpv: realized v3 transport (msi+intx), msglog=%s verbose=%u "
             "hwbackend=%s\n", s->msglog ? s->msglog : "(stderr)", s->verbose,
             vtpv_use_dx(s) ? "dx" : "vk");
 }
