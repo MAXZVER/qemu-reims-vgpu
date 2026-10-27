@@ -110,6 +110,20 @@ typedef struct VtpvSess {
     uint64_t next_seq;
     uint32_t dbuf_out;              /* 'Dbuf's sent and not answered yet */
     uint32_t shed_n;                /* frames shed and not completed yet */
+    /* dbuf-gate (TEMP lab): the hidden-layer signature - the layer stops
+     * returning displayed buffers, the pool answers every 'Dbuf' with a
+     * NEVER-SEEN surface (cold), forever.  Gate: hold new 'Dbuf's (one probe
+     * out at a time, DBUF_GATE_PROBE_US apart) until a probe's answer carries
+     * a RECYCLED surface (the layer consumes again = visible) or the session
+     * goes quiet.  The held-back 'Dbuf's are the player's own back-pressure:
+     * its buffer acquisition blocks, the pipeline pauses - what a real Mac's
+     * display link does to a hidden layer. */
+    bool gate_on;
+    int64_t gate_probe_us;
+    uint32_t gate_cold;             /* cold answers in the current window */
+    int64_t gate_win_us;
+    uint64_t gate_seen[64];         /* recent answer surface ids, ring */
+    uint32_t gate_seen_n, gate_seen_i;
     int slot;                       /* the slot its 'Dbuf's go out on */
     bool dpba_sent;
     uint32_t dpba_w, dpba_h;        /* size the last 'Dpba' announced */
@@ -278,7 +292,8 @@ struct AppleVtpv {
     uint32_t tdem_window;
     bool tdem_fast;               /* tdem-fast=on: pace by h2g ring free space, no fixed holds */
     bool tile_uui;
-    bool canvas_probe;                /* tile-uui=off: 'TDem' carries no ',uui' - the guest emits its own
+    bool canvas_probe;
+    bool dbuf_gate;                /* TEMP lab: gate 'Dbuf's on the hidden-layer cold-surface signature */                /* tile-uui=off: 'TDem' carries no ',uui' - the guest emits its own
                                    * canvas (rec[+0x20], retained at DecodeTile) instead of resolving
                                    * our echoed UUID in its registry; immune to late-emit staleness */
     int64_t tdem_last_us;
@@ -978,6 +993,57 @@ static void vtpv_send_dbuf(AppleVtpv *s, int slot, uint64_t frame_id,
     vtpv_shed(s, s->cur);
 }
 
+#define DBUF_GATE_COLD_PER_WIN 8   /* cold answers per 2 s window to trip */
+#define DBUF_GATE_PROBE_US 500000  /* one probe 'Dbuf' out per 500 ms while gated */
+
+/* a 'Dbuf' ANSWER arrived carrying these surfaces: cold = never seen for the
+ * session (the pool is NOT recycling), warm = the layer returned it once */
+static void vtpv_gate_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
+{
+    if (!s->dbuf_gate) {
+        return;
+    }
+    bool warm = false;
+    for (uint32_t i = 0; i < se->gate_seen_n; i++) {
+        if (se->gate_seen[i] == surf0) {
+            warm = true;
+            break;
+        }
+    }
+    if (se->gate_seen_n < 64) {
+        se->gate_seen[se->gate_seen_n++] = surf0;
+    } else {
+        se->gate_seen[se->gate_seen_i] = surf0;
+        se->gate_seen_i = (se->gate_seen_i + 1) & 63;
+    }
+    int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    if (se->gate_win_us == 0) {
+        se->gate_win_us = now;
+    }
+    if (warm) {
+        if (se->gate_on) {
+            se->gate_on = false;
+            fprintf(stderr, "apple-vtpv: dbuf-gate LIFTED (surface %u recycled)
+", surf0);
+        }
+        se->gate_cold = 0;
+        se->gate_win_us = now;
+        return;
+    }
+    se->gate_cold++;
+    if (!se->gate_on && se->gate_cold >= DBUF_GATE_COLD_PER_WIN &&
+        now - se->gate_win_us >= 2000000) {
+        se->gate_on = true;
+        fprintf(stderr, "apple-vtpv: dbuf-gate ON (session cold surfaces %u in %lld ms)
+",
+                se->gate_cold, (long long)(now - se->gate_win_us) / 1000);
+    }
+    if (now - se->gate_win_us >= 2000000) {
+        se->gate_win_us = now;
+        se->gate_cold = 0;
+    }
+}
+
 /* ask the guest for buffers for the oldest waiting frames, at most
  * VTPV_DBUF_INFLIGHT at a time (the next goes out when one is answered) */
 static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
@@ -1014,6 +1080,15 @@ static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
         }
         if (se->dbuf_out >= VTPV_DBUF_INFLIGHT) {
             return;
+        }
+        if (s->dbuf_gate && se->gate_on) {
+            /* hidden-like: one probe 'Dbuf' at a time, rate-limited; the rest
+             * wait - the player's buffer acquisition blocks (back-pressure) */
+            int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+            if (se->dbuf_out > 0 || now < se->gate_probe_us) {
+                return;
+            }
+            se->gate_probe_us = now + DBUF_GATE_PROBE_US;
         }
         uint8_t paras[128];
         uint32_t n = 0;
@@ -3279,6 +3354,9 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
             memcpy(uuid, u, 16);
         }
         uint64_t frame_id = s->cur->frame[hit].frame_id;
+        if (nsurf) {
+            vtpv_gate_note_answer(s, s->cur, sl->surf[0]);
+        }
         s->cur->frame[hit].dbuf_sent = false;
         if (s->cur->dbuf_out) {
             s->cur->dbuf_out--;
@@ -4367,7 +4445,9 @@ static const Property vtpv_properties[] = {
     DEFINE_PROP_BOOL("tile-dump-read", AppleVtpv, tile_dump_read, false),
     DEFINE_PROP_BOOL("tdem-fast", AppleVtpv, tdem_fast, true),   /* A/B won 10-26: tail p99 124->72-86ms, 0 errors, 108/108; off = rollback */
     DEFINE_PROP_BOOL("tile-uui", AppleVtpv, tile_uui, true),
-    DEFINE_PROP_BOOL("canvas-probe", AppleVtpv, canvas_probe, false), /* read back the canvas's first
+    DEFINE_PROP_BOOL("canvas-probe", AppleVtpv, canvas_probe, false),
+    DEFINE_PROP_BOOL("dbuf-gate", AppleVtpv, dbuf_gate, false), /* TEMP lab A/B 10-27: hidden-layer
+                                                                  * back-pressure; off = stock */ /* read back the canvas's first
                                                                        * bytes right after the fill (BH) */     /* off = A/B 10-27: emit without ',uui' (the guest uses its own
                                                                    * retained canvas) against the 16 ms-p50 late-emit retry loop */
     DEFINE_PROP_UINT64("tdem-gate-cap-us", AppleVtpv, tdem_gate_cap_us, 100000),
