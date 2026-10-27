@@ -1024,6 +1024,14 @@ static void vtpv_gate_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
             }
         }
     }
+    {
+        static int g_note;
+        if (g_note < 3) {
+            g_note++;
+            fprintf(stderr, "apple-vtpv: note-answer #%d live=%d gate=%d\n",
+                    g_note, s->dbuf_gate_live, s->dbuf_gate);
+        }
+    }
     if (!s->dbuf_gate) {
         return;
     }
