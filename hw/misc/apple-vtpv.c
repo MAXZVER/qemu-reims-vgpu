@@ -294,7 +294,9 @@ struct AppleVtpv {
     bool tdem_fast;               /* tdem-fast=on: pace by h2g ring free space, no fixed holds */
     bool tile_uui;
     bool canvas_probe;
-    bool dbuf_gate;                /* TEMP lab: gate 'Dbuf's on the hidden-layer cold-surface signature */                /* tile-uui=off: 'TDem' carries no ',uui' - the guest emits its own
+    bool dbuf_gate;                /* TEMP lab: gate 'Dbuf's on the hidden-layer cold-surface signature */
+    bool dbuf_gate_live;           /* TEMP lab: dbuf-gate=live - the flag file is the switch */
+    int64_t gate_live_check_us;                /* tile-uui=off: 'TDem' carries no ',uui' - the guest emits its own
                                    * canvas (rec[+0x20], retained at DecodeTile) instead of resolving
                                    * our echoed UUID in its registry; immune to late-emit staleness */
     int64_t tdem_last_us;
@@ -1004,6 +1006,20 @@ static void vtpv_send_dbuf(AppleVtpv *s, int slot, uint64_t frame_id,
  * session (the pool is NOT recycling), warm = the layer returned it once */
 static void vtpv_gate_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
 {
+    /* dbuf-gate=live: the flag file is the A/B switch (Opus 16:1x - one boot,
+     * no boot-to-boot variance); the answer stream is the poll clock (~60/s
+     * ungated, ~8/s gated - both far past the 250 ms throttle) */
+    if (s->dbuf_gate_live) {
+        int64_t nowl = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        if (nowl >= s->gate_live_check_us) {
+            s->gate_live_check_us = nowl + 250000;
+            gchar *txt = NULL;
+            if (g_file_get_contents("C:/reims-lab/live/vtpv-dbufgate", &txt, NULL, NULL) && txt) {
+                s->dbuf_gate = g_str_has_prefix(g_strchomp(txt), "on");
+                g_free(txt);
+            }
+        }
+    }
     if (!s->dbuf_gate) {
         return;
     }
@@ -4455,7 +4471,9 @@ static const Property vtpv_properties[] = {
     DEFINE_PROP_BOOL("tdem-fast", AppleVtpv, tdem_fast, true),   /* A/B won 10-26: tail p99 124->72-86ms, 0 errors, 108/108; off = rollback */
     DEFINE_PROP_BOOL("tile-uui", AppleVtpv, tile_uui, true),
     DEFINE_PROP_BOOL("canvas-probe", AppleVtpv, canvas_probe, false),
-    DEFINE_PROP_BOOL("dbuf-gate", AppleVtpv, dbuf_gate, false), /* TEMP lab A/B 10-27: hidden-layer
+    DEFINE_PROP_BOOL("dbuf-gate", AppleVtpv, dbuf_gate, false),
+    DEFINE_PROP_BOOL("dbuf-gate-live", AppleVtpv, dbuf_gate_live, false), /* the A/B-in-one-boot form:
+                                                                           * C:/reims-lab/live/vtpv-dbufgate = on/off */ /* TEMP lab A/B 10-27: hidden-layer
                                                                   * back-pressure; off = stock */ /* read back the canvas's first
                                                                        * bytes right after the fill (BH) */     /* off = A/B 10-27: emit without ',uui' (the guest uses its own
                                                                    * retained canvas) against the 16 ms-p50 late-emit retry loop */
