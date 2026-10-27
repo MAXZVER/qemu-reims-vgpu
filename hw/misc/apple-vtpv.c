@@ -994,11 +994,11 @@ static void vtpv_send_dbuf(AppleVtpv *s, int slot, uint64_t frame_id,
     vtpv_shed(s, s->cur);
 }
 
-#define DBUF_GATE_COLD_WIN 12      /* cold answers per 10 s window to trip; the measured hidden
+#define DBUF_GATE_COLD_WIN 6       /* cold answers per 5 s window to trip; the measured hidden
                                    * leak is 16-32/10 s across boots.  Two consecutive windows >= 8
                                    * confirm, so a resolution-switch burst (one hot window) cannot
                                    * trip */
-#define DBUF_GATE_PROBE_US 500000  /* one probe 'Dbuf' out per 500 ms while gated */
+#define DBUF_GATE_PROBE_US 125000  /* gated: one 'Dbuf' out per 125 ms (8/s) */
 
 /* a 'Dbuf' ANSWER arrived carrying these surfaces: cold = never seen for the
  * session (the pool is NOT recycling), warm = the layer returned it once */
@@ -1020,38 +1020,30 @@ static void vtpv_gate_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
         se->gate_seen[se->gate_seen_i] = surf0;
         se->gate_seen_i = (se->gate_seen_i + 1) & 63;
     }
-    if (warm) {
-        /* while gated, the ONLY 'Dbuf' in flight is our probe (the rest are
-         * held): a warm PROBE answer means the layer consumes again - visible
-         * again - so lift at once.  Ungated warm answers (the pool's own
-         * decode-ahead recycles) never reach a lift (yt21's 30 flaps) */
-        if (se->gate_on) {
-            se->gate_on = false;
-            se->gate_cold_win = 0;
-            fprintf(stderr, "apple-vtpv: dbuf-gate LIFTED (probe surface %u recycled)\n",
-                    surf0);
-        }
-        return;
-    }
-    int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
-    if (se->gate_win_us == 0 || now - se->gate_win_us >= 10000000) {
+    int64_t now_ans = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    /* the window runs on EVERY answer (v3's bug: the warm early-return made
+     * the clean-window lift unreachable and deadlocked the gate ON) */
+    if (se->gate_win_us == 0 || now_ans - se->gate_win_us >= 5000000) {
         se->gate_cold_prev = se->gate_cold_win;
-        se->gate_win_us = now;
+        se->gate_win_us = now_ans;
         se->gate_cold_win = 0;
-        if (se->gate_on && se->gate_cold_prev < 4) {
+        if (se->gate_on && se->gate_cold_prev < 3) {
             se->gate_on = false;
-            fprintf(stderr, "apple-vtpv: dbuf-gate LIFTED (a clean window: %u cold)\n",
+            fprintf(stderr, "apple-vtpv: dbuf-gate LIFTED (clean window: %u cold)\nn",
                     se->gate_cold_prev);
         }
     }
+    if (warm) {
+        return;
+    }
     se->gate_cold_win++;
-    if (s->dbuf_gate && se->gate_cold_win % 16 == 0) {
-        fprintf(stderr, "apple-vtpv: gate-diag cold=%u in window (seen=%u)\n",
+    if (s->dbuf_gate && se->gate_cold_win % 8 == 0) {
+        fprintf(stderr, "apple-vtpv: gate-diag cold=%u in window (seen=%u)\nn",
                 se->gate_cold_win, se->gate_seen_n);
     }
-    if (se->gate_cold_win >= DBUF_GATE_COLD_WIN && se->gate_cold_prev >= 8 && !se->gate_on) {
+    if (se->gate_cold_win >= DBUF_GATE_COLD_WIN && se->gate_cold_prev >= 4 && !se->gate_on) {
         se->gate_on = true;
-        fprintf(stderr, "apple-vtpv: dbuf-gate ON (session: %u cold answer surfaces in 10 s)\n",
+        fprintf(stderr, "apple-vtpv: dbuf-gate ON (session: %u cold answer surfaces in 5 s)\nn",
                 se->gate_cold_win);
     }
 }
@@ -1094,10 +1086,12 @@ static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
             return;
         }
         if (s->dbuf_gate && se->gate_on) {
-            /* hidden-like: one probe 'Dbuf' at a time, rate-limited; the rest
-             * wait - the player's buffer acquisition blocks (back-pressure) */
+            /* hidden-like: throttle to ~8 'Dbuf'/s (the player degrades to a
+             * hidden-tab cadence instead of freezing - v3's hard hold worked
+             * but stalled the switch-back 824 ms; v4's probe-lift flapped on
+             * the pool's recycled stock).  Lift = the clean window (v5). */
             int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
-            if (se->dbuf_out > 0 || now < se->gate_probe_us) {
+            if (now < se->gate_probe_us) {
                 return;
             }
             se->gate_probe_us = now + DBUF_GATE_PROBE_US;
