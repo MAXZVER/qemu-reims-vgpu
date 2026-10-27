@@ -1133,10 +1133,13 @@ static void vtpv_pace_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
     }
     if ((se->pace_warm + se->pace_cold) % 256 == 0) {
         lab_elog("apple-vtpv: pace-diag warm=%u cold=%u holds=%u "
-                 "dec-stat dfrm=%llu ask=%llu drop=%llu dec=%llu\n",
+                 "dec-stat dfrm=%llu ask=%llu drop=%llu dec=%llu "
+                 "dbg pace=%d dx=%d ivl=%lld toks=%lld\n",
                 se->pace_warm, se->pace_cold, s->pace_holds,
                 (unsigned long long)s->stat_dfrm, (unsigned long long)s->stat_ask,
-                (unsigned long long)s->stat_drop, (unsigned long long)s->stat_dec);
+                (unsigned long long)s->stat_drop, (unsigned long long)s->stat_dec,
+                s->dec_pace ? 1 : 0, se->dx ? 1 : 0,
+                (long long)s->pace_ivl_us, (long long)se->pace_toks_us);
     }
 }
 
@@ -1218,6 +1221,10 @@ static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
         }
         if (!vtpv_pace_allow(s, se, true)) {
             s->pace_holds++;
+            if (s->pace_holds == 1 || s->pace_holds % 100 == 0) {
+                lab_elog("apple-vtpv: pace HOLD #%u toks=%lld dx=%d\n",
+                        s->pace_holds, (long long)se->pace_toks_us, se->dx ? 1 : 0);
+            }
             memcpy(s->pace_uuid, uuid16, 16);
             if (!timer_pending(s->pace_timer)) {
                 timer_mod(s->pace_timer,
