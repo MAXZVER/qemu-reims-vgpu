@@ -2317,8 +2317,7 @@ static void vtpv_tdem_pump(AppleVtpv *s)
     /* TEMP lab gate diag: the flag/cold state every 2 s, independent of answers */
     if (s->dbuf_gate_live && now >= s->gate_diag_us) {
         s->gate_diag_us = now + 2000000;
-        fprintf(stderr, "apple-vtpv: gate-live flag=%d on=%d cold=%u prev=%u seen=%u
-",
+        fprintf(stderr, "apple-vtpv: gate-live flag=%d on=%d cold=%u prev=%u seen=%u\n",
                 s->dbuf_gate, s->gate_on, s->gate_cold_win, s->gate_cold_prev, s->gate_seen_n);
     }
     VtpvTdem *t;
