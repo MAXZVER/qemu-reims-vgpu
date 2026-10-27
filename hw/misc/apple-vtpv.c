@@ -103,6 +103,7 @@ typedef struct VtpvSess {
         bool decoded;               /* the decode thread is done: nv12 or nothing */
         bool shed;                  /* backlog: decoded for its references only, completed dropped */
         bool dno;                   /* TEMP lab dno: the player asked kVTDecodeFrame_DoNotOutputFrame */
+        bool pace_drop;             /* TEMP lab dec-pace: decode for references, complete dropped */
         uint8_t *nv12;              /* outbuf: decoded picture waiting for its buffer */
         uint32_t w, h;
         uint8_t *sample;            /* outbuf: or the compressed sample, decoded at the reply */
@@ -317,6 +318,8 @@ struct AppleVtpv {
     uint8_t pace_uuid[16];
     uint32_t pace_holds;
     int64_t pace_ivl_us;           /* dec-pace ask interval (REIMS_VGPU_LAB_DEC_PACE_US) */
+    bool pace_drop_next;           /* dec-pace v3: the next allocated frame is decode-only */
+    uint64_t stat_dfrm, stat_ask, stat_drop, stat_dec;
     int64_t gate_live_check_us;
     int64_t gate_diag_us;                /* tile-uui=off: 'TDem' carries no ',uui' - the guest emits its own
                                    * canvas (rec[+0x20], retained at DecodeTile) instead of resolving
@@ -999,7 +1002,14 @@ static void vtpv_send_dbuf(AppleVtpv *s, int slot, uint64_t frame_id,
     s->cur->frame[free_i].queued = false;
     s->cur->frame[free_i].decoded = false;
     s->cur->frame[free_i].shed = false;
-    s->cur->frame[free_i].dno = s->dno && s->decthread && (s->cur_dfl & (1u << 1));
+        s->cur->frame[free_i].dno = s->dno && s->decthread && (s->cur_dfl & (1u << 1));
+        s->cur->frame[free_i].pace_drop = s->pace_drop_next;
+        s->pace_drop_next = false;
+        if (s->cur->frame[free_i].pace_drop) {
+            s->stat_drop++;
+        } else {
+            s->stat_ask++;
+        }
     g_free(s->cur->frame[free_i].nv12);
     s->cur->frame[free_i].nv12 = NULL;
     g_free(s->cur->frame[free_i].sample);
@@ -1122,9 +1132,36 @@ static void vtpv_pace_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
         se->pace_cold++;
     }
     if ((se->pace_warm + se->pace_cold) % 256 == 0) {
-        lab_elog("apple-vtpv: pace-diag warm=%u cold=%u holds=%u\n",
-                se->pace_warm, se->pace_cold, s->pace_holds);
+        lab_elog("apple-vtpv: pace-diag warm=%u cold=%u holds=%u "
+                 "dec-stat dfrm=%llu ask=%llu drop=%llu dec=%llu\n",
+                se->pace_warm, se->pace_cold, s->pace_holds,
+                (unsigned long long)s->stat_dfrm, (unsigned long long)s->stat_ask,
+                (unsigned long long)s->stat_drop, (unsigned long long)s->stat_dec);
     }
+}
+
+/* dec-pace v3: token check; consume=true also spends a token (the pump's
+ * real send); consume=false is the dfrm site's peek (its denied frames never
+ * ask, so they never spend). */
+static bool vtpv_pace_allow(AppleVtpv *s, VtpvSess *se, bool consume)
+{
+    if (!s->dec_pace || !s->outbuf || !se->dx) {
+        return true;
+    }
+    int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    int64_t cap = (int64_t)VTPV_PACE_BURST * s->pace_ivl_us;
+    if (se->pace_last_us == 0) {
+        se->pace_last_us = now;
+    }
+    se->pace_toks_us = MIN(cap, se->pace_toks_us + (now - se->pace_last_us));
+    se->pace_last_us = now;
+    if (se->pace_toks_us < s->pace_ivl_us) {
+        return false;
+    }
+    if (consume) {
+        se->pace_toks_us -= s->pace_ivl_us;
+    }
+    return true;
 }
 
 /* ask the guest for buffers for the oldest waiting frames, at most
@@ -1148,7 +1185,7 @@ static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
         /* TEMP lab dno: the oldest waiting frame was asked not to be output -
          * decode it now, in decode order (every older frame is already queued
          * or shed), and complete it dropped without a buffer */
-        if (se->frame[next].dno) {
+        if (se->frame[next].dno || se->frame[next].pace_drop) {
             if (se->frame[next].sample && !se->frame[next].nv12 &&
                 !vtpv_dec_queue(s, se, next)) {
                 return;             /* the decode queue is full: next pump */
@@ -1179,23 +1216,14 @@ static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
                 }
             }
         }
-        if (s->dec_pace && s->outbuf && se->dx) {
-            int64_t nowq = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
-            int64_t cap = (int64_t)VTPV_PACE_BURST * s->pace_ivl_us;
-            if (se->pace_last_us == 0) {
-                se->pace_last_us = nowq;
+        if (!vtpv_pace_allow(s, se, true)) {
+            s->pace_holds++;
+            memcpy(s->pace_uuid, uuid16, 16);
+            if (!timer_pending(s->pace_timer)) {
+                timer_mod(s->pace_timer,
+                          qemu_clock_get_us(QEMU_CLOCK_REALTIME) + s->pace_ivl_us / 4);
             }
-            se->pace_toks_us = MIN(cap, se->pace_toks_us + (nowq - se->pace_last_us));
-            se->pace_last_us = nowq;
-            if (se->pace_toks_us < s->pace_ivl_us) {
-                s->pace_holds++;
-                memcpy(s->pace_uuid, uuid16, 16);
-                if (!timer_pending(s->pace_timer)) {
-                    timer_mod(s->pace_timer, nowq + s->pace_ivl_us / 4);
-                }
-                return;
-            }
-            se->pace_toks_us -= s->pace_ivl_us;
+            return;
         }
         if (s->dbuf_gate && s->gate_on) {
             /* hidden-like: throttle to ~8 'Dbuf'/s (the player degrades to a
@@ -2146,6 +2174,7 @@ static bool vtpv_dx_decode_sample(AppleVtpv *s, VtpvSess *se, const uint8_t *sam
                 (unsigned long long)k->written, rc, (long long)(t1 - t0), (long long)(t0 - t_in));
         if (rc == 0 && k->pictures > 0) {
             vtpv_learned_api[cls] = se->dx_api + 1;
+            s->stat_dec++;
             return true;
         }
         /* a stream this decoder does not take: the session moves to the next
@@ -3735,6 +3764,13 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
     }
     if (non_tile_dfrm && s->outbuf) {
         VtpvDxSink *k = &s->cur->dx_sink;
+        s->stat_dfrm++;
+        /* dec-pace v3: the REAL ask path is here (the pump only retries);
+         * a denied ask still allocates its frame and decodes in order for
+         * its references, completed dropped without a buffer (the shed
+         * machinery) - what a full real-Mac VT queue answers a pusher. */
+        bool pdeny = s->dec_pace && s->outbuf && s->cur->dx && !vtpv_pace_allow(s, s->cur, false);
+        s->pace_drop_next = pdeny;
         if (s->ob_first) {
             if (k->w != s->cur->dpba_w || k->h != s->cur->dpba_h) {
                 vtpv_send_dpba(s, slot, s->msg + 0x10, k->w, k->h);
