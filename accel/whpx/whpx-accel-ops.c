@@ -9,6 +9,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/lab-elog.h"   /* TEMP lab: one write per stderr line */
 #include "system/kvm_int.h"
 #include "qemu/main-loop.h"
 #include "accel/accel-cpu-ops.h"
@@ -47,13 +48,13 @@ static void *whpx_cpu_thread_fn(void *arg)
             int p = atoi(e);
 
             if (SetThreadPriority(GetCurrentThread(), p) && cpu->cpu_index == 0) {
-                fprintf(stderr, "whpx: vCPU thread priority %d (QEMU_LAB_VCPU_PRIO)\n", p);
+                lab_elog("whpx: vCPU thread priority %d (QEMU_LAB_VCPU_PRIO)\n", p);
             }
         }
     }
     r = whpx_init_vcpu(cpu);
     if (r < 0) {
-        fprintf(stderr, "whpx_init_vcpu failed: %s\n", strerror(-r));
+        lab_elog("whpx_init_vcpu failed: %s\n", strerror(-r));
         exit(1);
     }
 

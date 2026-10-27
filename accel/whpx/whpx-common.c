@@ -6,6 +6,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/lab-elog.h"   /* TEMP lab: one write per stderr line */
 #include "system/whpx-wp.h"
 #include "cpu.h"
 #include "system/address-spaces.h"
@@ -380,7 +381,7 @@ void whpx_lab_pin_pcores(const char *who)
     }
     g_free(buf);
     if (n && SetThreadSelectedCpuSets(GetCurrentThread(), ids, n)) {
-        fprintf(stderr, "reims-pcores %s: %lu performance cpu sets\n", who, (unsigned long)n);
+        lab_elog("reims-pcores %s: %lu performance cpu sets\n", who, (unsigned long)n);
     }
 }
 /*
@@ -462,7 +463,7 @@ void whpx_lab_excl_core_drain(void)
         }
     }
     SetThreadSelectedCpuSets(GetCurrentThread(), &drain, 1);
-    fprintf(stderr, "reims-excl-core drain=core%d set=%lu recorder=core%d rest=%lu\n", core0,
+    lab_elog("reims-excl-core drain=core%d set=%lu recorder=core%d rest=%lu\n", core0,
             (unsigned long)drain, core1, (unsigned long)n);
 }
 /*
@@ -503,7 +504,7 @@ void whpx_lab_pin_ccd(const char *who)
     }
     g_free(buf);
     if (n && SetThreadSelectedCpuSets(GetCurrentThread(), ids, n)) {
-        fprintf(stderr, "reims-lab: device-ccd %s ccd=%d sets=%lu\n", who, ccd, (unsigned long)n);
+        lab_elog("reims-lab: device-ccd %s ccd=%d sets=%lu\n", who, ccd, (unsigned long)n);
     }
 }
 
@@ -561,7 +562,7 @@ static void whpx_lab_wp_populate(uint64_t gpa, uint64_t size, bool writable)
     if (now - was >= NANOSECONDS_PER_SECOND && qatomic_cmpxchg(&last, was, now) == was) {
         uint64_t cn = qatomic_xchg(&n, 0), cp = qatomic_xchg(&pages, 0), cns = qatomic_xchg(&ns, 0);
         uint64_t cf = qatomic_xchg(&fails, 0);
-        fprintf(stderr, "reims-lab: wp-populate mode=%d n=%" PRIu64 " pages=%" PRIu64 " us=%" PRIu64
+        lab_elog("reims-lab: wp-populate mode=%d n=%" PRIu64 " pages=%" PRIu64 " us=%" PRIu64
                 " fails=%" PRIu64 "\n", mode, cn, cp, cns / 1000, cf);
     }
 }
@@ -772,7 +773,7 @@ int whpx_fence_remap_at(uint64_t gpa, uint64_t size, bool closed, void *mem, uin
         static int said;
 
         if (said++ < 4) {
-            fprintf(stderr, "reims-fence: remap %s of 0x%" PRIx64 "+0x%" PRIx64 " refused hr=0x%lx\n",
+            lab_elog("reims-fence: remap %s of 0x%" PRIx64 "+0x%" PRIx64 " refused hr=0x%lx\n",
                     closed ? "close" : "open", gpa, size, (long)hr);
         }
         if (!closed) {
@@ -829,7 +830,7 @@ static void whpx_lab_populate(uint64_t gpa, uint64_t size, bool ram)
     hr = whp_dispatch.WHvAdviseGpaRange(whpx_global.partition, &range, 1,
                                         WHvAdviseGpaRangeCodePopulate,
                                         &advice, sizeof(advice));
-    fprintf(stderr, "reims-lab: populate gpa=0x%" PRIx64 " size_mb=%" PRIu64
+    lab_elog("reims-lab: populate gpa=0x%" PRIx64 " size_mb=%" PRIu64
             " hr=0x%lx ms=%" PRId64 "\n", gpa, size >> 20, hr,
             (get_clock() - t0) / 1000000);
 }
@@ -869,7 +870,7 @@ static void whpx_lab_resident(void *mem, uint64_t size, bool ram)
                                      QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
     DWORD set_err = set ? 0 : GetLastError();
     lk = set && VirtualLock(mem, size);
-    fprintf(stderr, "reims-lab: resident size_mb=%" PRIu64 " ws_min_mb=%" PRIu64 " set=%d err=%lu lock=%d "
+    lab_elog("reims-lab: resident size_mb=%" PRIu64 " ws_min_mb=%" PRIu64 " set=%d err=%lu lock=%d "
             "lock_err=%lu ms=%" PRId64 "\n", size >> 20, (uint64_t)want >> 20, set, set_err, lk,
             lk ? 0UL : GetLastError(), (get_clock() - t0) / 1000000);
 }
@@ -965,7 +966,7 @@ static void whpx_set_phys_mem_inner(MemoryRegionSection *section, bool add)
          */
         if (ut && strcmp(ut, "on") == 0) {
             whpx_dirty_tracking = false;
-            fprintf(stderr, "reims-lab: guest RAM mapped untracked\n");
+            lab_elog("reims-lab: guest RAM mapped untracked\n");
         }
         whpx_dirty_tracking_decided = true;
     }
@@ -1109,7 +1110,7 @@ static void whpx_log_sync(MemoryListener *listener,
                 qatomic_cmpxchg(&last, was, now) == was) {
                 uint64_t cn = qatomic_xchg(&n, 0), cns = qatomic_xchg(&ns, 0);
 
-                fprintf(stderr, "whpx-dirty-diag epoch_ms=%" PRId64
+                lab_elog("whpx-dirty-diag epoch_ms=%" PRId64
                         " syncs=%" PRIu64 " total_us=%" PRIu64
                         " avg_us=%" PRIu64 " max_us=%" PRIu64
                         " pages=%" PRIu64 "\n", g_get_real_time() / 1000, cn,
@@ -1366,7 +1367,7 @@ static void lab_whv_log(const char *what, int64_t t0, uint64_t gpa, uint64_t siz
     int64_t t1 = get_clock();
 
     if (t1 - t0 > lab_whv_ns) {
-        fprintf(stderr, "lab-whv %s %.2f ms at %" PRId64 " gpa=0x%" PRIx64
+        lab_elog("lab-whv %s %.2f ms at %" PRId64 " gpa=0x%" PRIx64
                 " size_mb=%" PRIu64 "\n", what, (t1 - t0) / 1e6, t0, gpa,
                 size >> 20);
     }
@@ -1436,7 +1437,7 @@ static void lab_whv_wrap(void)
         lab_whv_advise = whp_dispatch.WHvAdviseGpaRange;
         whp_dispatch.WHvAdviseGpaRange = lab_whv_advise_w;
     }
-    fprintf(stderr, "lab-whv on threshold_ms=%s\n", e);
+    lab_elog("lab-whv on threshold_ms=%s\n", e);
 }
 
 bool init_whp_dispatch(void)

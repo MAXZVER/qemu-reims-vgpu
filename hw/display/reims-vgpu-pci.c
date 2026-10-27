@@ -13,6 +13,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/lab-elog.h"   /* TEMP lab: one write per stderr line */
 #if defined(_WIN32)
 #include "system/whpx-wp.h"
 #endif
@@ -420,7 +421,7 @@ fail:
             }
             if (tripwire_ns > 0 && build_ns_now > tripwire_ns && !alias_off) {
                 alias_off = 1;
-                fprintf(stderr, "reims-pagealias storm tripped: build_us=%"
+                lab_elog("reims-pagealias storm tripped: build_us=%"
                         PRId64 " pages=%zu -> copying rails for this boot\n",
                         build_ns_now / 1000, count);
             }
@@ -456,7 +457,7 @@ fail:
             reims_pagealias.runs += runs_n;
             reims_pagealias.run_pages += count;
             if (!reims_pagealias.last || now - reims_pagealias.last >= NANOSECONDS_PER_SECOND) {
-                fprintf(stderr, "reims-pagealias epoch_ms=%" PRId64 " builds=%" PRIu64
+                lab_elog("reims-pagealias epoch_ms=%" PRId64 " builds=%" PRIu64
                         " build_us=%" PRIu64 " build_max_us=%" PRIu64 " frees=%" PRIu64
                         " free_us=%" PRIu64 " runs=%" PRIu64 " run_pages=%" PRIu64
                         " live=%u fails=%" PRIu64 "\n",
@@ -1024,7 +1025,7 @@ static void *reims_vgpu_pci_peek_thread(void *opaque)
             reims_vgpu_pci_peek_tails(s);
         }
         if (get_clock() - last >= NANOSECONDS_PER_SECOND * 5) {
-            fprintf(stderr, "reims-peek peeks=%" PRIu64 "\n", qatomic_xchg(&s->lab_peeks, 0));
+            lab_elog("reims-peek peeks=%" PRIu64 "\n", qatomic_xchg(&s->lab_peeks, 0));
             last = get_clock();
         }
         qemu_mutex_lock(&s->peek_mutex);
@@ -1248,7 +1249,7 @@ static void reims_vgpu_pci_wait_harvest(ReimsVGPUPCIState *s)
         int64_t now = get_clock();
 
         if (now - s->lab_hv_last >= NANOSECONDS_PER_SECOND) {
-            fprintf(stderr, "reims-harvest epoch_ms=%" PRId64 " harvests=%" PRIu64
+            lab_elog("reims-harvest epoch_ms=%" PRId64 " harvests=%" PRIu64
                     " harvest_us=%" PRIu64 " harvest_max_us=%" PRIu64
                     " waits=%" PRIu64 " wait_us=%" PRIu64 " wait_max_us=%" PRIu64
                     " nobql=%d\n", g_get_real_time() / 1000, s->lab_hv_n,
@@ -1311,7 +1312,7 @@ static void reims_vgpu_hiqos_apply(bool process)
     if (!process) {
         prio = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     }
-    fprintf(stderr, "reims-vgpu-hiqos %s throttling_off=%d priority=%d\n",
+    lab_elog("reims-vgpu-hiqos %s throttling_off=%d priority=%d\n",
             process ? "process" : "drain", ok ? 1 : 0, prio ? 1 : 0);
 }
 #endif
@@ -1616,7 +1617,7 @@ static void reims_vgpu_pci_gfx_write(void *opaque, hwaddr offset, uint64_t data,
                                 off_seen[k], off_n[k]);
                 off_n[k] = 0;
             }
-            fprintf(stderr, "reims-gfxw epoch_ms=%" PRId64 "%s\n",
+            lab_elog("reims-gfxw epoch_ms=%" PRId64 "%s\n",
                     g_get_real_time() / 1000, len ? buf : "");
             last = now;
         }

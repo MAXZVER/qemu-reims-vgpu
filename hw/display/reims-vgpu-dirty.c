@@ -5,6 +5,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/lab-elog.h"   /* TEMP lab: one write per stderr line */
 #include "qemu/main-loop.h"
 #include "qemu/thread.h"
 #include "qemu/timer.h"
@@ -1942,7 +1943,7 @@ static bool reims_vgpu_dirty_hash_avx2(void)
 
         __builtin_cpu_init();
         v = __builtin_cpu_supports("avx2") && !(e && strcmp(e, "off") == 0);
-        fprintf(stderr, "reims-dirty-hash-kernel avx2=%d\n", v);
+        lab_elog("reims-dirty-hash-kernel avx2=%d\n", v);
     }
     return v;
 }
@@ -2427,7 +2428,7 @@ static void reims_wp_lock(ReimsVgpuDirty *d, int line)
             }
             now = get_clock();
             if (now >= next) {
-                fprintf(stderr, "reims-dirty-wp-stuck: line %d thread %d waited %" PRId64 " ms; held from line %d by "
+                lab_elog("reims-dirty-wp-stuck: line %d thread %d waited %" PRId64 " ms; held from line %d by "
                         "thread %d for %" PRId64 " ms, waiters %d\n", line, qemu_get_thread_id(), (now - t0) / SCALE_MS,
                         qatomic_read(&reims_wp_holder_line), qatomic_read(&reims_wp_holder_tid),
                         (now - qatomic_read(&reims_wp_holder_ns)) / SCALE_MS, qatomic_read(&d->wp_waiters));
@@ -2575,7 +2576,7 @@ static void reims_fence_line(void)
     if (now - was < NANOSECONDS_PER_SECOND || qatomic_cmpxchg(&reims_fence_line_ns, was, now) != was) {
         return;
     }
-    fprintf(stderr, "reims-fence closes=%" PRIu64 " pages=%" PRIu64 " refused=%" PRIu64 " traps=%" PRIu64
+    lab_elog("reims-fence closes=%" PRIu64 " pages=%" PRIu64 " refused=%" PRIu64 " traps=%" PRIu64
             " trap_us=%" PRIu64 " trap_max_us=%" PRIu64 " wp_skips=%" PRIu64 " dma_waits=%" PRIu64 " stuck=%" PRIu64
             " runs=%" PRIu64 " close_us=%" PRIu64 " close_max_us=%" PRIu64 " open_us=%" PRIu64 " open_max_us=%" PRIu64 "\n",
             qatomic_xchg(&reims_fence_n_close, 0), qatomic_xchg(&reims_fence_n_pages, 0),
@@ -2654,7 +2655,7 @@ static void reims_fence_dma_wait(uint64_t addr, uint64_t len)
     }
     while (reims_fence_overlaps_locked(addr, len)) {
         if (get_clock() - t0 > 2 * NANOSECONDS_PER_SECOND) {
-            fprintf(stderr, "reims-fence STUCK dma 0x%" PRIx64 "+0x%" PRIx64 "\n", addr, len);
+            lab_elog("reims-fence STUCK dma 0x%" PRIx64 "+0x%" PRIx64 "\n", addr, len);
             qatomic_inc(&reims_fence_n_stuck);
             break;
         }
@@ -2685,7 +2686,7 @@ static void reims_fence_remap_guard(bool begin)
     reims_fence_blocked = begin;
     while (begin && reims_fences->len) {
         if (get_clock() - t0 > 2 * NANOSECONDS_PER_SECOND) {
-            fprintf(stderr, "reims-fence STUCK remap guard: %u fences closed\n", reims_fences->len);
+            lab_elog("reims-fence STUCK remap guard: %u fences closed\n", reims_fences->len);
             qatomic_inc(&reims_fence_n_stuck);
             break;
         }
@@ -2721,7 +2722,7 @@ static bool reims_fence_fault(uint64_t gpa)
         if (get_clock() - t0 > 2 * NANOSECONDS_PER_SECOND) {
             size_t r;
 
-            fprintf(stderr, "reims-fence STUCK token=%" PRIu64 " gpa=0x%" PRIx64 ": giving the pages back\n", token,
+            lab_elog("reims-fence STUCK token=%" PRIu64 " gpa=0x%" PRIx64 ": giving the pages back\n", token,
                     gpa);
             for (r = 0; r < f->nruns; r++) {
                 whpx_fence_remap_at(f->runs[2 * r], f->runs[2 * r + 1], false, f->mem[r], f->ram[r]);
@@ -2815,7 +2816,7 @@ static int reims_vgpu_dirty_wp_remap(ReimsVgpuDirty *d, uint64_t gpa, uint64_t s
         d->lab_wp_cause_pages[reims_wp_cause] += np;
         if (t0 - d->lab_wp_cause_last >= NANOSECONDS_PER_SECOND) {
             if (d->lab_wp_cause_last) {
-                fprintf(stderr, "reims-dirty-wp-cause epoch_ms=%" PRId64 " protect=%" PRIu64 "/%" PRIu64
+                lab_elog("reims-dirty-wp-cause epoch_ms=%" PRId64 " protect=%" PRIu64 "/%" PRIu64
                         " fault=%" PRIu64 "/%" PRIu64 " orphan=%" PRIu64 "/%" PRIu64 " drop=%" PRIu64 "/%" PRIu64
                         " other=%" PRIu64 "/%" PRIu64 " held=%" PRIu64 " orphans_left=%u\n",
                         g_get_real_time() / 1000,
@@ -2922,14 +2923,14 @@ uint64_t reims_vgpu_dirty_fence_close(ReimsVgpuDirty *d, const uint64_t *gpas, s
             down += gpas[i] + page_size == gpas[i - 1];
         }
         shape_said++;
-        fprintf(stderr, "reims-fence shape pages=%zu runs_in_order=%zu runs_sorted=%zu descending_steps=%zu"
+        lab_elog("reims-fence shape pages=%zu runs_in_order=%zu runs_sorted=%zu descending_steps=%zu"
                 " span_pages=%" PRIu64 "\n", count, in_order, nruns, down,
                 (sorted[count - 1] - sorted[0]) / page_size + 1);
     }
     g_free(sorted);
     if ((long)nruns > max_runs) {
         if (said++ < 8) {
-            fprintf(stderr, "reims-fence refused pages=%zu runs=%zu (max %ld)\n", count, nruns, max_runs);
+            lab_elog("reims-fence refused pages=%zu runs=%zu (max %ld)\n", count, nruns, max_runs);
         }
         qatomic_inc(&reims_fence_n_refused);
         g_array_free(runs, TRUE);
@@ -2944,7 +2945,7 @@ uint64_t reims_vgpu_dirty_fence_close(ReimsVgpuDirty *d, const uint64_t *gpas, s
     for (i = 0; i < nruns; i++) {
         if (whpx_ram_lookup(f->runs[2 * i], f->runs[2 * i + 1], &f->mem[i], &f->ram[i])) {
             if (said++ < 8) {
-                fprintf(stderr, "reims-fence refused: run 0x%" PRIx64 "+0x%" PRIx64 " is not one RAM region\n",
+                lab_elog("reims-fence refused: run 0x%" PRIx64 "+0x%" PRIx64 " is not one RAM region\n",
                         f->runs[2 * i], f->runs[2 * i + 1]);
             }
             reims_fence_free(f);
@@ -2987,7 +2988,7 @@ uint64_t reims_vgpu_dirty_fence_close(ReimsVgpuDirty *d, const uint64_t *gpas, s
             qemu_mutex_unlock(&d->wp_mutex);
         }
         if (said++ < 8) {
-            fprintf(stderr, "reims-fence refused pages=%zu runs=%zu: remap %zu declined\n", count, nruns, done);
+            lab_elog("reims-fence refused pages=%zu runs=%zu: remap %zu declined\n", count, nruns, done);
         }
         reims_fence_free(f);
         qatomic_inc(&reims_fence_n_refused);
@@ -3586,7 +3587,7 @@ static void reims_vgpu_dirty_wp_layout(ReimsVgpuDirty *d, const ReimsVgpuDirtySe
         }
     }
     span = prev_end - (s->pages[0] >> shift);
-    fprintf(stderr, "reims-dirty-wp-layout pages=%" PRIu64 " runs=%u span=%" PRIu64 " streak=%u"
+    lab_elog("reims-dirty-wp-layout pages=%" PRIu64 " runs=%u span=%" PRIu64 " streak=%u"
             " gaps=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
             " gpages=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
             " gtrk=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
@@ -4215,7 +4216,7 @@ static int64_t reims_vgpu_dirty_wp_protect_chunk(ReimsVgpuDirty *d, uint64_t tok
         d->wp_cur = 0;
         d->wp_mode = 0;
         d->lab_wp_refused++;
-        fprintf(stderr, "reims-dirty-wp: read-only remap refused (rc=%d), DIRTY_WP off\n", rc);
+        lab_elog("reims-dirty-wp: read-only remap refused (rc=%d), DIRTY_WP off\n", rc);
         qemu_mutex_unlock(&d->lock);
         goto done;
     }
@@ -4503,7 +4504,7 @@ static void *reims_vgpu_dirty_wp_watch_fn(void *opaque)
             static const char *const stage[] = { "-", "query-ticket wait", "hypervisor remap", "marks" };
             int st = qatomic_read(&reims_wp_stage);
 
-            fprintf(stderr, "reims-dirty-wp-watch: wp_mutex held %" PRId64 " ms from line %d by thread %d (%s), "
+            lab_elog("reims-dirty-wp-watch: wp_mutex held %" PRId64 " ms from line %d by thread %d (%s), "
                     "faults waiting %d, tickets in flight %d\n", held / SCALE_MS, qatomic_read(&reims_wp_holder_line),
                     qatomic_read(&reims_wp_holder_tid), stage[st < 4 && st >= 0 ? st : 0],
                     qatomic_read(&d->wp_waiters), qatomic_read(&d->q_ninflight));
@@ -4534,7 +4535,7 @@ void reims_vgpu_lab_device_prio(const char *who)
         on = e && strcmp(e, "on") == 0;
     }
     if (on && SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL)) {
-        fprintf(stderr, "reims-lab: device-prio %s" "\n", who);
+        lab_elog("reims-lab: device-prio %s" "\n", who);
     }
 #else
     (void)who;
@@ -4645,7 +4646,7 @@ static void *reims_vgpu_dirty_up_thread_fn(void *opaque)
         now = get_clock();
         was = qatomic_read(&d->lab_up_last_ns);
         if (now - was >= NANOSECONDS_PER_SECOND && qatomic_cmpxchg(&d->lab_up_last_ns, was, now) == was) {
-            fprintf(stderr, "reims-dirty-up sets=%" PRIu64 " runs=%" PRIu64 " pages=%" PRIu64
+            lab_elog("reims-dirty-up sets=%" PRIu64 " runs=%" PRIu64 " pages=%" PRIu64
                     " calls=%" PRIu64 " fail=%" PRIu64 " us=%" PRIu64 " dropped=%" PRIu64 "\n",
                     qatomic_xchg(&d->lab_up_sets, 0), qatomic_xchg(&d->lab_up_runs, 0),
                     qatomic_xchg(&d->lab_up_pages, 0), qatomic_xchg(&d->lab_up_calls, 0),
@@ -6929,11 +6930,11 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
                 hot120_pages += pg;
             }
         }
-        fprintf(stderr, "reims-dirty-hot sets=%u pages=%" PRIu64 " hot1=%" PRIu64
+        lab_elog("reims-dirty-hot sets=%u pages=%" PRIu64 " hot1=%" PRIu64
                 "/%" PRIu64 "pg hot120=%" PRIu64 "/%" PRIu64 "pg\n",
                 g_hash_table_size(d->sets), all_pages, hot1, hot1_pages,
                 hot120, hot120_pages);
-        fprintf(stderr, "reims-dirty-diag harvests=%" PRIu64 " sets=%u slices=%d"
+        lab_elog("reims-dirty-diag harvests=%" PRIu64 " sets=%u slices=%d"
                 " noslice=%" PRIu64 " unlogged=%" PRIu64 " bit=%" PRIu64
                 " clean=%" PRIu64 " logged_regions=%u\n",
                 (uint64_t)d->harvests, g_hash_table_size(d->sets), n,
@@ -6975,7 +6976,7 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
                 }
             }
         }
-        fprintf(stderr, "reims-dirty-cluster harvests=%" PRIu64
+        lab_elog("reims-dirty-cluster harvests=%" PRIu64
                 " distinct_pages=%" PRIu64 " max_pfn=%" PRIu64,
                 (uint64_t)d->harvests, distinct, max_pfn);
         for (gi = 0; gi < ARRAY_SIZE(gaps); gi++) {
@@ -6998,10 +6999,10 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
             if (open) {
                 covered += last - run_start + 1;
             }
-            fprintf(stderr, " g%" PRIu64 "=%" PRIu64 "runs/%" PRIu64 "pg",
+            lab_elog(" g%" PRIu64 "=%" PRIu64 "runs/%" PRIu64 "pg",
                     gaps[gi], runs, covered);
         }
-        fprintf(stderr, "\n");
+        lab_elog("\n");
         g_free(bm);
     }
     /*
@@ -8318,7 +8319,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
             d->lab_c_first_ns += lc2 - ph_settle_end;
         }
         if (lc2 - d->lab_c_last >= NANOSECONDS_PER_SECOND) {
-            fprintf(stderr, "reims-dirty-consume n=%" PRIu64 " pages=%" PRIu64 " qep_us=%" PRIu64
+            lab_elog("reims-dirty-consume n=%" PRIu64 " pages=%" PRIu64 " qep_us=%" PRIu64
                     " cset_us=%" PRIu64 " eval_us=%" PRIu64 " first_n=%" PRIu64 " first_us=%" PRIu64 "\n",
                     d->lab_c_n, d->lab_c_pages, d->lab_c_qep / 1000, d->lab_c_cset / 1000,
                     d->lab_c_eval / 1000, d->lab_c_first_n, d->lab_c_first_ns / 1000);
@@ -8371,7 +8372,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
         d->lab_od_ns += now - t0;
         d->lab_od_pages += count;
         if (now - d->lab_od_last >= NANOSECONDS_PER_SECOND) {
-            fprintf(stderr, "reims-dirty-ondemand epoch_ms=%" PRId64 " syncs=%"
+            lab_elog("reims-dirty-ondemand epoch_ms=%" PRId64 " syncs=%"
                     PRIu64 " us=%" PRIu64 " pages=%" PRIu64 " skipped=%" PRIu64
                     " epochs=%" PRIu64 " fg=%" PRIu64 " fg_us=%" PRIu64
                     " wait_us=%" PRIu64 " prep_us=%" PRIu64 " query_us=%" PRIu64
@@ -8415,7 +8416,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                     d->lab_tb_syncs, d->lab_tb_batches);
             reims_vgpu_dirty_gap_refresh();   /* TEMP lab live DIRTY_GAP */
             if (d->gen_repeek) {   /* TEMP lab REIMS_VGPU_LAB_DIRTY_GEN_REPEEK */
-                fprintf(stderr, "reims-dirty-genrepeek epoch_ms=%" PRId64
+                lab_elog("reims-dirty-genrepeek epoch_ms=%" PRId64
                         " hit=%" PRIu64 " miss=%" PRIu64 " trylock=%" PRIu64
                         " miss_rounds=%" PRIu64 "\n",
                         g_get_real_time() / 1000,
@@ -8425,7 +8426,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                         qatomic_xchg(&d->lab_repeek_rounds, 0));
             }
             if (d->gen_hist) {   /* TEMP lab REIMS_VGPU_LAB_DIRTY_GEN_HIST */
-                fprintf(stderr, "reims-dirty-genhist epoch_ms=%" PRId64
+                lab_elog("reims-dirty-genhist epoch_ms=%" PRId64
                         " lt1us=%" PRIu64 " lt3us=%" PRIu64 " lt10us=%" PRIu64
                         " lt40us=%" PRIu64 " lt200us=%" PRIu64 " rest=%" PRIu64 "\n",
                         g_get_real_time() / 1000,
@@ -8434,7 +8435,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                         qatomic_xchg(&d->lab_genh[4], 0), qatomic_xchg(&d->lab_genh[5], 0));
             }
             if (d->epoch_hotsync) {   /* TEMP lab REIMS_VGPU_LAB_DIRTY_EPOCH_HOTSYNC */
-                fprintf(stderr, "reims-dirty-hotsync epoch_ms=%" PRId64
+                lab_elog("reims-dirty-hotsync epoch_ms=%" PRId64
                         " tokens=%" PRIu64 " epochs=%" PRIu64 " full=%" PRIu64 "\n",
                         g_get_real_time() / 1000,
                         qatomic_xchg(&d->lab_hotq_n, 0), qatomic_xchg(&d->lab_hotq_epochs, 0),
@@ -8443,16 +8444,16 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
             {   /* TEMP lab: who syncs the large sets in the foreground */
                 int c;
 
-                fprintf(stderr, "reims-dirty-fgbig");
+                lab_elog("reims-dirty-fgbig");
                 for (c = 0; c < 8; c++) {
-                    fprintf(stderr, " ch%d=%" PRIu64 "/%" PRIu64 "us", c, d->lab_fgbig_n[c],
+                    lab_elog(" ch%d=%" PRIu64 "/%" PRIu64 "us", c, d->lab_fgbig_n[c],
                             d->lab_fgbig_ns[c] / 1000);
                     d->lab_fgbig_n[c] = d->lab_fgbig_ns[c] = 0;
                 }
                 fputc('\n', stderr);
             }
             if (d->trk_on) {   /* TEMP lab DIRTY_TIGHT */
-                fprintf(stderr, "reims-dirty-tight on=%d gap=%" PRIu64 " kept=%" PRIu64 " cut=%" PRIu64
+                lab_elog("reims-dirty-tight on=%d gap=%" PRIu64 " kept=%" PRIu64 " cut=%" PRIu64
                         " cut_pages=%" PRIu64 "\n", reims_vgpu_dirty_tight_on(d),
                         reims_vgpu_dirty_gap_pages(),
                         qatomic_xchg(&d->lab_tight_kept, 0), qatomic_xchg(&d->lab_tight_cut, 0),
@@ -8481,7 +8482,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                 }
             }
             if (d->wp_mode || d->lab_wp_refused) {   /* lab DIRTY_WP */
-                fprintf(stderr, "reims-dirty-wp active=%u listed=%u protecting=%u protects=%" PRIu64
+                lab_elog("reims-dirty-wp active=%u listed=%u protecting=%u protects=%" PRIu64
                         " chunks=%" PRIu64 " faults=%" PRIu64 " lost=%" PRIu64 " dropped=%" PRIu64
                         " orphans=%u remaps=%" PRIu64 " refused=%" PRIu64 " remap_us=%" PRId64
                         " pause_us=%" PRId64 " pause_max_us=%" PRId64
@@ -8502,7 +8503,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                         d->lab_wp_heal_skipped, d->lab_wp_hole_drops, d->wp_calm, d->lab_wp_young,
                         d->lab_wp_dead, d->lab_wp_yields, d->wp_merge, d->lab_wp_merge_spans,
                         d->lab_wp_merge_runs, d->lab_wp_merge_pages, d->lab_wp_merge_fault);
-                fprintf(stderr, "reims-dirty-wp-rm n1=%" PRIu64 " us1=%" PRIu64 " n16=%" PRIu64
+                lab_elog("reims-dirty-wp-rm n1=%" PRIu64 " us1=%" PRIu64 " n16=%" PRIu64
                         " us16=%" PRIu64 " n256=%" PRIu64 " us256=%" PRIu64 " nbig=%" PRIu64
                         " usbig=%" PRIu64 "\n",   /* TEMP lab (b357) */
                         d->lab_wp_rm_n[0], d->lab_wp_rm_ns[0] / 1000, d->lab_wp_rm_n[1],
@@ -8510,14 +8511,14 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                         d->lab_wp_rm_n[3], d->lab_wp_rm_ns[3] / 1000);
                 memset(d->lab_wp_rm_n, 0, sizeof(d->lab_wp_rm_n));
                 memset(d->lab_wp_rm_ns, 0, sizeof(d->lab_wp_rm_ns));
-                fprintf(stderr, "reims-dirty-wp-fault fair=%u n=%" PRIu64 " wait_us=%" PRIu64 " wait_max_us=%" PRIu64
+                lab_elog("reims-dirty-wp-fault fair=%u n=%" PRIu64 " wait_us=%" PRIu64 " wait_max_us=%" PRIu64
                         " hold_us=%" PRIu64 " hold_max_us=%" PRIu64 " slow4ms=%" PRIu64 "\n",   /* TEMP lab DIRTY_WP_FAIR */
                         d->wp_fair, d->lab_wp_faults, d->lab_wp_fwait_ns / 1000, d->lab_wp_fwait_max_ns / 1000,
                         d->lab_wp_fhold_ns / 1000, d->lab_wp_fhold_max_ns / 1000, d->lab_wp_fslow);
                 d->lab_wp_fwait_ns = d->lab_wp_fwait_max_ns = d->lab_wp_fhold_ns = d->lab_wp_fhold_max_ns = 0;
                 d->lab_wp_fslow = 0;
                 if (d->wp_bridge) {   /* TEMP lab DIRTY_WP_BRIDGE */
-                    fprintf(stderr, "reims-dirty-wp-bridge spans=%" PRIu64 " runs=%" PRIu64 " gap_ro=%" PRIu64
+                    lab_elog("reims-dirty-wp-bridge spans=%" PRIu64 " runs=%" PRIu64 " gap_ro=%" PRIu64
                             " gap_hashed=%" PRIu64 " stop_log=%" PRIu64 " stop_free=%" PRIu64 " stop_far=%" PRIu64
                             " orphaned=%" PRIu64 " bridged=%u\n",
                             d->lab_wp_br_spans, d->lab_wp_br_runs, d->lab_wp_br_ro, d->lab_wp_br_hashed,
@@ -8564,7 +8565,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                                            top[ti]->wp_state, top[ti]->wp_streak, top[ti]->wp_lost,
                                            top[ti]->gen);
                 }
-                fprintf(stderr, "%s\n", line->str);
+                lab_elog("%s\n", line->str);
                 g_string_free(line, TRUE);
                 g_hash_table_iter_init(&it, d->sets);
                 while (g_hash_table_iter_next(&it, &k, &v)) {
@@ -8583,7 +8584,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
             d->lab_od_epochs = d->lab_od_fg_n = d->lab_od_fg_ns = 0;
             d->lab_od_last = now;
             if (d->lab_prep_asked) {   /* TEMP lab PREP_SYNC */
-                fprintf(stderr, "reims-dirty-prep n=%" PRIu64 " asked=%" PRIu64 " sets=%" PRIu64
+                lab_elog("reims-dirty-prep n=%" PRIu64 " asked=%" PRIu64 " sets=%" PRIu64
                         " pages=%" PRIu64 " us=%" PRIu64 " lock_us=%" PRIu64 " query_us=%" PRIu64
                         " settle_us=%" PRIu64 " fold_us=%" PRIu64 "\n", d->lab_prep_n,
                         d->lab_prep_asked, d->lab_prep_sets, d->lab_prep_pages, d->lab_prep_ns / 1000,
@@ -8596,7 +8597,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
             }
             if (d->arm_flush && (d->lab_arm_flushes || d->lab_pb_arm_flushes)) {
                 /* TEMP lab ARM_FLUSH */
-                fprintf(stderr, "reims-dirty-armflush epoch_ms=%" PRId64 " n=%" PRIu64
+                lab_elog("reims-dirty-armflush epoch_ms=%" PRId64 " n=%" PRIu64
                         " pb=%" PRIu64
                         " us=%" PRId64 "\n", g_get_real_time() / 1000, d->lab_arm_flushes,
                         qatomic_xchg(&d->lab_pb_arm_flushes, 0),
@@ -8605,7 +8606,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
             }
             if (d->steal_mode || d->gen_memo_mode || d->epoch_named ||
                 d->lf_mode) {   /* TEMP lab gates */
-                fprintf(stderr, "reims-dirty-lab epoch_ms=%" PRId64 " steal=%u memo=%u"
+                lab_elog("reims-dirty-lab epoch_ms=%" PRId64 " steal=%u memo=%u"
                         " steals=%" PRIu64 " steal_same=%" PRIu64 " steal_late=%" PRIu64
                         " steal_joined=%" PRIu64 " memo_hit=%" PRIu64 " memo_fresh=%" PRIu64
                         " memo_diff=%" PRIu64 " memo_bad=%" PRIu64 " named=%u unnamed_skipped=%" PRIu64 " lf=%u lf_hit=%" PRIu64 " lf_hitdiff=%" PRIu64
@@ -8629,12 +8630,12 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
             if (d->hole_mode) {   /* TEMP lab (DIRTY_HOLE) */
                 unsigned ch;
 
-                fprintf(stderr, "reims-dirty-hole epoch_ms=%" PRId64 " closed=%" PRIu64
+                lab_elog("reims-dirty-hole epoch_ms=%" PRId64 " closed=%" PRIu64
                         " unnamed=%" PRIu64, g_get_real_time() / 1000,
                         d->lab_hole_closed, qatomic_xchg(&d->lab_unnamed, 0));
                 d->lab_hole_closed = 0;
                 for (ch = 0; ch < 8; ch++) {
-                    fprintf(stderr, " db%u=%" PRIu64 " pk%u=%" PRIu64 " dr%u=%" PRIu64
+                    lab_elog(" db%u=%" PRIu64 " pk%u=%" PRIu64 " dr%u=%" PRIu64
                             " em%u=%" PRIu64 " hl%u=%" PRIu64, ch, qatomic_xchg(&d->lab_db[ch], 0),
                             ch, qatomic_xchg(&d->lab_pk[ch], 0),
                             ch, qatomic_xchg(&d->lab_dr[ch], 0),
@@ -8654,7 +8655,7 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
 
                     setpg += ls->count * (ls->page_size / 4096);
                 }
-                fprintf(stderr, "reims-fgdiag epoch_ms=%" PRId64 " first=%" PRIu64
+                lab_elog("reims-fgdiag epoch_ms=%" PRId64 " first=%" PRIu64
                         " dup=%" PRIu64 " fast_n=%" PRIu64 " fast_us=%" PRIu64
                         " pref_used=%" PRIu64 " pref_wasted=%" PRIu64
                         " wasted_pg=%" PRIu64 " whv_us=%" PRIu64 " whv_calls=%" PRIu64
@@ -9028,7 +9029,7 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
         d->gen_repeek = getenv("REIMS_VGPU_LAB_DIRTY_GEN_REPEEK") ?   /* lab A/B */
                         MAX(0, atoi(getenv("REIMS_VGPU_LAB_DIRTY_GEN_REPEEK"))) : 0;
         if (d->gen_repeek) {
-            fprintf(stderr, "reims-dirty-genrepeek on rounds=%u\n", d->gen_repeek);
+            lab_elog("reims-dirty-genrepeek on rounds=%u\n", d->gen_repeek);
         }
         d->gen_hist = getenv("REIMS_VGPU_LAB_DIRTY_GEN_HIST") &&   /* lab */
                       strcmp(getenv("REIMS_VGPU_LAB_DIRTY_GEN_HIST"), "on") == 0;
@@ -9085,7 +9086,7 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
         }
         qatomic_set(&reims_vgpu_dirty_wp_hashed_live, reims_vgpu_dirty_wp_hashed_default);
         qatomic_set(&reims_vgpu_dirty_wp_hashed_min_live, reims_vgpu_dirty_wp_hashed_min_default);
-        fprintf(stderr, "reims-dirty-hash-config hash_max=%" PRIu64 " bg_max=%" PRIu64 " hash_ns=%" PRIu64
+        lab_elog("reims-dirty-hash-config hash_max=%" PRIu64 " bg_max=%" PRIu64 " hash_ns=%" PRIu64
                 " host=%s wp_hashed=%d wp_hashed_min=%" PRIu64 "\n", (uint64_t)d->hash_max,
                 reims_vgpu_dirty_hash_bg_max_default, (uint64_t)d->hash_ns, d->host_intel ? "intel" : "other",
                 reims_vgpu_dirty_wp_hashed_default, reims_vgpu_dirty_wp_hashed_min_default);
@@ -9115,7 +9116,7 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                 qemu_thread_create(&th, "reims-dirty-up", reims_vgpu_dirty_up_thread_fn, d,
                                    QEMU_THREAD_DETACHED);
             }
-            fprintf(stderr, "reims-dirty-up on: threads=%d\n", d->up_threads);
+            lab_elog("reims-dirty-up on: threads=%d\n", d->up_threads);
         }
 #endif
         /*
@@ -9281,7 +9282,7 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                     reims_vgpu_dirty_wp_hashed_min_default = 16;
                     qatomic_set(&reims_vgpu_dirty_wp_hashed_min_live, 16);
                 }
-                fprintf(stderr, "reims-dirty-wp bridge on: gap<=%u fast_streak=%u hashed_min=%" PRIu64 "\n",
+                lab_elog("reims-dirty-wp bridge on: gap<=%u fast_streak=%u hashed_min=%" PRIu64 "\n",
                         d->wp_merge_gap, d->wp_fast_streak, reims_vgpu_dirty_wp_hashed_min_default);
             }
             d->wp_calm = !(getenv("REIMS_VGPU_LAB_DIRTY_WP_CALM") &&
@@ -9305,7 +9306,7 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
             d->wp_orphan_hold_ms = getenv("REIMS_VGPU_LAB_DIRTY_WP_ORPHAN_HOLD_MS") ?
                                    MAX(1, atoi(getenv("REIMS_VGPU_LAB_DIRTY_WP_ORPHAN_HOLD_MS"))) : 3000;
             if (d->wp_orphan_calm) {
-                fprintf(stderr, "reims-dirty-wp orphan calm on: quiet %u ms, hold <= %u ms\n",
+                lab_elog("reims-dirty-wp orphan calm on: quiet %u ms, hold <= %u ms\n",
                         d->wp_orphan_quiet_ms, d->wp_orphan_hold_ms);
             }
             /* 1 s plus 2 ms a run (its protect and give-back cost ~0.7 ms); the stress rows use 0. */
@@ -9337,7 +9338,7 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                         qemu_thread_create(&watch, "reims-wp-watch", reims_vgpu_dirty_wp_watch_fn, d,
                                            QEMU_THREAD_DETACHED);
                     }
-                    fprintf(stderr, "reims-dirty-wp thread on: chunk=%u duty=%u%%\n", d->wp_chunk,
+                    lab_elog("reims-dirty-wp thread on: chunk=%u duty=%u%%\n", d->wp_chunk,
                             d->wp_thread_duty);
                 }
                 reims_vgpu_dirty_wp_dev = d;
@@ -9866,7 +9867,7 @@ static void reims_vgpu_dirty_prefetch_phase(ReimsVgpuDirty *d, GArray *tokens,
     pb7 = get_clock();
     qemu_mutex_lock(&d->lock);
     if (pb7 - d->lab_pb_last >= NANOSECONDS_PER_SECOND) {
-        fprintf(stderr, "reims-pbatch epoch_ms=%" PRId64 " n=%" PRIu64 " sets=%" PRIu64
+        lab_elog("reims-pbatch epoch_ms=%" PRId64 " n=%" PRIu64 " sets=%" PRIu64
                 " setpages=%" PRIu64 " pages=%" PRIu64 " chunks=%" PRIu64
                 " lag_us=%" PRId64 " build_us=%" PRId64 " query_us=%" PRId64
                 " settle_us=%" PRId64 " mark_us=%" PRId64 " consume_us=%" PRId64
@@ -9982,7 +9983,7 @@ static void reims_vgpu_dirty_hash_report(ReimsVgpuDirty *d)
         return;
     }
     d->lab_hash_last = now;
-    fprintf(stderr, "reims-dirty-hash sets=%" PRIu64 " syncs=%" PRIu64 " pages=%" PRIu64
+    lab_elog("reims-dirty-hash sets=%" PRIu64 " syncs=%" PRIu64 " pages=%" PRIu64
             " us=%" PRIu64 " dirty=%" PRIu64 " fg=%" PRIu64 " fg_us=%" PRIu64
             " waits=%" PRIu64 " noram=%" PRIu64 " pf=%" PRIu64 " split=%" PRIu64 " helped=%" PRIu64
             " due_skipped=%" PRIu64 " ahead_req=%" PRIu64 " ahead_q=%" PRIu64 " ahead_done=%" PRIu64
