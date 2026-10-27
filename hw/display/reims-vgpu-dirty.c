@@ -440,6 +440,15 @@ struct ReimsVgpuDirty {
     uint32_t gen_repeek;
     uint64_t lab_repeek_hit, lab_repeek_miss, lab_repeek_trylock, lab_repeek_rounds;
     /*
+     * TEMP lab REIMS_VGPU_LAB_DIRTY_GEN_HIST=on: duration buckets for every
+     * reims_vgpu_dirty_gen call, because two theories of where the witness's
+     * 1.6 s lives (locked-path round-trips against rare expensive syncs)
+     * both fit the totals the reports carry (fg=95 syncs / 44 ms against
+     * ng_gen 1.68 s over ~200k reads) and the split decides the fix.
+     */
+    bool gen_hist;
+    uint64_t lab_genh[6];   /* <1us, <3, <10, <40, <200, rest */
+    /*
      * The prefetch batch's page union: one bit per target page frame, set for
      * every page of every claimed set and cleared again as the runs are read
      * back out, so it is all-zero between batches. Scanning it yields the
@@ -5446,6 +5455,7 @@ uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token)
     int64_t fg0;
     /* TEMP lab (FGTRACE) */
     int64_t lt0 = 0, lw = 0, lq = 0;
+    int64_t gh0 = d->gen_hist ? get_clock() : 0;   /* TEMP lab GEN_HIST */
     uint64_t l_needed = 0, l_last_q = 0, l_gen0 = 0, l_epoch = 0, l_created = 0;
     uint32_t l_pages = 0;
     uint8_t l_cls = 0;
@@ -5462,6 +5472,11 @@ uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token)
         if (lt0) {
             qatomic_add(&d->lab_fast_ns, get_clock() - lt0);
             qatomic_inc(&d->lab_fast_n);
+        }
+        if (gh0) {   /* TEMP lab GEN_HIST: fast-path reads land here */
+            int64_t ns = get_clock() - gh0;
+
+            qatomic_inc(&d->lab_genh[ns < 1000 ? 0 : ns < 3000 ? 1 : ns < 10000 ? 2 : 5]);
         }
         return gen;
     }
@@ -5602,6 +5617,12 @@ uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token)
     }
     qatomic_inc(&d->reads_since_harvest);
     qemu_mutex_unlock(&d->lock);
+    if (gh0) {   /* TEMP lab GEN_HIST: the locked path's own duration */
+        int64_t ns = get_clock() - gh0;
+
+        qatomic_inc(&d->lab_genh[ns < 1000 ? 0 : ns < 3000 ? 1 : ns < 10000 ? 2 :
+                    ns < 40000 ? 3 : ns < 200000 ? 4 : 5]);
+    }
     return gen;
 }
 
@@ -8389,6 +8410,15 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                         qatomic_xchg(&d->lab_repeek_trylock, 0),
                         qatomic_xchg(&d->lab_repeek_rounds, 0));
             }
+            if (d->gen_hist) {   /* TEMP lab REIMS_VGPU_LAB_DIRTY_GEN_HIST */
+                fprintf(stderr, "reims-dirty-genhist epoch_ms=%" PRId64
+                        " lt1us=%" PRIu64 " lt3us=%" PRIu64 " lt10us=%" PRIu64
+                        " lt40us=%" PRIu64 " lt200us=%" PRIu64 " rest=%" PRIu64 "\n",
+                        g_get_real_time() / 1000,
+                        qatomic_xchg(&d->lab_genh[0], 0), qatomic_xchg(&d->lab_genh[1], 0),
+                        qatomic_xchg(&d->lab_genh[2], 0), qatomic_xchg(&d->lab_genh[3], 0),
+                        qatomic_xchg(&d->lab_genh[4], 0), qatomic_xchg(&d->lab_genh[5], 0));
+            }
             {   /* TEMP lab: who syncs the large sets in the foreground */
                 int c;
 
@@ -8980,6 +9010,8 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
         if (d->gen_repeek) {
             fprintf(stderr, "reims-dirty-genrepeek on rounds=%u\n", d->gen_repeek);
         }
+        d->gen_hist = getenv("REIMS_VGPU_LAB_DIRTY_GEN_HIST") &&   /* lab */
+                      strcmp(getenv("REIMS_VGPU_LAB_DIRTY_GEN_HIST"), "on") == 0;
         d->period_mode = getenv("REIMS_VGPU_LAB_DIRTY_PERIOD") &&     /* lab A/B */
                          strcmp(getenv("REIMS_VGPU_LAB_DIRTY_PERIOD"), "on") == 0;
         d->hash_ns = getenv("REIMS_VGPU_LAB_DIRTY_HASH_NS") ?
