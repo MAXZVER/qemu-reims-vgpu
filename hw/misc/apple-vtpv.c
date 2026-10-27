@@ -120,8 +120,7 @@ typedef struct VtpvSess {
      * display link does to a hidden layer. */
     bool gate_on;
     int64_t gate_probe_us;
-    uint32_t gate_cold;             /* cold answers in the current window */
-    int64_t gate_win_us;
+    uint32_t gate_cold_run;         /* consecutive cold answers (no recycle at all) */
     uint64_t gate_seen[64];         /* recent answer surface ids, ring */
     uint32_t gate_seen_n, gate_seen_i;
     int slot;                       /* the slot its 'Dbuf's go out on */
@@ -993,7 +992,9 @@ static void vtpv_send_dbuf(AppleVtpv *s, int slot, uint64_t frame_id,
     vtpv_shed(s, s->cur);
 }
 
-#define DBUF_GATE_COLD_PER_WIN 8   /* cold answers per 2 s window to trip */
+#define DBUF_GATE_COLD_RUN 128     /* consecutive cold answers to trip: a visible player's pool
+                                   * (<= ~30 buffers) MUST recycle within far fewer answers at 60 fps;
+                                   * only a layer that returns nothing runs cold this long */
 #define DBUF_GATE_PROBE_US 500000  /* one probe 'Dbuf' out per 500 ms while gated */
 
 /* a 'Dbuf' ANSWER arrived carrying these surfaces: cold = never seen for the
@@ -1016,31 +1017,18 @@ static void vtpv_gate_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
         se->gate_seen[se->gate_seen_i] = surf0;
         se->gate_seen_i = (se->gate_seen_i + 1) & 63;
     }
-    int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
-    if (se->gate_win_us == 0) {
-        se->gate_win_us = now;
-    }
     if (warm) {
+        se->gate_cold_run = 0;
         if (se->gate_on) {
             se->gate_on = false;
-            fprintf(stderr, "apple-vtpv: dbuf-gate LIFTED (surface %u recycled)
-", surf0);
+            fprintf(stderr, "apple-vtpv: dbuf-gate LIFTED (surface %u recycled)\n", surf0);
         }
-        se->gate_cold = 0;
-        se->gate_win_us = now;
         return;
     }
-    se->gate_cold++;
-    if (!se->gate_on && se->gate_cold >= DBUF_GATE_COLD_PER_WIN &&
-        now - se->gate_win_us >= 2000000) {
+    if (++se->gate_cold_run >= DBUF_GATE_COLD_RUN && !se->gate_on) {
         se->gate_on = true;
-        fprintf(stderr, "apple-vtpv: dbuf-gate ON (session cold surfaces %u in %lld ms)
-",
-                se->gate_cold, (long long)(now - se->gate_win_us) / 1000);
-    }
-    if (now - se->gate_win_us >= 2000000) {
-        se->gate_win_us = now;
-        se->gate_cold = 0;
+        fprintf(stderr, "apple-vtpv: dbuf-gate ON (session: %u consecutive cold answer surfaces)\n",
+                se->gate_cold_run);
     }
 }
 
@@ -1501,6 +1489,9 @@ static VtpvSess *vtpv_sess_get(AppleVtpv *s, const uint8_t *uuid16)
         }
     }
     vtpv_sess_free(s, se);
+    memset(&se->gate_on, 0, sizeof(se->gate_on) + sizeof(se->gate_probe_us) +
+           sizeof(se->gate_cold_run) + sizeof(se->gate_seen) +
+           sizeof(se->gate_seen_n) + sizeof(se->gate_seen_i));
     se->used = true;
     memcpy(se->uuid, uuid16, 16);
     se->last_use = ++s->sess_clock;
