@@ -4486,8 +4486,8 @@ static const Property vtpv_properties[] = {
     DEFINE_PROP_BOOL("tdem-fast", AppleVtpv, tdem_fast, true),   /* A/B won 10-26: tail p99 124->72-86ms, 0 errors, 108/108; off = rollback */
     DEFINE_PROP_BOOL("tile-uui", AppleVtpv, tile_uui, true),
     DEFINE_PROP_BOOL("canvas-probe", AppleVtpv, canvas_probe, false),
-    DEFINE_PROP_BOOL("dbuf-gate", AppleVtpv, dbuf_gate, false),
-    DEFINE_PROP_BOOL("dbuf-gate-live", AppleVtpv, dbuf_gate_live, false), /* the A/B-in-one-boot form:
+    DEFINE_PROP_BOOL("dbuf-gate", AppleVtpv, dbuf_gate, true),  /* A/B WON 10-27 (yt24+yt29: hidden kernel 9-12 % vs 47-117 % off; visible clean; appsmoke all-alive) - DEFAULT ON; off = rollback */
+    DEFINE_PROP_BOOL("dbuf-gate-live", AppleVtpv, dbuf_gate_live, false), /* the A/B-in-one-boot form: C:/reims-lab/live/vtpv-dbufgate = on/off */
                                                                            * C:/reims-lab/live/vtpv-dbufgate = on/off */ /* TEMP lab A/B 10-27: hidden-layer
                                                                   * back-pressure; off = stock */ /* read back the canvas's first
                                                                        * bytes right after the fill (BH) */     /* off = A/B 10-27: emit without ',uui' (the guest uses its own
