@@ -5468,21 +5468,29 @@ uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token)
     /* TEMP lab REIMS_VGPU_LAB_DIRTY_GEN_REPEEK: see the field's doc. Only on
      * the RCU peek (lf_mode 1): a re-peek through the locked variant would
      * take sets_lock per round and be the queue it exists to avoid. Lagged
-     * and nosync reads must not wait for a publish at all. */
+     * and nosync reads must not wait for a publish at all.
+     *
+     * The peek comes FIRST in every round: the worker syncs a set in its own
+     * short lock bursts, so by the time this read runs the set it needs is
+     * often already published while `lock` itself is free (the first
+     * live counters read trylock==miss: the trylock-first shape never peeked
+     * at all). The trylock is only the exit signal - a free tracker AND a
+     * still-stale set means no publish is coming, and the locked path is the
+     * right answer at once. */
     if (d->gen_repeek && d->lf_mode == 1 && !lagged && !d->lab_nosync &&
         qatomic_read(&d->ondemand)) {
         uint32_t rounds;
         bool hit = false;
 
         for (rounds = 0; rounds < d->gen_repeek; rounds++) {
-            if (qemu_mutex_trylock(&d->lock) == 0) {
-                qemu_mutex_unlock(&d->lock);
-                qatomic_inc(&d->lab_repeek_trylock);
-                break;   /* the tracker is idle: nothing is about to publish */
-            }
             if (reims_vgpu_dirty_gen_synced(d, token, &gen)) {
                 hit = true;
                 break;
+            }
+            if (qemu_mutex_trylock(&d->lock) == 0) {
+                qemu_mutex_unlock(&d->lock);
+                qatomic_inc(&d->lab_repeek_trylock);
+                break;   /* idle tracker, still stale: nothing is coming */
             }
             cpu_relax();
         }
