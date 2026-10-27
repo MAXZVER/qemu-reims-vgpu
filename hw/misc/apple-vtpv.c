@@ -299,7 +299,8 @@ struct AppleVtpv {
     uint32_t gate_cold_prev;
     uint64_t gate_seen[64];
     uint32_t gate_seen_n, gate_seen_i;
-    int64_t gate_live_check_us;                /* tile-uui=off: 'TDem' carries no ',uui' - the guest emits its own
+    int64_t gate_live_check_us;
+    int64_t gate_diag_us;                /* tile-uui=off: 'TDem' carries no ',uui' - the guest emits its own
                                    * canvas (rec[+0x20], retained at DecodeTile) instead of resolving
                                    * our echoed UUID in its registry; immune to late-emit staleness */
     int64_t tdem_last_us;
@@ -2313,6 +2314,13 @@ static bool vtpv_h2g_busy(AppleVtpv *s, int slot)
 static void vtpv_tdem_pump(AppleVtpv *s)
 {
     int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    /* TEMP lab gate diag: the flag/cold state every 2 s, independent of answers */
+    if (s->dbuf_gate_live && now >= s->gate_diag_us) {
+        s->gate_diag_us = now + 2000000;
+        fprintf(stderr, "apple-vtpv: gate-live flag=%d on=%d cold=%u prev=%u seen=%u
+",
+                s->dbuf_gate, s->gate_on, s->gate_cold_win, s->gate_cold_prev, s->gate_seen_n);
+    }
     VtpvTdem *t;
     static int p;
     while ((t = g_queue_peek_head(&s->tdem_q)) != NULL) {
