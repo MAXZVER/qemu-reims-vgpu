@@ -320,6 +320,7 @@ struct AppleVtpv {
     int64_t pace_ivl_us;           /* dec-pace ask interval (REIMS_VGPU_LAB_DEC_PACE_US) */
     bool pace_drop_next;           /* dec-pace v3: the next allocated frame is decode-only */
     uint64_t stat_dfrm, stat_ask, stat_drop, stat_dec;
+    uint64_t stat_send, stat_evals;
     int64_t gate_live_check_us;
     int64_t gate_diag_us;                /* tile-uui=off: 'TDem' carries no ',uui' - the guest emits its own
                                    * canvas (rec[+0x20], retained at DecodeTile) instead of resolving
@@ -1134,12 +1135,13 @@ static void vtpv_pace_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
     if ((se->pace_warm + se->pace_cold) % 256 == 0) {
         lab_elog("apple-vtpv: pace-diag warm=%u cold=%u holds=%u "
                  "dec-stat dfrm=%llu ask=%llu drop=%llu dec=%llu "
-                 "dbg pace=%d dx=%d ivl=%lld toks=%lld\n",
+                 "dbg pace=%d dx=%d ivl=%lld toks=%lld send=%llu evals=%llu\n",
                 se->pace_warm, se->pace_cold, s->pace_holds,
                 (unsigned long long)s->stat_dfrm, (unsigned long long)s->stat_ask,
                 (unsigned long long)s->stat_drop, (unsigned long long)s->stat_dec,
                 s->dec_pace ? 1 : 0, se->dx ? 1 : 0,
-                (long long)s->pace_ivl_us, (long long)se->pace_toks_us);
+                (long long)s->pace_ivl_us, (long long)se->pace_toks_us,
+                (unsigned long long)s->stat_send, (unsigned long long)s->stat_evals);
     }
 }
 
@@ -1158,6 +1160,7 @@ static bool vtpv_pace_allow(AppleVtpv *s, VtpvSess *se, bool consume)
     }
     se->pace_toks_us = MIN(cap, se->pace_toks_us + (now - se->pace_last_us));
     se->pace_last_us = now;
+    s->stat_evals++;
     if (se->pace_toks_us < s->pace_ivl_us) {
         return false;
     }
@@ -1255,6 +1258,7 @@ static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
         uint8_t id8[8];
         stq_be_p(id8, s->host_msg_id);
         vtpv_send_h2g(s, slot, 0x44627566u /* 'Dbuf' */, uuid16, id8, paras, n);
+        s->stat_send++;
         se->frame[next].dbuf_sent = true;  /* in the queue or its outbox: never lost */
         se->dbuf_out++;
         if (s->decthread && se->frame[next].sample && !se->frame[next].nv12) {
