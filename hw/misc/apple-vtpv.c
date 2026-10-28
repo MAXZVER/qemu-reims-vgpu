@@ -328,6 +328,14 @@ struct AppleVtpv {
         uint8_t uuid16[16];
         uint8_t uuid[16];
     } pace_pend[8];
+    struct {                /* dec-pace v7: a dfrm REPLY held until a token - the
+                             * reply clerk is what DecodeFrame waits on, so this
+                             * is the real "decoder busy"; completions stay free */
+        bool used;
+        int slot;
+        uint32_t len;
+        uint8_t data[160];
+    } pace_rep[4];
     int64_t pace_toks_us, pace_last_us;   /* dec-pace v4: DEVICE-level bucket - the
                                            * wallpaper decodes through >=2 alternating
                                            * sessions (ae17: adjacent diag lines carry
@@ -1194,29 +1202,8 @@ static void vtpv_pace_complete(AppleVtpv *s, VtpvSess *se, int slot,
                                uint64_t frame_id, int32_t err, uint32_t inf,
                                const uint8_t *uuid16, const uint8_t *uuid)
 {
-    if (!s->dec_pace || !s->outbuf || !se->dx ||
-        vtpv_pace_allow(s, se, true, 0)) {
-        vtpv_send_demt2(s, slot, frame_id, err, inf, uuid16, uuid);
-        s->stat_done++;
-        return;
-    }
-    for (uint32_t i = 0; i < ARRAY_SIZE(s->pace_pend); i++) {
-        if (!s->pace_pend[i].used) {
-            s->pace_pend[i].used = true;
-            s->pace_pend[i].slot = slot;
-            s->pace_pend[i].frame_id = frame_id;
-            s->pace_pend[i].err = err;
-            s->pace_pend[i].inf = inf;
-            memcpy(s->pace_pend[i].uuid16, uuid16, 16);
-            memcpy(s->pace_pend[i].uuid, uuid, 16);
-            if (!timer_pending(s->pace_timer)) {
-                timer_mod(s->pace_timer,
-                          qemu_clock_get_us(QEMU_CLOCK_REALTIME) + s->pace_ivl_us / 4);
-            }
-            return;
-        }
-    }
-    /* ring full: overflow relief - complete now rather than freeze (bounded) */
+    /* v7: completions flow FREE - the dfrm reply hold (v7) is the only consumer;
+     * v5/v6 showed the player tolerates no completion delay */
     vtpv_send_demt2(s, slot, frame_id, err, inf, uuid16, uuid);
     s->stat_done++;
 }
@@ -1343,7 +1330,22 @@ static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
 static void vtpv_pace_tick(void *opaque)
 {
     AppleVtpv *s = opaque;
-    /* v6: give the waiting completions their tokens first (priority), then pump */
+    /* v7 first: the held dfrm replies (they pace the submit loop itself) */
+    for (uint32_t i = 0; i < ARRAY_SIZE(s->pace_rep); i++) {
+        if (s->pace_rep[i].used) {
+            if (!s->cur || vtpv_pace_allow(s, s->cur, true, 0)) {
+                vtpv_dq_push(s, s->pace_rep[i].slot, s->pace_rep[i].data,
+                             s->pace_rep[i].len);
+                vtpv_raise(s, s->pace_rep[i].slot);
+                s->pace_rep[i].used = false;
+            } else {
+                timer_mod(s->pace_timer,
+                          qemu_clock_get_us(QEMU_CLOCK_REALTIME) + s->pace_ivl_us / 4);
+                return;
+            }
+        }
+    }
+    /* v6: give the waiting completions their tokens, then pump */
     for (uint32_t i = 0; i < ARRAY_SIZE(s->pace_pend); i++) {
         if (s->pace_pend[i].used) {
             if (!s->cur) {
@@ -1416,15 +1418,9 @@ static void vtpv_shed_reap(AppleVtpv *s, VtpvSess *se)
     if (!se->shed_n) {
         return;
     }
-    /* dec-pace v5: a dropped frame's completion is what frees the player's
-     * pipeline slot - completing a whole reap at once lets its submit loop
-     * run at decode speed.  Spend one token per completion; frames beyond
-     * the budget stay shed and re-reap as tokens refill (outbox_tick). */
+    /* v7: the reap completes freely (v5's cap starved the player); the dfrm
+     * reply hold is the loop's only throttle */
     uint32_t allowed = UINT32_MAX;
-    if (s->dec_pace && s->outbuf && se->dx) {
-        vtpv_pace_allow(s, se, false, 0);
-        allowed = (uint32_t)(s->pace_toks_us / s->pace_ivl_us);
-    }
     uint64_t done[VTPV_FRAMES];
     uint32_t n = 0;
     qemu_mutex_lock(&s->dec_lock);
@@ -1449,9 +1445,6 @@ static void vtpv_shed_reap(AppleVtpv *s, VtpvSess *se)
     qemu_mutex_unlock(&s->dec_lock);
     uint8_t zero_uuid[16] = { 0 };
     for (uint32_t i = 0; i < n; i++) {
-        if (allowed != UINT32_MAX && !vtpv_pace_allow(s, se, true, 0)) {
-            break;
-        }
         vtpv_send_demt2(s, se->slot, done[i], 0, 1u << 1, se->uuid, zero_uuid);
         s->stat_done++;
     }
@@ -3861,8 +3854,33 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                 s->tile_sessions++;
             }
         }
-        vtpv_dq_push(s, slot, rep, rlen);
-        vtpv_raise(s, slot);
+        /* dec-pace v7: hold the non-tile dfrm's own reply for a token - the
+         * guest's DecodeFrame call waits on this reply (the reply clerk), so
+         * the submit loop itself runs at the budget.  The dance below still
+         * runs now: the sample is consumed once, completions flow freely. */
+        bool rep_held = false;
+        if (patch_type && non_tile_dfrm && s->dec_pace && s->outbuf && s->cur->dx &&
+            rlen >= 0x30 && rlen <= (long)sizeof(s->pace_rep[0].data) &&
+            !vtpv_pace_allow(s, s->cur, true, 0)) {
+            for (uint32_t i = 0; i < ARRAY_SIZE(s->pace_rep); i++) {
+                if (!s->pace_rep[i].used) {
+                    s->pace_rep[i].used = true;
+                    s->pace_rep[i].slot = slot;
+                    s->pace_rep[i].len = (uint32_t)rlen;
+                    memcpy(s->pace_rep[i].data, rep, rlen);
+                    if (!timer_pending(s->pace_timer)) {
+                        timer_mod(s->pace_timer, qemu_clock_get_us(QEMU_CLOCK_REALTIME) +
+                                  s->pace_ivl_us / 4);
+                    }
+                    rep_held = true;
+                    break;
+                }
+            }
+        }
+        if (!rep_held) {
+            vtpv_dq_push(s, slot, rep, rlen);
+            vtpv_raise(s, slot);
+        }
         g_free(rep);
     }
 
