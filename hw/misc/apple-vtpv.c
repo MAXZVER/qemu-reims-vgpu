@@ -658,7 +658,15 @@ static bool vtpv_dq_lowfill(AppleVtpv *s, int slot, uint32_t entry)
         qsize = sl->h2g_len - sizeof(h);
     }
     uint32_t used = tail >= head ? tail - head : qsize - (head - tail);
-    return used == 0 || used + entry <= qsize / 4;
+    /* one entry per notification (q1206): the kext's poll turns every
+     * observed pending bit into ONE port message and the framework's pump
+     * dequeues one entry per message - entries enqueued between two polls
+     * merged into one bit and waited for the guest's next kick, the reply
+     * behind them past its clerk (timeout and DeliverReply -19093 in the
+     * same millisecond, every frame).  So a message enters only an empty
+     * ring, and vtpv_h2g_watch raises again for each entry still there. */
+    (void)entry;
+    return used == 0;
 }
 
 
@@ -734,6 +742,9 @@ static bool vtpv_h2g_watch(AppleVtpv *s, int slot, int64_t now)
         }
         sl->stall_tries = 0;
         return false;
+    }
+    if (s->reply_first && !(s->irq_pending & (1u << slot))) {
+        vtpv_raise(s, slot);        /* the last notification was taken: one per entry */
     }
     if (head != sl->seen_head) {
         sl->seen_head = head;
@@ -861,11 +872,6 @@ static bool vtpv_dq_push2(AppleVtpv *s, int slot, const uint8_t *data, uint32_t 
         timer_mod(s->outbox_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1);
     }
     return false;
-}
-
-static bool vtpv_dq_push(AppleVtpv *s, int slot, const uint8_t *data, uint32_t len)
-{
-    return vtpv_dq_push2(s, slot, data, len, false);
 }
 
 static void vtpv_lower(AppleVtpv *s)
@@ -1067,7 +1073,8 @@ static bool vtpv_send_h2g2(AppleVtpv *s, int slot, uint32_t type, uint32_t flags
             fclose(f);
         }
     }
-    bool ok = vtpv_dq_push(s, slot, buf, 0x30 + paras_len);
+    /* flags 4 = a reply (the 'dtil' reply): it passes the queue like the template replies */
+    bool ok = vtpv_dq_push2(s, slot, buf, 0x30 + paras_len, flags == 4);
     vtpv_raise(s, slot);
     g_free(buf);
     return ok;
