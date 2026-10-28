@@ -56,6 +56,8 @@ typedef struct {
     ID3D12Resource *buf;        /* placed buffer covering mem */
     UINT64 fv;                  /* copy fence value of the picture in it */
     int busy;                   /* holds a picture whose callback is pending */
+    ID3D12CommandAllocator *valloc;  /* 28-10 (240fps): this slot's P010->NV12 blit */
+    ID3D12VideoProcessCommandList *vlist;
     VtpvDxFrame out;
 } Slot;
 
@@ -101,6 +103,18 @@ struct VtpvDx {
     UINT tex_h;
     DXGI_FORMAT tex_fmt;
     int nplanes;                /* 2: NV12/P010; 1: the packed HEVC range-extension outputs */
+    /* 28-10 (240fps): GPU P010->NV12 - a VIDEO_PROCESS queue blits the decode
+     * target into an NV12 texture before the readback: the copy moves half
+     * the bytes and fire() does no CPU downshift.  vp_fail = CPU fallback */
+    ID3D12VideoDevice *vd;
+    ID3D12VideoProcessor *vp;
+    ID3D12CommandQueue *vpq;
+    ID3D12Fence *vpf;
+    UINT64 vpfv;
+    ID3D12Resource *nv12;       /* conversion target, decoder-sized */
+    UINT64 nv12_w;
+    UINT nv12_h;
+    int vp_fail;
     uint8_t *conv;              /* packed -> luma + interleaved CbCr, for the callback */
     size_t conv_cap;
     /* stats */
@@ -205,6 +219,12 @@ static int queue_init(VtpvDx *d)
                                                   &IID_ID3D12GraphicsCommandList, (void **)&s->list)))
             return -1;
         ID3D12GraphicsCommandList_Close(s->list);
+        if (FAILED(ID3D12Device_CreateCommandAllocator(d->dev, D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS,
+                                                       &IID_ID3D12CommandAllocator, (void **)&s->valloc)) ||
+            FAILED(ID3D12Device_CreateCommandList(d->dev, 0, D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS, s->valloc,
+                                                  NULL, &IID_ID3D12VideoProcessCommandList, (void **)&s->vlist)))
+            return -1;
+        ID3D12VideoProcessCommandList_Close(s->vlist);
     }
     d->ev = CreateEventA(NULL, FALSE, FALSE, NULL);
     return 0;
@@ -381,7 +401,116 @@ static void fire(VtpvDx *d, Slot *s)
         s->out.sx = c422 ? 1 : 0;
         s->out.sy = 0;
     }
+    /* 28-10 (240fps): with the GPU conversion the slot already holds 8-bit
+     * NV12 - the CPU downshift below is only the vp_fail fallback */
+    if (!d->vp && d->nplanes == 2 && d->tex_fmt == DXGI_FORMAT_P010) {
+        /* TEMP lab main10 (28.10): P010 = 10 bits in the HIGH bits of 16-bit
+         * samples, and every consumer (the stage copy, vtpv_fill_surface, the
+         * guest's '420v' pool - VideoToolbox's own default output for a Main10
+         * stream is 8-bit 420v) reads 8-bit rows: without this the stage took
+         * the row's first w bytes of a 2-per-sample plane - a striped half
+         * picture.  Downshift both planes like the packed 4:2:2/4:4:4 branch */
+        uint32_t w = s->out.width, h = s->out.height;
+        uint32_t cw = (w + 1) / 2, ch = (h + 1) / 2;
+        size_t need = (size_t)w * h + (size_t)cw * 2 * ch;
+        if (d->conv_cap < need) {
+            free(d->conv);
+            d->conv = malloc(need);
+            d->conv_cap = d->conv ? need : 0;
+            if (!d->conv) return;
+        }
+        uint8_t *yp = d->conv, *cp = d->conv + (size_t)w * h;
+        const uint8_t *sy = s->mem + d->fp[0].Offset, *sc = s->mem + d->fp[1].Offset;
+        for (uint32_t y = 0; y < h; y++) {
+            const uint16_t *r = (const uint16_t *)(sy + (size_t)y * d->fp[0].Footprint.RowPitch);
+            uint8_t *o = yp + (size_t)y * w;
+            for (uint32_t x = 0; x < w; x++) {
+                o[x] = (uint8_t)(r[x] >> 8);
+            }
+        }
+        for (uint32_t y = 0; y < ch; y++) {
+            const uint16_t *r = (const uint16_t *)(sc + (size_t)y * d->fp[1].Footprint.RowPitch);
+            uint8_t *o = cp + (size_t)y * cw * 2;
+            for (uint32_t x = 0; x < cw * 2; x++) {
+                o[x] = (uint8_t)(r[x] >> 8);
+            }
+        }
+        s->out.y = yp;
+        s->out.y_pitch = w;
+        s->out.uv = cp;
+        s->out.uv_pitch = cw * 2;
+    }
     d->out(d->opaque, &s->out);
+}
+
+/* 28-10 (240fps): the P010->NV12 conversion target and the VIDEO_PROCESS
+ * queue, once per decoder texture size; any failure sets vp_fail and the
+ * CPU downshift in fire() stays */
+static int vp_setup(VtpvDx *d, const D3D12_RESOURCE_DESC *td)
+{
+    if (d->vp_fail) {
+        return -1;
+    }
+    if (d->vp && d->nv12 && d->nv12_w == td->Width && d->nv12_h == td->Height) {
+        return 0;
+    }
+    if (d->nv12) { ID3D12Resource_Release(d->nv12); d->nv12 = NULL; }
+    if (!d->vd &&
+        FAILED(ID3D12Device_QueryInterface(d->dev, &IID_ID3D12VideoDevice, (void **)&d->vd))) {
+        goto fail;
+    }
+    if (d->vp) {                    /* its size ranges are this texture's */
+        ID3D12VideoProcessor_Release(d->vp);
+        d->vp = NULL;
+    }
+    {
+        UINT tw = (UINT)td->Width, th = td->Height;
+        D3D12_VIDEO_PROCESS_INPUT_STREAM_DESC in = {
+            .Format = DXGI_FORMAT_P010,
+            .ColorSpace = DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
+            .SourceAspectRatio = { 1, 1 }, .DestinationAspectRatio = { 1, 1 },
+            .FrameRate = { 60, 1 },
+            .SourceSizeRange = { .MaxWidth = tw, .MaxHeight = th, .MinWidth = tw, .MinHeight = th },
+            .DestinationSizeRange = { .MaxWidth = tw, .MaxHeight = th, .MinWidth = tw, .MinHeight = th },
+        };
+        D3D12_VIDEO_PROCESS_OUTPUT_STREAM_DESC out = {
+            .Format = DXGI_FORMAT_NV12,
+            .ColorSpace = DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
+            .FrameRate = { 60, 1 },
+        };
+        if (FAILED(ID3D12VideoDevice_CreateVideoProcessor(d->vd, 0, &out, 1, &in,
+                                                          &IID_ID3D12VideoProcessor,
+                                                          (void **)&d->vp))) {
+            goto fail;
+        }
+    }
+    if (!d->vpq) {
+        D3D12_COMMAND_QUEUE_DESC qd = { .Type = D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS };
+        if (FAILED(ID3D12Device_CreateCommandQueue(d->dev, &qd, &IID_ID3D12CommandQueue,
+                                                   (void **)&d->vpq)) ||
+            FAILED(ID3D12Device_CreateFence(d->dev, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence,
+                                            (void **)&d->vpf))) {
+            goto fail;
+        }
+    }
+    D3D12_HEAP_PROPERTIES hp = { .Type = D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC nd = *td;
+    nd.Format = DXGI_FORMAT_NV12;
+    nd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    nd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    if (FAILED(ID3D12Device_CreateCommittedResource(d->dev, &hp, D3D12_HEAP_FLAG_NONE, &nd,
+               D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&d->nv12))) {
+        goto fail;
+    }
+    d->nv12_w = td->Width;
+    d->nv12_h = td->Height;
+    fprintf(stderr, "vtpv-dx: GPU P010->NV12 %llux%llu\n",
+            (unsigned long long)td->Width, (unsigned long long)td->Height);
+    return 0;
+fail:
+    d->vp_fail = 1;
+    fprintf(stderr, "vtpv-dx: video-processor setup failed - CPU downshift stays\n");
+    return -1;
 }
 
 /* (re)size the process-memory buffers for this decoder texture */
@@ -393,11 +522,22 @@ static int slots_setup(VtpvDx *d, ID3D12Resource *tex, int sub)
     slots_free(d);
     d->tex_fmt = td.Format;
     d->nplanes = td.Format == DXGI_FORMAT_NV12 || td.Format == DXGI_FORMAT_P010 ? 2 : 1;
+    /* 28-10 (240fps): through the video processor the readback copies the
+     * CONVERTED NV12 texture - footprints and half the bytes from it */
+    if (d->nplanes == 2 && td.Format == DXGI_FORMAT_P010) {
+        vp_setup(d, &td);
+    }
+    D3D12_RESOURCE_DESC nv = td, *fd = &td;
+    if (d->vp && d->nv12 && td.Format == DXGI_FORMAT_P010) {
+        nv.Format = DXGI_FORMAT_NV12;
+        fd = &nv;
+        sub = 0;
+    }
     UINT64 off = 0;
     for (int p = 0; p < d->nplanes; p++) {
-        UINT s = (UINT)sub + (UINT)p * td.DepthOrArraySize * td.MipLevels;
+        UINT s = (UINT)sub + (UINT)p * fd->DepthOrArraySize * fd->MipLevels;
         UINT64 t;
-        ID3D12Device_GetCopyableFootprints(d->dev, &td, s, 1, off, &d->fp[p], NULL, NULL, &t);
+        ID3D12Device_GetCopyableFootprints(d->dev, fd, s, 1, off, &d->fp[p], NULL, NULL, &t);
         off = (d->fp[p].Offset + t + 511) & ~511ull;
     }
     d->memsz = (SIZE_T)((off + 65535) & ~65535ull);
@@ -479,18 +619,69 @@ static int emit(VtpvDx *d, AVFrame *f, int64_t tag)
         fire(d, s);                                 /* free it (pipelined: picture N-2) */
     }
     D3D12_RESOURCE_DESC td = ID3D12Resource_GetDesc(df->texture);
+    ID3D12Resource *srcTex = df->texture;
+    UINT srcSub = (UINT)df->subresource_index;
+    bool vpBlit = d->vp && d->nv12 && d->tex_fmt == DXGI_FORMAT_P010;
+    if (vpBlit) {
+        /* 28-10 (240fps): the P010->NV12 blit rides this SLOT's video list
+         * (its allocator resets only after the slot's previous picture fired
+         * - the same discipline as the copy list); every wait is GPU-side */
+        ID3D12CommandAllocator_Reset(s->valloc);
+        ID3D12VideoProcessCommandList_Reset(s->vlist, s->valloc);
+        D3D12_RESOURCE_BARRIER tovp[2] = {
+            { .Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+              .Transition = { .pResource = df->texture, .Subresource = df->subresource_index,
+                              .StateBefore = D3D12_RESOURCE_STATE_COMMON,
+                              .StateAfter = D3D12_RESOURCE_STATE_VIDEO_PROCESS_READ } },
+            { .Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+              .Transition = { .pResource = d->nv12, .Subresource = 0,
+                              .StateBefore = D3D12_RESOURCE_STATE_COMMON,
+                              .StateAfter = D3D12_RESOURCE_STATE_VIDEO_PROCESS_WRITE } },
+        };
+        ID3D12VideoProcessCommandList_ResourceBarrier(s->vlist, 2, tovp);
+        D3D12_VIDEO_PROCESS_INPUT_STREAM_ARGUMENTS vin = { 0 };
+        vin.InputStream[0].pTexture2D = df->texture;
+        vin.InputStream[0].Subresource = df->subresource_index;
+        D3D12_RECT whole = { 0, 0, (LONG)td.Width, (LONG)td.Height };
+        vin.Transform.SourceRectangle = whole;
+        vin.Transform.DestinationRectangle = whole;
+        vin.RateInfo.OutputIndex = 0;
+        vin.RateInfo.InputFrameOrField = 0;
+        D3D12_VIDEO_PROCESS_OUTPUT_STREAM_ARGUMENTS vout = { 0 };
+        vout.OutputStream[0].pTexture2D = d->nv12;
+        vout.OutputStream[0].Subresource = 0;
+        vout.TargetRectangle = whole;
+        ID3D12VideoProcessCommandList_ProcessFrames(s->vlist, d->vp, &vout, 1, &vin);
+        D3D12_RESOURCE_BARRIER back[2] = { tovp[0], tovp[1] };
+        back[0].Transition.StateBefore = D3D12_RESOURCE_STATE_VIDEO_PROCESS_READ;
+        back[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+        back[1].Transition.StateBefore = D3D12_RESOURCE_STATE_VIDEO_PROCESS_WRITE;
+        back[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+        ID3D12VideoProcessCommandList_ResourceBarrier(s->vlist, 2, back);
+        ID3D12VideoProcessCommandList_Close(s->vlist);
+        ID3D12CommandQueue_Wait(d->vpq, df->sync_ctx.fence, df->sync_ctx.fence_value);
+        ID3D12CommandList *vl = (ID3D12CommandList *)s->vlist;
+        ID3D12CommandQueue_ExecuteCommandLists(d->vpq, 1, &vl);
+        ID3D12CommandQueue_Signal(d->vpq, d->vpf, ++d->vpfv);
+        srcTex = d->nv12;
+        srcSub = 0;
+    }
     ID3D12CommandAllocator_Reset(s->alloc);
     ID3D12GraphicsCommandList_Reset(s->list, s->alloc, NULL);
     for (int p = 0; p < d->nplanes; p++) {
-        D3D12_TEXTURE_COPY_LOCATION src = { .pResource = df->texture,
+        D3D12_TEXTURE_COPY_LOCATION src = { .pResource = srcTex,
             .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            .SubresourceIndex = (UINT)df->subresource_index + (UINT)p * td.DepthOrArraySize * td.MipLevels };
+            .SubresourceIndex = srcSub + (UINT)p * td.DepthOrArraySize * td.MipLevels };
         D3D12_TEXTURE_COPY_LOCATION dst = { .pResource = s->buf,
             .Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, .PlacedFootprint = d->fp[p] };
         ID3D12GraphicsCommandList_CopyTextureRegion(s->list, &dst, 0, 0, 0, &src, NULL);
     }
     ID3D12GraphicsCommandList_Close(s->list);
-    ID3D12CommandQueue_Wait(d->q, df->sync_ctx.fence, df->sync_ctx.fence_value);
+    if (vpBlit) {
+        ID3D12CommandQueue_Wait(d->q, d->vpf, d->vpfv);
+    } else {
+        ID3D12CommandQueue_Wait(d->q, df->sync_ctx.fence, df->sync_ctx.fence_value);
+    }
     ID3D12CommandList *l = (ID3D12CommandList *)s->list;
     ID3D12CommandQueue_ExecuteCommandLists(d->q, 1, &l);
     ID3D12CommandQueue_Signal(d->q, d->fence, ++d->fv);
@@ -742,7 +933,14 @@ static void dx_destroy(VtpvDx *d)
     for (int i = 0; i < NSLOT; i++) {
         if (d->slot[i].list) ID3D12GraphicsCommandList_Release(d->slot[i].list);
         if (d->slot[i].alloc) ID3D12CommandAllocator_Release(d->slot[i].alloc);
+        if (d->slot[i].vlist) ID3D12VideoProcessCommandList_Release(d->slot[i].vlist);
+        if (d->slot[i].valloc) ID3D12CommandAllocator_Release(d->slot[i].valloc);
     }
+    if (d->vpq) ID3D12CommandQueue_Release(d->vpq);
+    if (d->vpf) ID3D12Fence_Release(d->vpf);
+    if (d->vp) ID3D12VideoProcessor_Release(d->vp);
+    if (d->vd) ID3D12VideoDevice_Release(d->vd);
+    if (d->nv12) ID3D12Resource_Release(d->nv12);
     if (d->q) ID3D12CommandQueue_Release(d->q);
     if (d->fence) ID3D12Fence_Release(d->fence);
     if (d->ev) CloseHandle(d->ev);
