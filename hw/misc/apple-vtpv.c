@@ -448,6 +448,9 @@ struct AppleVtpv {
     QEMUBH *tile_bh;
     QEMUBH *ahead_bh;               /* TEMP lab dec-ahead: a decode finished - re-pump */
     bool dec_ahead;                 /* TEMP lab dec-ahead (prop, default on) */
+    bool reply_first;               /* TEMP lab reply-first (prop, default on) */
+    uint64_t stat_h2g_queued, stat_reply_outboxed, stat_h2g_queued_logged;
+    int64_t stat_h2g_log_ms;
     char *dec_gpu_str;             /* "nv" (default) / "int" */
     VtpvDecoder *dec;
     uint8_t avcC_sps[64];          /* SPS/PPS cached from dsts ',fds' avcC */
@@ -623,8 +626,40 @@ static void vtpv_raise(AppleVtpv *s, int slot)
 
 typedef struct {
     uint32_t len;
+    bool urgent;            /* a reply: its clerk gives up at 1.1 s */
     uint8_t data[];
 } VtpvOut;
+
+/*
+ * TEMP lab reply-first (Opus 10-28, q1204): the guest's reply clerk waits
+ * 1.1 s for a 'dfrm' reply, then abandons the frame - the 4K Aerial log had
+ * ~250 timeouts/s, every later 'Demt' "Unrecognised VTVideoDecoderFrame
+ * token", FigVideoQueue "0 frames enqueued", the player resubmitting in a
+ * loop (2.5 guest cores).  The reply stood in the same h2g ring behind the
+ * 'Dbuf' asks and completions.  Replies now pass whatever waits in the
+ * outbox, and the rest fills at most a quarter of the ring, so a reply never
+ * stands behind more than that.
+ */
+static bool vtpv_dq_lowfill(AppleVtpv *s, int slot, uint32_t entry)
+{
+    AppleVtpvSlot *sl = &s->slot[slot];
+    struct io_dq_header h;
+    if (!s->reply_first) {
+        return true;
+    }
+    if (!sl->h2g_gpa || dma_memory_read(pci_get_address_space(PCI_DEVICE(s)), sl->h2g_gpa,
+                                        &h, sizeof(h), MEMTXATTRS_UNSPECIFIED)) {
+        return true;            /* vtpv_dq_enqueue gives the verdict */
+    }
+    uint32_t qsize = le32_to_cpu(h.queue_size);
+    uint32_t head = le32_to_cpu(h.head);
+    uint32_t tail = le32_to_cpu(h.tail);
+    if (qsize == 0 || qsize + sizeof(h) > sl->h2g_len) {
+        qsize = sl->h2g_len - sizeof(h);
+    }
+    uint32_t used = tail >= head ? tail - head : qsize - (head - tail);
+    return used == 0 || used + entry <= qsize / 4;
+}
 
 
 
@@ -634,7 +669,22 @@ static bool vtpv_outbox_flush(AppleVtpv *s, int slot)
     AppleVtpvSlot *sl = &s->slot[slot];
     bool moved = false;
     VtpvOut *o;
-    while ((o = g_queue_peek_head(&sl->outbox)) && vtpv_dq_enqueue(s, slot, o->data, o->len)) {
+    /* replies first, wherever they wait */
+    for (GList *l = sl->outbox.head; l;) {
+        GList *next = l->next;
+        o = l->data;
+        if (o->urgent) {
+            if (!vtpv_dq_enqueue(s, slot, o->data, o->len)) {
+                return moved;
+            }
+            g_free(o);
+            g_queue_delete_link(&sl->outbox, l);
+            moved = true;
+        }
+        l = next;
+    }
+    while ((o = g_queue_peek_head(&sl->outbox)) && vtpv_dq_lowfill(s, slot, 4 + o->len) &&
+           vtpv_dq_enqueue(s, slot, o->data, o->len)) {
         g_free(g_queue_pop_head(&sl->outbox));
         moved = true;
     }
@@ -763,14 +813,37 @@ static void vtpv_outbox_tick(void *opaque)
     if (left) {
         timer_mod(s->outbox_timer, now + 1);
     }
+    if (now - s->stat_h2g_log_ms >= 2000 && s->stat_h2g_queued != s->stat_h2g_queued_logged) {
+        s->stat_h2g_log_ms = now;
+        s->stat_h2g_queued_logged = s->stat_h2g_queued;
+        uint32_t ob = 0;
+        for (int i = 0; i < VTPV_MAX_SLOT; i++) {
+            ob += g_queue_get_length(&s->slot[i].outbox);
+        }
+        lab_elog("apple-vtpv: h2g-stat queued=%llu reply_outboxed=%llu outbox_now=%u reply_first=%d\n",
+                 (unsigned long long)s->stat_h2g_queued,
+                 (unsigned long long)s->stat_reply_outboxed, ob, s->reply_first ? 1 : 0);
+    }
 }
 
-/* a host->guest message that is never lost; true if it went straight in */
-static bool vtpv_dq_push(AppleVtpv *s, int slot, const uint8_t *data, uint32_t len)
+/* a host->guest message that is never lost; true if it went straight in.
+ * urgent = a reply (passes the outbox, ignores the quarter-ring cap) */
+static bool vtpv_dq_push2(AppleVtpv *s, int slot, const uint8_t *data, uint32_t len,
+                          bool urgent)
 {
     AppleVtpvSlot *sl = &s->slot[slot];
     vtpv_outbox_flush(s, slot);
-    if (g_queue_is_empty(&sl->outbox) && vtpv_dq_enqueue(s, slot, data, len)) {
+    bool straight;
+    if (urgent && s->reply_first) {
+        straight = true;
+        for (GList *l = sl->outbox.head; l && straight; l = l->next) {
+            straight = !((VtpvOut *)l->data)->urgent;
+        }
+    } else {
+        straight = g_queue_is_empty(&sl->outbox) && vtpv_dq_lowfill(s, slot, 4 + len);
+    }
+    s->stat_h2g_queued += !straight;
+    if (straight && vtpv_dq_enqueue(s, slot, data, len)) {
         if (!timer_pending(s->outbox_timer)) {      /* watch it being taken */
             timer_mod(s->outbox_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1);
         }
@@ -778,12 +851,21 @@ static bool vtpv_dq_push(AppleVtpv *s, int slot, const uint8_t *data, uint32_t l
     }
     VtpvOut *o = g_malloc(sizeof(*o) + len);
     o->len = len;
+    o->urgent = urgent && s->reply_first;
     memcpy(o->data, data, len);
     g_queue_push_tail(&sl->outbox, o);
+    if (urgent) {
+        s->stat_reply_outboxed++;
+    }
     if (!timer_pending(s->outbox_timer)) {
         timer_mod(s->outbox_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1);
     }
     return false;
+}
+
+static bool vtpv_dq_push(AppleVtpv *s, int slot, const uint8_t *data, uint32_t len)
+{
+    return vtpv_dq_push2(s, slot, data, len, false);
 }
 
 static void vtpv_lower(AppleVtpv *s)
@@ -1409,8 +1491,8 @@ static void vtpv_pace_tick(void *opaque)
     for (uint32_t i = 0; i < ARRAY_SIZE(s->pace_rep); i++) {
         if (s->pace_rep[i].used) {
             if (!s->cur || vtpv_pace_allow(s, s->cur, true, 0)) {
-                vtpv_dq_push(s, s->pace_rep[i].slot, s->pace_rep[i].data,
-                             s->pace_rep[i].len);
+                vtpv_dq_push2(s, s->pace_rep[i].slot, s->pace_rep[i].data,
+                              s->pace_rep[i].len, true);
                 vtpv_raise(s, s->pace_rep[i].slot);
                 s->pace_rep[i].used = false;
             } else {
@@ -2488,8 +2570,17 @@ static void *vtpv_dec_thread(void *opaque)
         VtpvDxSink *k = &se->dx_sink;
         uint8_t *pic = NULL;
         uint32_t w = 0, h = 0;
+        /* TEMP lab dec-tid-max: dec-ahead queues the sample before the dfrm
+         * dance's ob_sample check, so the layer filter lives HERE - a frame
+         * above the cap decodes to nothing and completes dropped (the !pic
+         * path below), references intact via the sublayer */
+        bool tid_skip = sample && s->dec_tid_max >= 0 && se->dx &&
+                        vtpv_sample_tid(sample, sl) > s->dec_tid_max;
+        if (tid_skip) {
+            s->stat_tidskip++;
+        }
         k->to_stage = true;
-        if (sample && vtpv_dx_decode_sample(s, se, sample, sl, frame_id)) {
+        if (sample && !tid_skip && vtpv_dx_decode_sample(s, se, sample, sl, frame_id)) {
             pic = k->stage;         /* the frame owns this picture now */
             w = k->w;
             h = k->h;
@@ -4061,7 +4152,7 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
             }
         }
         if (!rep_held) {
-            vtpv_dq_push(s, slot, rep, rlen);
+            vtpv_dq_push2(s, slot, rep, rlen, true);
             vtpv_raise(s, slot);
         }
         g_free(rep);
@@ -4945,6 +5036,7 @@ static const Property vtpv_properties[] = {
     DEFINE_PROP_BOOL("mock_demt", AppleVtpv, mock_demt, false),
     DEFINE_PROP_BOOL("outbuf", AppleVtpv, outbuf, true),
     DEFINE_PROP_BOOL("decthread", AppleVtpv, decthread, true),
+    DEFINE_PROP_BOOL("reply-first", AppleVtpv, reply_first, true), /* TEMP lab: off = one FIFO for replies and messages */
     DEFINE_PROP_BOOL("dec-ahead", AppleVtpv, dec_ahead, true), /* TEMP lab: off = ask the buffer first, decode at the ask */
     DEFINE_PROP_UINT32("backlog", AppleVtpv, backlog, 8), /* TEMP lab: default ON per Opus q1199 direction (was 0) */
     DEFINE_PROP_BOOL("dno", AppleVtpv, dno, false),
