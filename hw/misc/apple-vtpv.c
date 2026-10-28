@@ -318,7 +318,7 @@ struct AppleVtpv {
     int64_t pace_ivl_us;           /* dec-pace ask interval (REIMS_VGPU_LAB_DEC_PACE_US) */
     bool pace_drop_next;           /* dec-pace v3: the next allocated frame is decode-only */
     uint64_t stat_dfrm, stat_ask, stat_drop, stat_dec;
-    uint64_t stat_send, stat_evals, stat_done, stat_tidskip;
+    uint64_t stat_send, stat_evals, stat_done, stat_tidskip, stat_shed;
     /* dec-tid-max (TEMP lab, Opus 10-28): the Aerial clips are dyadic
      * HEVC temporal layers - tid>=3 frames are droppable without corrupting
      * the tid<=2 sublayer (an honest 60 fps).  -1 = decode everything. */
@@ -1160,12 +1160,13 @@ static void vtpv_pace_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
     }
     if ((se->pace_warm + se->pace_cold) % 256 == 0) {
         lab_elog("apple-vtpv: pace-diag warm=%u cold=%u holds=%u "
-                 "dec-stat dfrm=%llu ask=%llu drop=%llu dec=%llu done=%llu tidskip=%llu "
+                 "dec-stat dfrm=%llu ask=%llu drop=%llu dec=%llu done=%llu tidskip=%llu shed=%llu "
                  "dbg pace=%d dx=%d ivl=%lld toks=%lld send=%llu evals=%llu\n",
                 se->pace_warm, se->pace_cold, s->pace_holds,
                 (unsigned long long)s->stat_dfrm, (unsigned long long)s->stat_ask,
                 (unsigned long long)s->stat_drop, (unsigned long long)s->stat_dec,
                 (unsigned long long)s->stat_done, (unsigned long long)s->stat_tidskip,
+                (unsigned long long)s->stat_shed,
                 s->dec_pace ? 1 : 0, se->dx ? 1 : 0,
                 (long long)s->pace_ivl_us, (long long)s->pace_toks_us,
                 (unsigned long long)s->stat_send, (unsigned long long)s->stat_evals);
@@ -1453,6 +1454,7 @@ static void vtpv_shed_reap(AppleVtpv *s, VtpvSess *se)
     for (uint32_t i = 0; i < n; i++) {
         vtpv_send_demt2(s, se->slot, done[i], 0, 1u << 1, se->uuid, zero_uuid);
         s->stat_done++;
+        s->stat_shed++;
     }
     if (n && s->verbose) {
         lab_elog( "apple-vtpv: shed %u frames (%llu in all, %u left)\n", n,
