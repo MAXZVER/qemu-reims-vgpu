@@ -33,6 +33,7 @@ typedef struct {
     uint32_t v_pitch;
     int sx, sy;           /* chroma subsampling shifts: 1,1 = 4:2:0; 1,0 = 4:2:2; 0,0 = 4:4:4 */
     int gray;             /* luma only (monochrome HEVC: a HEIF alpha plane); uv, v unused */
+    int wide;             /* 16-bit samples, data in the high bits (P010 pass-through, 'x420') */
 } VtpvDxFrame;
 
 typedef void (*VtpvDxOut)(void *opaque, const VtpvDxFrame *f);
@@ -60,6 +61,10 @@ int vtpv_dx_decode(VtpvDx *d, const uint8_t *sample, uint32_t len, int64_t tag);
  * next vtpv_dx_decode() or from vtpv_dx_flush().  Off by default (synchronous:
  * every callback before vtpv_dx_decode() returns). */
 void vtpv_dx_set_pipelined(VtpvDx *d, int on);
+
+/* 0003 (Task 18): keep P010 as 16-bit samples instead of the GPU NV12
+ * conversion - for 10-bit video sessions whose pool buffer is 'x420'. */
+void vtpv_dx_set_wide(VtpvDx *d, int on);
 
 /* Emit every picture still in flight (VTDecompressionSessionWaitForAsynchronousFrames
  * / FinishDelayedFrames). */

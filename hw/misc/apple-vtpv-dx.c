@@ -83,6 +83,7 @@ struct VtpvDx {
     int soft;                   /* "sw": libavcodec on the CPU, no device */
     int hook;                   /* decode-order output via get_buffer2 */
     int pipelined;
+    int wide;                   /* 0003: P010 pass-through (16-bit samples out) */
     VtpvDxOut out;
     void *opaque;
     AVPacket *pkt;
@@ -402,8 +403,9 @@ static void fire(VtpvDx *d, Slot *s)
         s->out.sy = 0;
     }
     /* 28-10 (240fps): with the GPU conversion the slot already holds 8-bit
-     * NV12 - the CPU downshift below is only the vp_fail fallback */
-    if (!d->vp && d->nplanes == 2 && d->tex_fmt == DXGI_FORMAT_P010) {
+     * NV12 - the CPU downshift below is only the vp_fail fallback;
+     * 0003: wide keeps the slot's P010 untouched (16-bit samples out) */
+    if (!d->vp && !d->wide && d->nplanes == 2 && d->tex_fmt == DXGI_FORMAT_P010) {
         /* TEMP lab main10 (28.10): P010 = 10 bits in the HIGH bits of 16-bit
          * samples, and every consumer (the stage copy, vtpv_fill_surface, the
          * guest's '420v' pool - VideoToolbox's own default output for a Main10
@@ -523,8 +525,9 @@ static int slots_setup(VtpvDx *d, ID3D12Resource *tex, int sub)
     d->tex_fmt = td.Format;
     d->nplanes = td.Format == DXGI_FORMAT_NV12 || td.Format == DXGI_FORMAT_P010 ? 2 : 1;
     /* 28-10 (240fps): through the video processor the readback copies the
-     * CONVERTED NV12 texture - footprints and half the bytes from it */
-    if (d->nplanes == 2 && td.Format == DXGI_FORMAT_P010) {
+     * CONVERTED NV12 texture - footprints and half the bytes from it;
+     * 0003: wide skips the video processor - the footprints stay P010 */
+    if (!d->wide && d->nplanes == 2 && td.Format == DXGI_FORMAT_P010) {
         vp_setup(d, &td);
     }
     D3D12_RESOURCE_DESC nv = td, *fd = &td;
@@ -572,6 +575,9 @@ static int emit(VtpvDx *d, AVFrame *f, int64_t tag)
         switch (m->format) {
         case AV_PIX_FMT_NV12:
             break;
+        case AV_PIX_FMT_P016LE:  /* 0003: 10-bit readback, samples in the high bits */
+            o.wide = 1;
+            break;
         case AV_PIX_FMT_GRAY8:
             o.gray = 1;
             break;
@@ -598,6 +604,9 @@ static int emit(VtpvDx *d, AVFrame *f, int64_t tag)
     }
     AVD3D12VAFrame *df = (AVD3D12VAFrame *)f->data[0];
     if (slots_setup(d, df->texture, df->subresource_index) < 0) return -1;
+    if (d->wide && d->nplanes == 2 && d->tex_fmt == DXGI_FORMAT_P010) {
+        o.wide = 1;               /* the slot holds P010: 16-bit samples out */
+    }
     Slot *s;
     if (d->pipelined) {
         /* async readback: prefer a free slot so the submit returns without a
@@ -825,6 +834,17 @@ void vtpv_dx_set_pipelined(VtpvDx *d, int on)
 {
     if (!on) vtpv_dx_flush(d);
     d->pipelined = on && d->d3d12;
+}
+
+/* 0003 (Task 18): P010 pass-through for 10-bit video sessions - no GPU NV12
+ * conversion, the callback's planes are 16-bit samples (the 'x420' layout).
+ * Only vtpv.c's video/outbuf sessions turn it on; HEIF tiles stay 8-bit. */
+void vtpv_dx_set_wide(VtpvDx *d, int on)
+{
+    if (d->wide && !on) {
+        vtpv_dx_flush(d);  /* a wide picture may still sit in a slot */
+    }
+    d->wide = on;
 }
 
 void vtpv_dx_flush(VtpvDx *d)
