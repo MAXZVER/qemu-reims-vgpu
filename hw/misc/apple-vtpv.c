@@ -4803,7 +4803,7 @@ static const Property vtpv_properties[] = {
     DEFINE_PROP_BOOL("mock_demt", AppleVtpv, mock_demt, false),
     DEFINE_PROP_BOOL("outbuf", AppleVtpv, outbuf, true),
     DEFINE_PROP_BOOL("decthread", AppleVtpv, decthread, true),
-    DEFINE_PROP_UINT32("backlog", AppleVtpv, backlog, 0),
+    DEFINE_PROP_UINT32("backlog", AppleVtpv, backlog, 8), /* TEMP lab: default ON per Opus q1199 direction (was 0) */
     DEFINE_PROP_BOOL("dno", AppleVtpv, dno, false),
     DEFINE_PROP_BOOL("tiles", AppleVtpv, tiles, true),
     DEFINE_PROP_BOOL("writeback", AppleVtpv, writeback, true),
