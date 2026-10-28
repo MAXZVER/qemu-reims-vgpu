@@ -42,7 +42,11 @@
 #pragma GCC diagnostic pop
 
 #define MAXPEND 8
-#define NSLOT 2
+/* TEMP lab (async readback, Opus 13:1x): 4 slots so the decode thread keeps
+ * 2-3 pictures in flight - a submit costs the CPU-side parse only, the
+ * readback wait lands on vtpv_dx_flush (collect), overlapped with the next
+ * submits.  Depth 2 (the old value) pipelined exactly one picture. */
+#define NSLOT 4
 
 typedef struct {
     ID3D12CommandAllocator *alloc;
@@ -454,8 +458,26 @@ static int emit(VtpvDx *d, AVFrame *f, int64_t tag)
     }
     AVD3D12VAFrame *df = (AVD3D12VAFrame *)f->data[0];
     if (slots_setup(d, df->texture, df->subresource_index) < 0) return -1;
-    Slot *s = &d->slot[d->next];
-    fire(d, s);                                 /* free it (pipelined: picture N-2) */
+    Slot *s;
+    if (d->pipelined) {
+        /* async readback: prefer a free slot so the submit returns without a
+         * fence wait; when the pool is full the oldest picture fires first
+         * (backpressure at the pool depth) */
+        s = NULL;
+        for (int i = 0; i < NSLOT && !s; i++) {
+            Slot *c = &d->slot[(d->next + i) % NSLOT];
+            if (!c->busy) {
+                s = c;
+            }
+        }
+        if (!s) {
+            s = &d->slot[d->next];
+            fire(d, s);
+        }
+    } else {
+        s = &d->slot[d->next];
+        fire(d, s);                                 /* free it (pipelined: picture N-2) */
+    }
     D3D12_RESOURCE_DESC td = ID3D12Resource_GetDesc(df->texture);
     ID3D12CommandAllocator_Reset(s->alloc);
     ID3D12GraphicsCommandList_Reset(s->list, s->alloc, NULL);
@@ -481,9 +503,12 @@ static int emit(VtpvDx *d, AVFrame *f, int64_t tag)
     }
     s->out = o;
     s->busy = 1;
-    d->next = (d->next + 1) % NSLOT;
-    if (d->pipelined) fire(d, &d->slot[d->next]);   /* picture N-1, copied while N decoded */
-    else fire(d, s);
+    d->next = (int)((s - d->slot) + 1) % NSLOT;
+    if (!d->pipelined) {
+        fire(d, s);
+    }
+    /* pipelined: nothing fires here - the pool fills to NSLOT-1 pictures and
+     * vtpv_dx_flush() (the collect step) fires them oldest-first */
     return 0;
 }
 
