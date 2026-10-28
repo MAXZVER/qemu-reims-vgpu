@@ -319,6 +319,15 @@ struct AppleVtpv {
     bool pace_drop_next;           /* dec-pace v3: the next allocated frame is decode-only */
     uint64_t stat_dfrm, stat_ask, stat_drop, stat_dec;
     uint64_t stat_send, stat_evals, stat_done;
+    struct {                /* dec-pace v6: completions beyond the budget wait here */
+        bool used;
+        int slot;
+        uint64_t frame_id;
+        int32_t err;
+        uint32_t inf;
+        uint8_t uuid16[16];
+        uint8_t uuid[16];
+    } pace_pend[8];
     int64_t pace_toks_us, pace_last_us;   /* dec-pace v4: DEVICE-level bucket - the
                                            * wallpaper decodes through >=2 alternating
                                            * sessions (ae17: adjacent diag lines carry
@@ -1152,7 +1161,7 @@ static void vtpv_pace_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
 /* dec-pace v3: token check; consume=true also spends a token (the pump's
  * real send); consume=false is the dfrm site's peek (its denied frames never
  * ask, so they never spend). */
-static bool vtpv_pace_allow(AppleVtpv *s, VtpvSess *se, bool consume)
+static bool vtpv_pace_allow(AppleVtpv *s, VtpvSess *se, bool consume, int64_t floor_us)
 {
     if (!s->dec_pace || !s->outbuf || !se->dx) {
         return true;
@@ -1165,13 +1174,51 @@ static bool vtpv_pace_allow(AppleVtpv *s, VtpvSess *se, bool consume)
     s->pace_toks_us = MIN(cap, s->pace_toks_us + (now - s->pace_last_us));
     s->pace_last_us = now;
     s->stat_evals++;
-    if (s->pace_toks_us < s->pace_ivl_us) {
+    if (s->pace_toks_us < s->pace_ivl_us + floor_us) {
         return false;
     }
     if (consume) {
         s->pace_toks_us -= s->pace_ivl_us;
     }
     return true;
+}
+
+/* dec-pace v6: a frame completion either goes out now (a token was free) or
+ * waits in the ring - the player's synchronous DecodeFrame loop then runs at
+ * the budget instead of at decode speed.  Calls spend tokens with PRIORITY
+ * over asks (the pump reserves one interval for them). */
+static void vtpv_send_demt2(AppleVtpv *s, int slot, uint64_t frame_id,
+                            int32_t err, uint32_t inf, const uint8_t *uuid16,
+                            const uint8_t *uuid);
+static void vtpv_pace_complete(AppleVtpv *s, VtpvSess *se, int slot,
+                               uint64_t frame_id, int32_t err, uint32_t inf,
+                               const uint8_t *uuid16, const uint8_t *uuid)
+{
+    if (!s->dec_pace || !s->outbuf || !se->dx ||
+        vtpv_pace_allow(s, se, true, 0)) {
+        vtpv_send_demt2(s, slot, frame_id, err, inf, uuid16, uuid);
+        s->stat_done++;
+        return;
+    }
+    for (uint32_t i = 0; i < ARRAY_SIZE(s->pace_pend); i++) {
+        if (!s->pace_pend[i].used) {
+            s->pace_pend[i].used = true;
+            s->pace_pend[i].slot = slot;
+            s->pace_pend[i].frame_id = frame_id;
+            s->pace_pend[i].err = err;
+            s->pace_pend[i].inf = inf;
+            memcpy(s->pace_pend[i].uuid16, uuid16, 16);
+            memcpy(s->pace_pend[i].uuid, uuid, 16);
+            if (!timer_pending(s->pace_timer)) {
+                timer_mod(s->pace_timer,
+                          qemu_clock_get_us(QEMU_CLOCK_REALTIME) + s->pace_ivl_us / 4);
+            }
+            return;
+        }
+    }
+    /* ring full: overflow relief - complete now rather than freeze (bounded) */
+    vtpv_send_demt2(s, slot, frame_id, err, inf, uuid16, uuid);
+    s->stat_done++;
 }
 
 /* ask the guest for buffers for the oldest waiting frames, at most
@@ -1198,7 +1245,22 @@ static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
         if (se->frame[next].dno || se->frame[next].pace_drop) {
             if (se->frame[next].sample && !se->frame[next].nv12 &&
                 !vtpv_dec_queue(s, se, next)) {
-                return;             /* the decode queue is full: next pump */
+                /* v6: the decode queue is full - complete it dropped NOW (v5
+                 * returned here leaving the frame unsent+unshed: completions
+                 * froze and the pipeline never recovered) */
+                uint8_t zero_uuid[16] = { 0 };
+                uint64_t fid = se->frame[next].frame_id;
+                qemu_mutex_lock(&s->dec_lock);
+                g_free(se->frame[next].sample);
+                se->frame[next].sample = NULL;
+                g_free(se->frame[next].nv12);
+                se->frame[next].nv12 = NULL;
+                se->frame[next].in_use = false;
+                se->frame[next].queued = false;
+                se->frame[next].decoded = false;
+                qemu_mutex_unlock(&s->dec_lock);
+                vtpv_pace_complete(s, se, slot, fid, 0, 1u << 1, uuid16, zero_uuid);
+                continue;
             }
             se->frame[next].shed = true;
             se->shed_n++;
@@ -1226,7 +1288,7 @@ static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
                 }
             }
         }
-        if (!vtpv_pace_allow(s, se, true)) {
+        if (!vtpv_pace_allow(s, se, true, s->pace_ivl_us)) {
             s->pace_holds++;
             if (s->pace_holds == 1 || s->pace_holds % 100 == 0) {
                 lab_elog("apple-vtpv: pace HOLD #%u toks=%lld dx=%d\n",
@@ -1281,6 +1343,25 @@ static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
 static void vtpv_pace_tick(void *opaque)
 {
     AppleVtpv *s = opaque;
+    /* v6: give the waiting completions their tokens first (priority), then pump */
+    for (uint32_t i = 0; i < ARRAY_SIZE(s->pace_pend); i++) {
+        if (s->pace_pend[i].used) {
+            if (!s->cur) {
+                return;
+            }
+            if (vtpv_pace_allow(s, s->cur, true, 0)) {
+                vtpv_send_demt2(s, s->pace_pend[i].slot, s->pace_pend[i].frame_id,
+                                s->pace_pend[i].err, s->pace_pend[i].inf,
+                                s->pace_pend[i].uuid16, s->pace_pend[i].uuid);
+                s->stat_done++;
+                s->pace_pend[i].used = false;
+            } else {
+                timer_mod(s->pace_timer,
+                          qemu_clock_get_us(QEMU_CLOCK_REALTIME) + s->pace_ivl_us / 4);
+                return;
+            }
+        }
+    }
     if (s->cur && s->cur->used) {
         vtpv_pump_dbuf(s, s->cur->slot, s->pace_uuid);
     }
@@ -1341,7 +1422,7 @@ static void vtpv_shed_reap(AppleVtpv *s, VtpvSess *se)
      * the budget stay shed and re-reap as tokens refill (outbox_tick). */
     uint32_t allowed = UINT32_MAX;
     if (s->dec_pace && s->outbuf && se->dx) {
-        vtpv_pace_allow(s, se, false);
+        vtpv_pace_allow(s, se, false, 0);
         allowed = (uint32_t)(s->pace_toks_us / s->pace_ivl_us);
     }
     uint64_t done[VTPV_FRAMES];
@@ -1368,7 +1449,7 @@ static void vtpv_shed_reap(AppleVtpv *s, VtpvSess *se)
     qemu_mutex_unlock(&s->dec_lock);
     uint8_t zero_uuid[16] = { 0 };
     for (uint32_t i = 0; i < n; i++) {
-        if (allowed != UINT32_MAX && !vtpv_pace_allow(s, se, true)) {
+        if (allowed != UINT32_MAX && !vtpv_pace_allow(s, se, true, 0)) {
             break;
         }
         vtpv_send_demt2(s, se->slot, done[i], 0, 1u << 1, se->uuid, zero_uuid);
@@ -3623,8 +3704,7 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
         s->cur->frame[hit].in_use = false;
         s->cur->frame[hit].queued = false;
         s->cur->frame[hit].decoded = false;
-        vtpv_send_demt2(s, slot, frame_id, err, inf, s->msg + 0x10, uuid);
-        s->stat_done++;
+        vtpv_pace_complete(s, s->cur, slot, frame_id, err, inf, s->msg + 0x10, uuid);
         if (s->outbuf && pic && (pw != s->cur->dpba_w || ph != s->cur->dpba_h)) {
             /* the stream changed size: the next buffers must fit it */
             vtpv_send_dpba(s, slot, s->msg + 0x10, pw, ph);
@@ -3799,7 +3879,7 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
          * a denied ask still allocates its frame and decodes in order for
          * its references, completed dropped without a buffer (the shed
          * machinery) - what a full real-Mac VT queue answers a pusher. */
-        bool pdeny = s->dec_pace && s->outbuf && s->cur->dx && !vtpv_pace_allow(s, s->cur, false);
+        bool pdeny = s->dec_pace && s->outbuf && s->cur->dx && !vtpv_pace_allow(s, s->cur, false, 0);
         s->pace_drop_next = pdeny;
         if (s->ob_first) {
             if (k->w != s->cur->dpba_w || k->h != s->cur->dpba_h) {
