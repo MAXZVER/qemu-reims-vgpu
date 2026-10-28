@@ -2401,6 +2401,9 @@ static bool vtpv_dx_decode_sample(AppleVtpv *s, VtpvSess *se, const uint8_t *sam
             const char *gpu = se->dx_api == VTPV_API_CUDA ? "nv" : s->dec_gpu_str ? s->dec_gpu_str : "int";
             se->dx = vtpv_dx_open(gpu, vtpv_api_name[se->dx_api], (VtpvDxCodec)se->dx_codec,
                                  se->dx_cfg_len ? se->dx_cfg : NULL, se->dx_cfg_len, vtpv_dx_put, se);
+            if (se->dx) {
+                vtpv_dx_set_pipelined(se->dx, 1);   /* TEMP lab: async readback */
+            }
             if (!se->dx) {
                 lab_elog( "apple-vtpv: dx: %s decoder open failed (codec %d)\n",
                         vtpv_api_name[se->dx_api], se->dx_codec);
@@ -2490,6 +2493,7 @@ static void *vtpv_dec_thread(void *opaque)
         uint32_t w = 0, h = 0;
         k->to_stage = true;
         if (sample && vtpv_dx_decode_sample(s, se, sample, sl, frame_id)) {
+            vtpv_dx_flush(se->dx);   /* TEMP lab: async readback - collect the picture */
             pic = k->stage;         /* the frame owns this picture now */
             w = k->w;
             h = k->h;
@@ -3323,6 +3327,9 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                     s->cur->dx_sink.to_stage = true;
                     s->ob_first = vtpv_dx_decode_sample(s, s->cur, smp, smp_len,
                                                         s->last_frame_id);
+                    if (s->ob_first) {
+                        vtpv_dx_flush(s->cur->dx);   /* TEMP lab: async readback */
+                    }
                     s->cur->dx_sink.to_stage = false;
                 } else if (smp) {
                     /* dec-tid-max: a temporal layer above the cap is answered
@@ -3834,6 +3841,7 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
             k->to_stage = true;
             k->pictures = 0;
             vtpv_dx_decode_sample(s, s->cur, s->cur->frame[hit].sample, s->cur->frame[hit].sample_len, frame_id);
+            vtpv_dx_flush(s->cur->dx);   /* TEMP lab: async readback - collect */
             k->to_stage = false;
             g_free(s->cur->frame[hit].sample);
             s->cur->frame[hit].sample = NULL;
