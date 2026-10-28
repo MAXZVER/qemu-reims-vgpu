@@ -318,7 +318,7 @@ struct AppleVtpv {
     int64_t pace_ivl_us;           /* dec-pace ask interval (REIMS_VGPU_LAB_DEC_PACE_US) */
     bool pace_drop_next;           /* dec-pace v3: the next allocated frame is decode-only */
     uint64_t stat_dfrm, stat_ask, stat_drop, stat_dec;
-    uint64_t stat_send, stat_evals;
+    uint64_t stat_send, stat_evals, stat_done;
     int64_t pace_toks_us, pace_last_us;   /* dec-pace v4: DEVICE-level bucket - the
                                            * wallpaper decodes through >=2 alternating
                                            * sessions (ae17: adjacent diag lines carry
@@ -1137,11 +1137,12 @@ static void vtpv_pace_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
     }
     if ((se->pace_warm + se->pace_cold) % 256 == 0) {
         lab_elog("apple-vtpv: pace-diag warm=%u cold=%u holds=%u "
-                 "dec-stat dfrm=%llu ask=%llu drop=%llu dec=%llu "
+                 "dec-stat dfrm=%llu ask=%llu drop=%llu dec=%llu done=%llu "
                  "dbg pace=%d dx=%d ivl=%lld toks=%lld send=%llu evals=%llu\n",
                 se->pace_warm, se->pace_cold, s->pace_holds,
                 (unsigned long long)s->stat_dfrm, (unsigned long long)s->stat_ask,
                 (unsigned long long)s->stat_drop, (unsigned long long)s->stat_dec,
+                (unsigned long long)s->stat_done,
                 s->dec_pace ? 1 : 0, se->dx ? 1 : 0,
                 (long long)s->pace_ivl_us, (long long)s->pace_toks_us,
                 (unsigned long long)s->stat_send, (unsigned long long)s->stat_evals);
@@ -1334,10 +1335,22 @@ static void vtpv_shed_reap(AppleVtpv *s, VtpvSess *se)
     if (!se->shed_n) {
         return;
     }
+    /* dec-pace v5: a dropped frame's completion is what frees the player's
+     * pipeline slot - completing a whole reap at once lets its submit loop
+     * run at decode speed.  Spend one token per completion; frames beyond
+     * the budget stay shed and re-reap as tokens refill (outbox_tick). */
+    uint32_t allowed = UINT32_MAX;
+    if (s->dec_pace && s->outbuf && se->dx) {
+        vtpv_pace_allow(s, se, false);
+        allowed = (uint32_t)(s->pace_toks_us / s->pace_ivl_us);
+    }
     uint64_t done[VTPV_FRAMES];
     uint32_t n = 0;
     qemu_mutex_lock(&s->dec_lock);
     for (int i = 0; i < VTPV_FRAMES; i++) {
+        if (n >= allowed) {
+            break;
+        }
         if (se->frame[i].in_use && se->frame[i].shed &&
             (se->frame[i].decoded || !se->frame[i].queued)) {
             done[n++] = se->frame[i].frame_id;
@@ -1355,7 +1368,11 @@ static void vtpv_shed_reap(AppleVtpv *s, VtpvSess *se)
     qemu_mutex_unlock(&s->dec_lock);
     uint8_t zero_uuid[16] = { 0 };
     for (uint32_t i = 0; i < n; i++) {
+        if (allowed != UINT32_MAX && !vtpv_pace_allow(s, se, true)) {
+            break;
+        }
         vtpv_send_demt2(s, se->slot, done[i], 0, 1u << 1, se->uuid, zero_uuid);
+        s->stat_done++;
     }
     if (n && s->verbose) {
         lab_elog( "apple-vtpv: shed %u frames (%llu in all, %u left)\n", n,
@@ -3607,6 +3624,7 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
         s->cur->frame[hit].queued = false;
         s->cur->frame[hit].decoded = false;
         vtpv_send_demt2(s, slot, frame_id, err, inf, s->msg + 0x10, uuid);
+        s->stat_done++;
         if (s->outbuf && pic && (pw != s->cur->dpba_w || ph != s->cur->dpba_h)) {
             /* the stream changed size: the next buffers must fit it */
             vtpv_send_dpba(s, slot, s->msg + 0x10, pw, ph);
