@@ -318,7 +318,13 @@ struct AppleVtpv {
     int64_t pace_ivl_us;           /* dec-pace ask interval (REIMS_VGPU_LAB_DEC_PACE_US) */
     bool pace_drop_next;           /* dec-pace v3: the next allocated frame is decode-only */
     uint64_t stat_dfrm, stat_ask, stat_drop, stat_dec;
-    uint64_t stat_send, stat_evals, stat_done;
+    uint64_t stat_send, stat_evals, stat_done, stat_tidskip;
+    /* dec-tid-max (TEMP lab, Opus 10-28): the Aerial clips are dyadic
+     * HEVC temporal layers - tid>=3 frames are droppable without corrupting
+     * the tid<=2 sublayer (an honest 60 fps).  -1 = decode everything. */
+    int32_t dec_tid_max;
+    bool dec_tid_live;
+    int64_t tid_live_check_us;
     struct {                /* dec-pace v6: completions beyond the budget wait here */
         bool used;
         int slot;
@@ -1154,12 +1160,12 @@ static void vtpv_pace_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
     }
     if ((se->pace_warm + se->pace_cold) % 256 == 0) {
         lab_elog("apple-vtpv: pace-diag warm=%u cold=%u holds=%u "
-                 "dec-stat dfrm=%llu ask=%llu drop=%llu dec=%llu done=%llu "
+                 "dec-stat dfrm=%llu ask=%llu drop=%llu dec=%llu done=%llu tidskip=%llu "
                  "dbg pace=%d dx=%d ivl=%lld toks=%lld send=%llu evals=%llu\n",
                 se->pace_warm, se->pace_cold, s->pace_holds,
                 (unsigned long long)s->stat_dfrm, (unsigned long long)s->stat_ask,
                 (unsigned long long)s->stat_drop, (unsigned long long)s->stat_dec,
-                (unsigned long long)s->stat_done,
+                (unsigned long long)s->stat_done, (unsigned long long)s->stat_tidskip,
                 s->dec_pace ? 1 : 0, se->dx ? 1 : 0,
                 (long long)s->pace_ivl_us, (long long)s->pace_toks_us,
                 (unsigned long long)s->stat_send, (unsigned long long)s->stat_evals);
@@ -2195,6 +2201,27 @@ static const uint8_t *vtpv_dx_sbf_sample(AppleVtpv *s, uint64_t total, uint64_t 
     return sample;
 }
 
+/* the frame's HEVC temporal_id: the first VCL NAL of the (AVCC-form,
+ * [BE32 len][NAL]...) sample; -1 when unparseable */
+static int vtpv_sample_tid(const uint8_t *sample, uint32_t len)
+{
+    uint32_t off = 0;
+    while (off + 6 <= len) {
+        uint32_t nl = ((uint32_t)sample[off] << 24) | ((uint32_t)sample[off + 1] << 16) |
+                      ((uint32_t)sample[off + 2] << 8) | sample[off + 3];
+        if (nl < 2 || off + 4 + nl > len) {
+            return -1;
+        }
+        const uint8_t *nal = sample + off + 4;
+        uint32_t ntype = (nal[0] >> 1) & 0x3f;
+        if (ntype <= 31) {          /* a VCL slice NAL carries the frame's tid */
+            return (nal[1] & 7) - 1;
+        }
+        off += 4 + nl;
+    }
+    return -1;
+}
+
 /* the stream class a decoder rung answers for: codec, and for HEVC the hvcC's
  * chroma format and luma depth (a HEIF alpha plane is monochrome, the Tahoe
  * picture 4:2:2) */
@@ -3155,8 +3182,21 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                                                         s->last_frame_id);
                     s->cur->dx_sink.to_stage = false;
                 } else if (smp) {
-                    s->ob_sample = smp;     /* inside s->msg: copied by vtpv_send_dbuf */
-                    s->ob_sample_len = smp_len;
+                    /* dec-tid-max: a temporal layer above the cap is answered
+                     * "dropped" right here - no decode, no buffer dance, no 4K
+                     * copy into the guest; the tid<=cap sublayer stays intact */
+                    int tid = vtpv_sample_tid(smp, smp_len);
+                    if (s->dec_tid_max >= 0 && tid >= 0 && tid > s->dec_tid_max) {
+                        s->stat_tidskip++;
+                        if (s->stat_tidskip <= 3 || s->stat_tidskip % 256 == 0) {
+                            lab_elog("apple-vtpv: tid-skip #%llu (tid=%d > %d)\n",
+                                    (unsigned long long)s->stat_tidskip,
+                                    tid, s->dec_tid_max);
+                        }
+                    } else {
+                        s->ob_sample = smp;     /* inside s->msg: copied by vtpv_send_dbuf */
+                        s->ob_sample_len = smp_len;
+                    }
                 }
             } else if (s->hwdecode && s->writeback && s->surfmap_count) {
                 if (vtpv_use_dx(s)) {
@@ -3898,6 +3938,21 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
          * its references, completed dropped without a buffer (the shed
          * machinery) - what a full real-Mac VT queue answers a pusher. */
         bool pdeny = s->dec_pace && s->outbuf && s->cur->dx && !vtpv_pace_allow(s, s->cur, false, 0);
+        if (s->dec_tid_live) {
+            int64_t nowt = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+            if (nowt >= s->tid_live_check_us) {
+                s->tid_live_check_us = nowt + 250000;
+                gchar *txt = NULL;
+                if (g_file_get_contents("C:/reims-lab/live/vtpv-dectid", &txt, NULL, NULL) && txt) {
+                    long v = atol(g_strchomp(txt));
+                    g_free(txt);
+                    if (v != s->dec_tid_max) {
+                        s->dec_tid_max = v < 0 || v > 6 ? -1 : (int32_t)v;
+                        lab_elog("apple-vtpv: dec-tid-max LIVE %d\n", s->dec_tid_max);
+                    }
+                }
+            }
+        }
         s->pace_drop_next = pdeny;
         if (s->ob_first) {
             if (k->w != s->cur->dpba_w || k->h != s->cur->dpba_h) {
@@ -4767,6 +4822,8 @@ static const Property vtpv_properties[] = {
     DEFINE_PROP_BOOL("dbuf-gate", AppleVtpv, dbuf_gate, true),  /* A/B WON 10-27 (yt24+yt29: hidden kernel 9-12 % vs 47-117 % off; visible clean; appsmoke all-alive) - DEFAULT ON; off = rollback */
     DEFINE_PROP_BOOL("dbuf-gate-live", AppleVtpv, dbuf_gate_live, false), /* A/B-in-one-boot */
     DEFINE_PROP_BOOL("dec-pace", AppleVtpv, dec_pace, false), /* TEMP lab: pool-as-the-clock Dbuf credit */
+    DEFINE_PROP_INT32("dec-tid-max", AppleVtpv, dec_tid_max, -1), /* TEMP lab: drop HEVC temporal layers above this tid */
+    DEFINE_PROP_BOOL("dec-tid-max-live", AppleVtpv, dec_tid_live, false), /* A/B-in-one-boot */
     DEFINE_PROP_BOOL("dec-pace-live", AppleVtpv, dec_pace_live, false), /* A/B-in-one-boot */
     DEFINE_PROP_UINT64("tdem-gate-cap-us", AppleVtpv, tdem_gate_cap_us, 100000),
     DEFINE_PROP_STRING("decgpu", AppleVtpv, dec_gpu_str),
