@@ -112,8 +112,6 @@ typedef struct VtpvSess {
     uint64_t next_seq;
     uint32_t dbuf_out;              /* 'Dbuf's sent and not answered yet */
     uint32_t shed_n;                /* frames shed and not completed yet */
-    int64_t pace_toks_us;          /* dec-pace v2: token bucket (ask costs VTPV_PACE_IVL_US) */
-    int64_t pace_last_us;
     uint32_t pace_warm, pace_cold; /* diag: recycled vs fresh answer surfaces */
     uint64_t pace_seen[256];
     uint32_t pace_seen_n, pace_seen_i;
@@ -321,6 +319,11 @@ struct AppleVtpv {
     bool pace_drop_next;           /* dec-pace v3: the next allocated frame is decode-only */
     uint64_t stat_dfrm, stat_ask, stat_drop, stat_dec;
     uint64_t stat_send, stat_evals;
+    int64_t pace_toks_us, pace_last_us;   /* dec-pace v4: DEVICE-level bucket - the
+                                           * wallpaper decodes through >=2 alternating
+                                           * sessions (ae17: adjacent diag lines carry
+                                           * different warm counters), so a per-session
+                                           * bucket multiplies the budget and never binds */
     int64_t gate_live_check_us;
     int64_t gate_diag_us;                /* tile-uui=off: 'TDem' carries no ',uui' - the guest emits its own
                                    * canvas (rec[+0x20], retained at DecodeTile) instead of resolving
@@ -1140,7 +1143,7 @@ static void vtpv_pace_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
                 (unsigned long long)s->stat_dfrm, (unsigned long long)s->stat_ask,
                 (unsigned long long)s->stat_drop, (unsigned long long)s->stat_dec,
                 s->dec_pace ? 1 : 0, se->dx ? 1 : 0,
-                (long long)s->pace_ivl_us, (long long)se->pace_toks_us,
+                (long long)s->pace_ivl_us, (long long)s->pace_toks_us,
                 (unsigned long long)s->stat_send, (unsigned long long)s->stat_evals);
     }
 }
@@ -1155,17 +1158,17 @@ static bool vtpv_pace_allow(AppleVtpv *s, VtpvSess *se, bool consume)
     }
     int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     int64_t cap = (int64_t)VTPV_PACE_BURST * s->pace_ivl_us;
-    if (se->pace_last_us == 0) {
-        se->pace_last_us = now;
+    if (s->pace_last_us == 0) {
+        s->pace_last_us = now;
     }
-    se->pace_toks_us = MIN(cap, se->pace_toks_us + (now - se->pace_last_us));
-    se->pace_last_us = now;
+    s->pace_toks_us = MIN(cap, s->pace_toks_us + (now - s->pace_last_us));
+    s->pace_last_us = now;
     s->stat_evals++;
-    if (se->pace_toks_us < s->pace_ivl_us) {
+    if (s->pace_toks_us < s->pace_ivl_us) {
         return false;
     }
     if (consume) {
-        se->pace_toks_us -= s->pace_ivl_us;
+        s->pace_toks_us -= s->pace_ivl_us;
     }
     return true;
 }
@@ -1226,7 +1229,7 @@ static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
             s->pace_holds++;
             if (s->pace_holds == 1 || s->pace_holds % 100 == 0) {
                 lab_elog("apple-vtpv: pace HOLD #%u toks=%lld dx=%d\n",
-                        s->pace_holds, (long long)se->pace_toks_us, se->dx ? 1 : 0);
+                        s->pace_holds, (long long)s->pace_toks_us, se->dx ? 1 : 0);
             }
             memcpy(s->pace_uuid, uuid16, 16);
             if (!timer_pending(s->pace_timer)) {
@@ -1669,8 +1672,6 @@ static VtpvSess *vtpv_sess_get(AppleVtpv *s, const uint8_t *uuid16)
     }
     vtpv_sess_free(s, se);
     se->used = true;
-    se->pace_toks_us = (int64_t)VTPV_PACE_BURST * s->pace_ivl_us;
-    se->pace_last_us = 0;
     se->pace_warm = 0;
     se->pace_cold = 0;
     se->pace_seen_n = 0;
@@ -4575,6 +4576,8 @@ static void vtpv_realize(PCIDevice *dev, Error **errp)
     s->tdem_timer = timer_new_us(QEMU_CLOCK_REALTIME, vtpv_tdem_tick, s);
     s->pace_timer = timer_new_us(QEMU_CLOCK_REALTIME, vtpv_pace_tick, s);
     s->pace_ivl_us = VTPV_PACE_IVL_US;
+    s->pace_toks_us = (int64_t)VTPV_PACE_BURST * s->pace_ivl_us;
+    s->pace_last_us = 0;
     {
         const char *pv = getenv("REIMS_VGPU_LAB_DEC_PACE_US");
         if (pv) {
