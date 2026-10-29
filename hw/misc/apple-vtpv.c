@@ -250,6 +250,11 @@ struct AppleVtpv {
     char *reply_dcap;               /* stage-2: file whose bytes answer 'decs' */
     char *dcap_file;                /* TEMP lab (task58): bplist overriding the
                                      * built-in 'dcap' dictionary reply */
+    char *dcap_dir;                 /* TEMP lab (Opus 10-30): <dir>/<fourcc>.bplist
+                                     * overrides one codec's 'dcap' dictionary */
+    bool dcap_caps;                 /* TEMP lab (prop dcap-caps, default on): ',dca' =
+                                     * Apple's capability dictionary; off = task58's
+                                     * registry-entry shape */
     char *reply_plusdec;            /* stage-2: file whose bytes answer '+dec' */
     char *reply_generic;            /* stage-3: ',ver'+',err' template for any other sync
                                      * query (dsta/dinv/...); the request's message type
@@ -1455,8 +1460,49 @@ static void vtpv_reply_dcap(AppleVtpv *s, int slot, uint64_t total)
     const uint8_t *cod = vtpv_para_find(s->msg, total, 0x2c636f64u /* ',cod' */, &clen);
     uint32_t codec = (cod && clen >= 4) ? ldl_be_p(cod) : 0;
     uint8_t pl[VTPV_DCAP_PLIST_MAX];
-    uint32_t plen = vtpv_dcap_plist(pl, codec);
+    uint32_t plen = 0;
     const char *src = "built-in";
+    /* TEMP lab (Opus 10-30, q1292): VideoToolbox hands ',dca' VERBATIM to
+     * VTCopy<codec>DecoderCapabilitiesDictionary (adding VTDoVi* for HEVC), so
+     * it must be Apple's capability dictionary - VTSupportedProfiles,
+     * VTPerProfileSupport {"<profile>": {VTIsHardwareAccelerated,
+     * VTMaxDecodeLevel, VTMaxPlaybackLevel}} - not the registry entry task58
+     * modelled: with no supported profiles WebKit called HEVC unsupported and
+     * AV1 not power efficient, and Safari would not play HEVC at all. */
+    static const struct {
+        uint32_t fcc;
+        const uint8_t *caps;
+        uint32_t len;
+    } caps[4] = {
+        { 0x61766331u, vtpv_dcap_avc1, sizeof(vtpv_dcap_avc1) },
+        { 0x68766331u, vtpv_dcap_hvc1, sizeof(vtpv_dcap_hvc1) },
+        { 0x76703039u, vtpv_dcap_vp09, sizeof(vtpv_dcap_vp09) },
+        { 0x61763031u, vtpv_dcap_av01, sizeof(vtpv_dcap_av01) },
+    };
+    for (size_t i = 0; s->dcap_caps && i < ARRAY_SIZE(caps); i++) {
+        if (caps[i].fcc == codec && caps[i].len <= sizeof(pl)) {
+            memcpy(pl, caps[i].caps, caps[i].len);
+            plen = caps[i].len;
+            src = "caps";
+        }
+    }
+    if (!plen) {
+        plen = vtpv_dcap_plist(pl, codec);
+    }
+    if (s->dcap_dir && codec) {
+        char fcc4[5], path[512];
+        vtpv_log4cc(fcc4, codec);
+        snprintf(path, sizeof(path), "%s/%.4s.bplist", s->dcap_dir, fcc4);
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            size_t got = fread(pl, 1, sizeof(pl), f);
+            if (got >= 8 && feof(f)) {
+                plen = (uint32_t)got;
+                src = "dcap_dir";
+            }
+            fclose(f);
+        }
+    }
     if (s->dcap_file) {
         FILE *f = fopen(s->dcap_file, "rb");
         if (f) {
@@ -5254,16 +5300,29 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
          * snapshot - the guest's serialized receive path (Dbuf answers 2-500 ms)
          * misses the ~4 ms dfrm reply deadline and the wallpaper reader latches
          * an error; without the device (q1235) Acquire took 0.28 s and the
-         * screensaver played.  sw-main10=off: our decoder takes Main10 again. */
+         * screensaver played.  sw-main10=off: our decoder takes Main10 again.
+         *
+         * TEMP lab (Zcode 10-30 task65): the refusal's reason is the 240 fps
+         * deadline, not 10-bit-ness - and firing on 10-bit alone sent every
+         * ordinary 24-60 fps HDR video (QuickTime, Safari, Photos) to software
+         * too.  The hvcC already in dx_cfg (2-byte size-prefixed, the same
+         * record the bitDepth predicate reads) carries avgFrameRate at
+         * [19..20] big-endian, in 256ths of a frame.  Refuse only when that
+         * says faster than 90 fps - the Aerial class.  A record too short for
+         * the field, or avgFrameRate 0, is ordinary video: our decoder takes
+         * it, and the deadline problem it never had stays theirs. */
         if (type == 0x64737461u /* 'dsta' */ && s->sw_main10 && reply_tpl == vtpv_tpl_generic &&
             rlen == (long)sizeof(vtpv_tpl_generic) && s->cur->dx_codec == VTPV_DX_HEVC &&
-            s->cur->dx_cfg_len > 18 && (s->cur->dx_cfg[17] & 7) != 0) {
+            s->cur->dx_cfg_len > 18 && (s->cur->dx_cfg[17] & 7) != 0 &&
+            s->cur->dx_cfg_len >= 22 &&
+            (uint32_t)lduw_be_p(s->cur->dx_cfg + 19) > 90u * 256u) {
             stl_be_p(rep + 0x54, (uint32_t)-12906);
             /* no pool for this StartSession; the session itself stays free to
              * start again (8-bit, or with sw-main10=off) and get its 'Dpba' then
              * (ZCode maps review M1: a sticky dpba_sent kept a restart poolless) */
             main10_refused = true;
-            lab_elog("apple-vtpv: dsta Main10 HEVC -> guest software decode (sw-main10)\n");
+            lab_elog("apple-vtpv: dsta Main10 HEVC %u/256 fps -> guest software decode (sw-main10, task65 gate)\n",
+                     (unsigned)lduw_be_p(s->cur->dx_cfg + 19));
         }
         /* dec-pace v7: hold the non-tile dfrm's own reply for a token - the
          * guest's DecodeFrame call waits on this reply (the reply clerk), so
@@ -6240,6 +6299,8 @@ static const Property vtpv_properties[] = {
     DEFINE_PROP_STRING("reply_dsup", AppleVtpv, reply_dsup),
     DEFINE_PROP_STRING("dpba_file", AppleVtpv, dpba_file),
     DEFINE_PROP_STRING("dcap_file", AppleVtpv, dcap_file), /* TEMP lab (task58): override the 'dcap' dictionary bplist */
+    DEFINE_PROP_STRING("dcap_dir", AppleVtpv, dcap_dir), /* TEMP lab (Opus 10-30): per-codec <dir>/<fourcc>.bplist */
+    DEFINE_PROP_BOOL("dcap-caps", AppleVtpv, dcap_caps, true), /* TEMP lab (Opus 10-30): off = task58 entry shape */
     DEFINE_PROP_BOOL("mock_dbuf", AppleVtpv, mock_dbuf, false),
     DEFINE_PROP_BOOL("mock_demt", AppleVtpv, mock_demt, false),
     DEFINE_PROP_BOOL("outbuf", AppleVtpv, outbuf, true),
