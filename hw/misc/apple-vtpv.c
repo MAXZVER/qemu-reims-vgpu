@@ -414,6 +414,10 @@ struct AppleVtpv {
                                    * player hoards; the pool then answers 'Dbuf's from its freelist
                                    * (q1240: a cold answer cost 36-66 ms of the guest's serialized
                                    * receive path, past the dfrm clerk's ~4 ms deadline); 0 = off */
+    uint32_t pool_age;             /* 0007: ',pba' MaximumBufferAge (s) - the pool's ~1 s aging
+                                   * churns IOSurface ids and every replacement re-wires in the
+                                   * kext (q1248's 25-105 ms answer sawtooth); a long age keeps
+                                   * the stock stable; 0 = omit the key */
     bool first_kick;                /* TEMP lab (prop, default off): decode a stream's first picture in the kick */
     bool sw_main10;                 /* TEMP lab (prop, default on): 10-bit HEVC sessions refused -> guest decode */
     bool dec_warm;                  /* TEMP lab (prop, default on): open the decoder at 'dsts'/'dsta', ahead of the first 'dfrm' */
@@ -449,6 +453,9 @@ struct AppleVtpv {
     bool mock_demt;
     uint8_t mock_uuid[16];
     uint64_t frames_completed;
+    uint64_t deleg_n;             /* 0008: guest ',frm' Dbuf-REQUESTS seen (the
+                                   * delegation the real host answers with an
+                                   * attached surface - the real-surface census) */
 
     /* write-back: pages + layout of the canvas the kext exported (SURFMAP regs) */
     bool writeback;
@@ -1191,28 +1198,34 @@ QEMU_BUILD_BUG_ON(sizeof(vtpv_empty_plist) != 42);
 /* binary plist of the pixel buffer attributes 'Dpba' hands the guest session
  * (VTDecoderSessionSetPixelBufferAttributes -> its output pool):
  * { Height, IOSurfaceProperties = {}, PixelFormatType = '420v' or 'x420', Width },
- * and kCVPixelBufferPoolMinimumBufferCountKey when pool_min > 0 (0002/q1240:
+ * kCVPixelBufferPoolMinimumBufferCountKey when pool_min > 0 (0002/q1240:
  * a cold pool answers each 'Dbuf' with a fresh IOSurface - 36-66 ms inside
  * the guest's serialized receive path, and the dfrm reply clerk's CMTime
- * deadline is ~4 ms at 240 fps).  Objects: 0 = dict, then the keys, then the
- * values; 1-byte offsets and refs. */
+ * deadline is ~4 ms at 240 fps), and kCVPixelBufferPoolMaximumBufferAgeKey
+ * when pool_age > 0 (0007/q1248: the pool's ~1 s aging frees buffers and
+ * the replacement IOSurfaces re-wire in the kext - the 25-105 ms sawtooth
+ * in otherwise-warm answers; a stable stock keeps pin-cache hits forever).
+ * Objects: 0 = dict, then the keys, then the values; 1-byte offsets and refs. */
 static uint32_t vtpv_pba_plist(uint8_t *out, uint32_t w, uint32_t h, uint32_t pixfmt,
-                               uint32_t pool_min)
+                               uint32_t pool_min, uint32_t pool_age)
 {
-    static const char *keys[5] = {
-        "Height", "IOSurfaceProperties", "MinimumBufferCount",
+    static const char *keys[6] = {
+        "Height", "IOSurfaceProperties", "MaximumBufferAge", "MinimumBufferCount",
         "PixelFormatType", "Width"
     };
-    uint32_t vals[5] = { h, 0, pool_min, pixfmt, w };
-    int ki[5], nk = 0;
+    uint32_t vals[6] = { h, 0, pool_age, pool_min, pixfmt, w };
+    int ki[6], nk = 0;
     ki[nk++] = 0;
     ki[nk++] = 1;
-    if (pool_min) {
+    if (pool_age) {
         ki[nk++] = 2;
     }
-    ki[nk++] = 3;
+    if (pool_min) {
+        ki[nk++] = 3;
+    }
     ki[nk++] = 4;
-    uint8_t off[11];
+    ki[nk++] = 5;
+    uint8_t off[13];
     uint32_t n = 0;
     memcpy(out, "bplist00", 8);
     n = 8;
@@ -1998,8 +2011,8 @@ static void vtpv_send_dpba(AppleVtpv *s, int slot, const uint8_t *uuid16,
         bool ten = s->dpba_10bit && cse->dx_codec == VTPV_DX_HEVC && cse->dx_cfg_len > 18 &&
                    (cse->dx_cfg[17] & 7) != 0;
         uint32_t pixfmt = ten ? 0x78343230u /* 'x420' */ : 0x34323076u /* '420v' */;
-        uint8_t plist[176], paras[256];
-        uint32_t pl = vtpv_pba_plist(plist, w, h, pixfmt, s->pool_min);
+        uint8_t plist[192], paras[256];
+        uint32_t pl = vtpv_pba_plist(plist, w, h, pixfmt, s->pool_min, s->pool_age);
         uint32_t n = vtpv_para_put(paras, 0x2c706261u /* ',pba' */, "=pls", plist, pl);
         s->host_msg_id++;
         uint8_t id8[8];
@@ -4641,9 +4654,11 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
             memset(s->mock_uuid + 8, 0xa5, 8);
             n += vtpv_para_put(paras + n, 0x2c757569u /* ',uui' */, "=uui",
                                s->mock_uuid, 16);
-            if (s->verbose) {
-                lab_elog( "apple-vtpv: their Dbuf request -> mock uuid "
-                        "(id=%llu)\n", (unsigned long long)s->host_msg_id);
+            s->deleg_n++;   /* 0008: census - when does the guest delegate? */
+            if (s->deleg_n <= 3 || (s->deleg_n & 63) == 0) {
+                lab_elog("apple-vtpv: their Dbuf request #%llu -> mock uuid "
+                         "(id=%llu)\n", (unsigned long long)s->deleg_n,
+                         (unsigned long long)s->host_msg_id);
             }
             vtpv_send_h2g2(s, slot, type, 4, s->msg + 0x10, s->msg + 0x20,
                            paras, n);
@@ -5799,6 +5814,24 @@ static void vtpv_hwdecode_dfrm(AppleVtpv *s, uint64_t total)
                             (unsigned long long)s->last_frame_id, dw, dh,
                             (unsigned long long)written,
                             (int)vtpv_dec_has_chroma(s->dec));
+                    /* TEMP lab (ZCode 29-10 Task23): dfrm's fills write the
+                     * exported surface's pages with neither the per-page
+                     * vtpv_host_store (they run on the session's own surface,
+                     * not a kick's) nor a following vtpv_note_surface - the
+                     * one vtpv store path the dirty tracking never saw. Stamp
+                     * the surface's pages exactly as vtpv_note_surface stamps
+                     * a kick's, so a host copy vouched by "the guest has not
+                     * written since" cannot survive our own decoded picture. */
+                    {
+                        uint32_t npg = s->surfmap_list ? s->surfmap_list_n
+                                        : MIN(s->surfmap_count,
+                                              (uint32_t)ARRAY_SIZE(s->surfmap_gpa));
+                        g_autofree uint64_t *pgs = g_new(uint64_t, npg ? npg : 1);
+                        for (uint32_t i = 0; i < npg; i++) {
+                            pgs[i] = vtpv_page_gpa(s, i) & ~(uint64_t)0xfff;
+                        }
+                        reims_vgpu_dirty_note_host_store(pgs, npg);
+                    }
                     decoded = true;
                 }
             } else {
@@ -5866,7 +5899,18 @@ static void vtpv_realize(PCIDevice *dev, Error **errp)
             }
         }
     }
-    lab_elog("apple-vtpv: pool_min=%u (pba MinimumBufferCount)\n", s->pool_min);
+    s->pool_age = 3600;              /* 0007: VTPV_POOL_AGE seconds (0 = omit the key) */
+    {
+        const char *pv = getenv("VTPV_POOL_AGE");
+        if (pv) {
+            long pa = atol(pv);
+            if (pa >= 0 && pa <= 86400) {
+                s->pool_age = pa;
+            }
+        }
+    }
+    lab_elog("apple-vtpv: pool_min=%u pool_age=%u (pba MinimumBufferCount/MaximumBufferAge)\n",
+             s->pool_min, s->pool_age);
 
     lab_elog( "apple-vtpv: realized v3 transport (msi+intx), msglog=%s verbose=%u "
             "hwbackend=%s\n", s->msglog ? s->msglog : "(stderr)", s->verbose,
