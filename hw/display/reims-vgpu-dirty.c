@@ -73,6 +73,18 @@ typedef struct ReimsVgpuDirtySet {
      * last accounted for. A page stamped past `seen_seq` was written since.
      */
     uint64_t synced_epoch;
+    /*
+     * TEMP lab O1SYNC (REIMS_VGPU_DIRTY_O1SYNC=on|verify, default off):
+     * o1_hint - a WP fault named one of this set's pages since the last
+     * completed sync (the write happened). o1_ok - the set has been
+     * continuously WP_ON since a sync completed over its full protection,
+     * so every page was read-only the whole interval and any write would
+     * have faulted and set o1_hint. A stale-by-epoch read of such a set
+     * may restamp and answer without walking. Hash-mode sets never
+     * qualify: their pages are not write-protected.
+     */
+    bool o1_hint;
+    bool o1_ok;
     uint64_t seen_seq;
     uint64_t last_query_epoch;  /* epoch of the last generation or page read */
     uint64_t claim_epoch;       /* epoch a sync of this set is running for, or 0 */
@@ -416,6 +428,10 @@ struct ReimsVgpuDirty {
     /* Generation reads may skip `lock` for synced sets (lab A/B
      * REIMS_VGPU_DIRTY_GEN_FAST=off restores the locked read). */
     bool gen_fast;
+    /* TEMP lab O1SYNC: see the set's o1_hint/o1_ok fields. `verify` keeps
+     * the full sync for the answer and only counts agreements. */
+    bool o1sync;
+    bool o1sync_verify;
     /*
      * TEMP (lab, diagnostic only) REIMS_VGPU_LAB_DIRTY_NOSYNC=on: every generation read takes the lagged
      * answer (what the prefetch workers last synced) instead of a foreground sync. Not correct — a store's
@@ -908,6 +924,14 @@ struct ReimsVgpuDirty {
     int64_t lab_wp_cause_last;
     uint64_t lab_wp_fwait_ns, lab_wp_fwait_max_ns, lab_wp_fhold_ns, lab_wp_fhold_max_ns, lab_wp_fslow;
     uint64_t lab_wp_protects, lab_wp_faults, lab_wp_refused, lab_wp_chunks, lab_wp_remaps;
+    /* TEMP lab O1SYNC: stale reads answered O(1), refusals by reason
+     * (hash set / not continuously protected / a fault named it), the
+     * verify arm's checked answers and disagreements (must stay 0), and
+     * the slow-sync census - why every full sync_one ran. */
+    uint64_t lab_o1_hit, lab_o1_miss_hash, lab_o1_miss_state, lab_o1_miss_hint;
+    uint64_t lab_o1_vn, lab_o1_vbad;
+    uint64_t lab_o1_slow_hash, lab_o1_slow_unprot, lab_o1_slow_written;
+    uint64_t lab_o1_slow_clean;
     /*
      * TEMP lab (n148): why the protect step passed over a queued set — gone or no longer WP_NONE,
      * unarmed, past the WP bitmap, or sharing a page that is already read-only — and how often a
@@ -3333,6 +3357,8 @@ static bool reims_vgpu_dirty_wp_fault(uint64_t gpa)
                 }
                 s->wp_holes++;
                 s->wp_state = WP_HOLED;
+                s->o1_hint = true;   /* TEMP lab O1SYNC: this write named the set */
+                s->o1_ok = false;
                 if (d->wp_hole_bits && (gpa >> qemu_target_page_bits()) < d->wp_bits_n) {
                     set_bit_atomic(gpa >> qemu_target_page_bits(), d->wp_hole_bits);
                 }
@@ -3347,6 +3373,8 @@ static bool reims_vgpu_dirty_wp_fault(uint64_t gpa)
                     qatomic_store_release(&s->synced_epoch, 0);
                 }
                 s->wp_state = WP_DROPPING;
+                s->o1_hint = true;   /* TEMP lab O1SYNC */
+                s->o1_ok = false;
                 reims_vgpu_dirty_wp_count(d, s, false);   /* TEMP lab DIRTY_WP_OVERLAP */
                 s->wp_next = 0;
                 s->wp_streak = 0;
@@ -3491,6 +3519,7 @@ static void reims_vgpu_dirty_wp_invalidate(void)
                 qatomic_store_release(&s->synced_epoch, 0);
             }
             s->wp_state = WP_NONE;
+            s->o1_ok = false;   /* TEMP lab O1SYNC */
             s->wp_streak = 0;
             reims_vgpu_dirty_wp_count(d, s, false);   /* TEMP lab DIRTY_WP_OVERLAP */
         }
@@ -3658,6 +3687,7 @@ static bool reims_vgpu_dirty_wp_pick_hot(ReimsVgpuDirty *d)
             if (c->wp_state == WP_HOLED) {
                 /* TEMP lab DIRTY_WP_HOLE: a heal; the set is on the list already. */
                 c->wp_state = WP_PROTECTING;
+                c->o1_ok = false;   /* TEMP lab O1SYNC */
                 c->wp_next = 0;
                 d->wp_cur = token;
                 d->lab_wp_heals++;
@@ -3671,6 +3701,7 @@ static bool reims_vgpu_dirty_wp_pick_hot(ReimsVgpuDirty *d)
             c->wp_state = WP_PROTECTING;
             c->wp_next = 0;
             c->wp_listed = true;
+            c->o1_ok = false;   /* TEMP lab O1SYNC: protection is partial until wp_finish */
             reims_vgpu_dirty_wp_count(d, c, true);   /* TEMP lab DIRTY_WP_OVERLAP */
             d->wp_cur = token;
             g_array_append_val(d->wp_list, token);
@@ -3694,6 +3725,7 @@ static bool reims_vgpu_dirty_wp_pick(ReimsVgpuDirty *d)
         if (c && c->count && d->wp_hole && c->wp_state == WP_HOLED) {
             /* TEMP lab DIRTY_WP_HOLE: a heal; the set is on the list already. */
             c->wp_state = WP_PROTECTING;
+            c->o1_ok = false;   /* TEMP lab O1SYNC: partial protection again */
             c->wp_next = 0;
             d->wp_cur = token;
             d->lab_wp_heals++;
@@ -3711,6 +3743,7 @@ static bool reims_vgpu_dirty_wp_pick(ReimsVgpuDirty *d)
             c->wp_state = WP_PROTECTING;
             c->wp_next = 0;
             c->wp_listed = true;
+            c->o1_ok = false;   /* TEMP lab O1SYNC: protection is partial until wp_finish */
             reims_vgpu_dirty_wp_count(d, c, true);   /* TEMP lab DIRTY_WP_OVERLAP */
             d->wp_cur = token;
             g_array_append_val(d->wp_list, token);
@@ -3739,6 +3772,11 @@ static void reims_vgpu_dirty_wp_finish(ReimsVgpuDirty *d, uint64_t token, ReimsV
         s->wp_state = WP_ON;
         s->wp_holes = 0;
         qatomic_store_release(&s->synced_epoch, REIMS_VGPU_DIRTY_WP_EPOCH);
+        /* TEMP lab O1SYNC: protection completed over the sync_one above,
+         * which started after every page was read-only - writes before it
+         * are in the query, writes after it fault. A clean interval. */
+        s->o1_hint = false;
+        s->o1_ok = true;
         if (d->wp_cur == token) {
             d->wp_cur = 0;
         }
@@ -4211,6 +4249,7 @@ static int64_t reims_vgpu_dirty_wp_protect_chunk(ReimsVgpuDirty *d, uint64_t tok
     qemu_mutex_lock(&d->lock);
     if (rc) {
         s->wp_state = WP_DROPPING;
+        s->o1_ok = false;   /* TEMP lab O1SYNC */
         reims_vgpu_dirty_wp_count(d, s, false);   /* TEMP lab DIRTY_WP_OVERLAP */
         s->wp_next = 0;
         d->wp_cur = 0;
@@ -4394,6 +4433,7 @@ static bool reims_vgpu_dirty_wp_step(ReimsVgpuDirty *d)
         if (s->wp_next >= s->count) {
             qemu_mutex_lock(&d->lock);
             s->wp_state = WP_NONE;
+            s->o1_ok = false;   /* TEMP lab O1SYNC */
             s->wp_holes = 0;
             qemu_mutex_unlock(&d->lock);
             reims_vgpu_dirty_wp_holes_clear(d, s);   /* TEMP lab DIRTY_WP_HOLE */
@@ -5467,6 +5507,8 @@ uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token)
     ReimsVgpuDirtySet *s;
     uint64_t gen = 0;
     bool stale, lagged = token & REIMS_VGPU_DIRTY_TOKEN_LAGGED;
+    bool o1 = false;        /* TEMP lab O1SYNC: answered without a walk */
+    uint64_t o1_pre = 0;    /* TEMP lab O1SYNC (verify): the gen we vouched for */
     int64_t fg0;
     /* TEMP lab (FGTRACE) */
     int64_t lt0 = 0, lw = 0, lq = 0;
@@ -5566,9 +5608,36 @@ uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token)
             }
         }
     }
+    /*
+     * TEMP lab O1SYNC: a set continuously WP_ON since a sync completed,
+     * that no fault has named, cannot have been written - every store to a
+     * protected page faults, and the fault marks its sets right here under
+     * `lock`. Answer from the established generation and restamp; no walk,
+     * no query, no consume. `verify` still runs the full sync for the
+     * answer and only checks the agreement below.
+     */
+    if (stale && d->o1sync && s) {
+        if (s->hash) {
+            qatomic_inc(&d->lab_o1_miss_hash);
+        } else if (!s->o1_ok) {
+            qatomic_inc(&d->lab_o1_miss_state);
+        } else if (s->o1_hint) {
+            qatomic_inc(&d->lab_o1_miss_hint);
+        } else {
+            o1 = true;
+            o1_pre = s->gen;
+            if (d->o1sync_verify) {
+                qatomic_inc(&d->lab_o1_vn);
+            } else {
+                qatomic_inc(&d->lab_o1_hit);
+                qatomic_store_release(&s->synced_epoch,
+                                      MAX(qatomic_read(&s->synced_epoch), needed_pre));
+            }
+        }
+    }
     qemu_mutex_unlock(&d->lock);
     fg0 = stale ? get_clock() : 0;
-    if (stale) {
+    if (stale && (!o1 || d->o1sync_verify)) {
         reims_vgpu_dirty_sync_one(d, token, true, needed_pre, &lw, &lq);
     }
     qemu_mutex_lock(&d->lock);
@@ -5585,6 +5654,19 @@ uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token)
     }
     if (s) {
         gen = s->gen;
+        if (o1 && d->o1sync_verify) {   /* TEMP lab O1SYNC: the full sync ran */
+            if (s->gen != o1_pre) {
+                qatomic_inc(&d->lab_o1_vbad);
+                if (qatomic_read(&d->lab_o1_vbad) <= 10) {
+                    lab_elog("reims-dirty-o1-verify-bad token=%llu pre=%llu post=%llu\n",
+                             (unsigned long long)token,
+                             (unsigned long long)o1_pre,
+                             (unsigned long long)s->gen);
+                }
+            } else {
+                qatomic_inc(&d->lab_o1_hit);
+            }
+        }
         if (d->gen_memo_mode &&
             qatomic_load_acquire(&s->synced_epoch) >= needed_pre) {   /* TEMP lab GEN_MEMO */
             /*
@@ -7259,6 +7341,8 @@ static bool reims_vgpu_dirty_sync_batch(ReimsVgpuDirty *d, uint64_t token)
                 d->log_wanted = true;
             }
             qatomic_store_release(&set->synced_epoch, MAX(set->synced_epoch, epoch));
+            set->o1_hint = false;   /* TEMP lab O1SYNC: a full sync completed */
+            set->o1_ok = set->wp_state == WP_ON;
         }
     }
     d->lab_od_n += tokens->len;
@@ -7442,6 +7526,8 @@ void reims_vgpu_dirty_sync_tokens(ReimsVgpuDirty *d, const uint64_t *want, size_
                 d->log_wanted = true;
             }
             qatomic_store_release(&set->synced_epoch, MAX(set->synced_epoch, epoch));
+            set->o1_hint = false;   /* TEMP lab O1SYNC: a full sync completed */
+            set->o1_ok = set->wp_state == WP_ON;
         }
     }
     d->lab_prep_query_ns += tq1 - tq0;
@@ -7966,6 +8052,8 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
     s->tclaim = MAX(s->tclaim, epoch);
     d->epoch_queried = true;   /* a hash sync observes this epoch too: no coalescing past it */
     if (s->hash && d->hash_mode) {   /* lab DIRTY_HASH: no hypervisor call, no ticket */
+        s->o1_ok = false;   /* TEMP lab O1SYNC: hashed pages are not protected */
+        qatomic_inc(&d->lab_o1_slow_hash);   /* TEMP lab O1SYNC: a full hash sync ran */
         int64_t h0 = get_clock();
 
         reims_vgpu_dirty_hash_sync(d, s, token, epoch, lab_query);
@@ -8328,6 +8416,22 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
             d->lab_c_last = lc2;
         }
         qatomic_store_release(&s->synced_epoch, MAX(s->synced_epoch, epoch));
+        /*
+         * TEMP lab O1SYNC: the slow-sync census, read before the restore
+         * below clears it - why did this set need the full path at all?
+         * written = a fault named it since its last sync (honest work);
+         * unprot = not continuously protected; clean = protected and
+         * unwritten, the class the O(1) answer takes in `on` mode.
+         */
+        if (s->o1_ok && !s->o1_hint) {
+            qatomic_inc(&d->lab_o1_slow_clean);
+        } else if (s->o1_hint) {
+            qatomic_inc(&d->lab_o1_slow_written);
+        } else {
+            qatomic_inc(&d->lab_o1_slow_unprot);
+        }
+        s->o1_hint = false;   /* TEMP lab O1SYNC: this sync completed over the set */
+        s->o1_ok = s->wp_state == WP_ON;
         if (s->claim_epoch == epoch) {
             s->claim_epoch = 0;
         }
@@ -8391,7 +8495,11 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                     " lkb_prep_us=%" PRId64 " lkb_list_us=%" PRId64 " lkb_post_us=%" PRId64
                     " fgjoin=%u dup_inflight=%" PRIu64 " ov_older=%" PRIu64
                     " settle_skip=%u settle_skips=%" PRIu64 " settle_skip_cand=%" PRIu64
-                    " tb=%u tb_syncs=%" PRIu64 " tb_batches=%" PRIu64 "\n",
+                    " tb=%u tb_syncs=%" PRIu64 " tb_batches=%" PRIu64
+                    " gen_fast_s=%" PRIu64 " o1_hit=%" PRIu64 " o1_mhash=%" PRIu64
+                    " o1_mstate=%" PRIu64 " o1_mhint=%" PRIu64 " o1_vn=%" PRIu64
+                    " o1_vbad=%" PRIu64 " o1_shash=%" PRIu64 " o1_sunprot=%" PRIu64
+                    " o1_swritten=%" PRIu64 " o1_sclean=%" PRIu64 "\n",
                     g_get_real_time() / 1000, d->lab_od_n, d->lab_od_ns / 1000,
                     d->lab_od_pages, d->lab_od_skipped, d->lab_od_epochs,
                     d->lab_od_fg_n, d->lab_od_fg_ns / 1000, d->lab_ph_wait / 1000,
@@ -8413,7 +8521,18 @@ static void reims_vgpu_dirty_sync_one(ReimsVgpuDirty *d, uint64_t token, bool fg
                     d->lab_holdb_list / 1000, d->lab_holdb_post / 1000, d->fgjoin_mode,
                     d->lab_dup_inflight, d->lab_ov_older, d->settle_skip,
                     d->lab_settle_skips, d->lab_settle_skip_cand, d->ticket_batch,
-                    d->lab_tb_syncs, d->lab_tb_batches);
+                    d->lab_tb_syncs, d->lab_tb_batches,
+                    qatomic_xchg(&d->lab_gen_fast_s, 0),
+                    qatomic_xchg(&d->lab_o1_hit, 0),
+                    qatomic_xchg(&d->lab_o1_miss_hash, 0),
+                    qatomic_xchg(&d->lab_o1_miss_state, 0),
+                    qatomic_xchg(&d->lab_o1_miss_hint, 0),
+                    qatomic_xchg(&d->lab_o1_vn, 0),
+                    qatomic_xchg(&d->lab_o1_vbad, 0),
+                    qatomic_xchg(&d->lab_o1_slow_hash, 0),
+                    qatomic_xchg(&d->lab_o1_slow_unprot, 0),
+                    qatomic_xchg(&d->lab_o1_slow_written, 0),
+                    qatomic_xchg(&d->lab_o1_slow_clean, 0));
             reims_vgpu_dirty_gap_refresh();   /* TEMP lab live DIRTY_GAP */
             if (d->gen_repeek) {   /* TEMP lab REIMS_VGPU_LAB_DIRTY_GEN_REPEEK */
                 lab_elog("reims-dirty-genrepeek epoch_ms=%" PRId64
@@ -8996,6 +9115,16 @@ void reims_vgpu_dirty_set_ondemand(ReimsVgpuDirty *d, bool on)
                         strcmp(getenv("REIMS_VGPU_LAB_DIRTY_NOSYNC"), "on") == 0;
         d->gen_fast = !(getenv("REIMS_VGPU_DIRTY_GEN_FAST") &&        /* lab A/B */
                         strcmp(getenv("REIMS_VGPU_DIRTY_GEN_FAST"), "off") == 0);
+        {   /* TEMP lab O1SYNC: off | on | verify (verify answers via the full sync). */
+            const char *o1 = getenv("REIMS_VGPU_DIRTY_O1SYNC");
+
+            d->o1sync_verify = o1 && strcmp(o1, "verify") == 0;
+            d->o1sync = d->o1sync_verify || (o1 && strcmp(o1, "on") == 0);
+            if (d->o1sync) {
+                lab_elog("reims-dirty-o1sync mode=%s\n",
+                         d->o1sync_verify ? "verify" : "on");
+            }
+        }
         d->fgjoin_mode = !(getenv("REIMS_VGPU_LAB_DIRTY_FGJOIN") &&    /* lab A/B */
                            strcmp(getenv("REIMS_VGPU_LAB_DIRTY_FGJOIN"), "off") == 0);
         d->prep_unlocked = !(getenv("REIMS_VGPU_LAB_DIRTY_PREPLOCK") &&  /* lab A/B */
@@ -9819,6 +9948,8 @@ static void reims_vgpu_dirty_prefetch_phase(ReimsVgpuDirty *d, GArray *tokens,
                 d->log_wanted = true;
             }
             qatomic_store_release(&set->synced_epoch, MAX(set->synced_epoch, epoch));
+            set->o1_hint = false;   /* TEMP lab O1SYNC: a full sync completed */
+            set->o1_ok = set->wp_state == WP_ON;
             if (set->claim_epoch == epoch) {
                 set->claim_epoch = 0;
             }
