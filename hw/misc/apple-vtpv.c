@@ -94,6 +94,7 @@ typedef struct VtpvSess {
     bool used;
     uint8_t uuid[16];
     uint64_t last_use;
+    int64_t last_us;                /* TEMP lab (task63): wall clock of its last message */
     struct AppleVtpv *owner;
     struct {
         uint64_t frame_id;
@@ -247,6 +248,8 @@ struct AppleVtpv {
     uint32_t irq_pending;           /* bitmask */
     char *msglog;
     char *reply_dcap;               /* stage-2: file whose bytes answer 'decs' */
+    char *dcap_file;                /* TEMP lab (task58): bplist overriding the
+                                     * built-in 'dcap' dictionary reply */
     char *reply_plusdec;            /* stage-2: file whose bytes answer '+dec' */
     char *reply_generic;            /* stage-3: ',ver'+',err' template for any other sync
                                      * query (dsta/dinv/...); the request's message type
@@ -1318,6 +1321,170 @@ static bool vtpv_send_h2g(AppleVtpv *s, int slot, uint32_t type,
     return vtpv_send_h2g2(s, slot, type, 1, uuid16, id8, paras, paras_len);
 }
 
+/* TEMP lab (Zcode 10-29, task58): binary plist for the 'dcap' reply's ',dca'
+ * - a CFDictionary, which the guest's caps machine requires (a wrong type
+ * strands the caller).  The dict is { "<fourcc>": <entry dict> }, the entry
+ * byte-modelled on the codec's own ',dec' registry entry - the description
+ * the guest already trusts from 'decs' - with VTDecoderCapabilities as an
+ * empty dict (its inner keys are still unknown; the file property replaces
+ * the whole bplist for shape iterations).  Objects: 0 the top dict, 1 the
+ * fourcc, 2 the entry dict(8), 3..10 the eight keys (including Apple's own
+ * "VTCodectType" typo), 11..18 the values.  Refs 1 byte (19 objects);
+ * offsets 2 bytes (the object table passes 255). */
+#define VTPV_DCAP_PLIST_MAX 512
+static uint32_t vtpv_dcap_plist(uint8_t *out, uint32_t codec)
+{
+    static const char *keys[8] = {
+        "CMCClassImplementationID", "CMCClassImplementationName",
+        "IsPreferredInternalPlugin", "VTCodectType",
+        "VTDecoderCapabilities", "VTHostDecoderID",
+        "VTIsHardwareAccelerated", "VTRating",
+    };
+    static const struct {
+        uint32_t fcc;
+        const char *name;
+    } names[4] = {
+        { 0x61766331u /* 'avc1' */, "Paravirtual H.264" },
+        { 0x68766331u /* 'hvc1' */, "Paravirtual HEVC" },
+        { 0x76703039u /* 'vp09' */, "Paravirtual VP9" },
+        { 0x61763031u /* 'av01' */, "Paravirtual AV1" },
+    };
+    const char *name = NULL;
+    for (size_t i = 0; i < ARRAY_SIZE(names); i++) {
+        if (names[i].fcc == codec) {
+            name = names[i].name;
+            break;
+        }
+    }
+    if (!name) {
+        /* not one of ours: a dictionary that says "no capabilities" - the
+         * empty plist the Dbuf options already use */
+        memcpy(out, vtpv_empty_plist, sizeof(vtpv_empty_plist));
+        return sizeof(vtpv_empty_plist);
+    }
+    char fcc[5];
+    vtpv_log4cc(fcc, codec);
+    char impl[40], hid[16];
+    snprintf(impl, sizeof(impl), "com.apple.videotoolbox.pv.%s", fcc);
+    snprintf(hid, sizeof(hid), "pv-%s-0", fcc);
+    uint16_t off[19];
+    uint32_t n = 0;
+    memcpy(out, "bplist00", 8);
+    n = 8;
+    off[0] = n;
+    out[n++] = 0xd1;                          /* top dict, 1 pair */
+    out[n++] = 1;                             /* key: the fourcc */
+    out[n++] = 2;                             /* value: the entry */
+    off[1] = n;
+    out[n++] = 0x50 | 4;
+    memcpy(out + n, fcc, 4);
+    n += 4;
+    off[2] = n;
+    out[n++] = 0xd8;                          /* entry dict, 8 pairs */
+    for (int i = 3; i <= 10; i++) {
+        out[n++] = i;                         /* key refs */
+    }
+    /* value refs, in key order: implID, name, preferred(true), codectType,
+     * capabilities({}), hostDecoderID, hwAccelerated(true), rating(100) */
+    static const uint8_t valrefs[8] = { 11, 12, 13, 14, 16, 15, 17, 18 };
+    memcpy(out + n, valrefs, 8);
+    n += 8;
+    for (int i = 0; i < 8; i++) {
+        off[3 + i] = n;
+        size_t kl = strlen(keys[i]);
+        if (kl < 15) {
+            out[n++] = 0x50 | kl;
+        } else {
+            out[n++] = 0x5f;
+            out[n++] = 0x10;                  /* length as a 1-byte int */
+            out[n++] = kl;
+        }
+        memcpy(out + n, keys[i], kl);
+        n += kl;
+    }
+    const char *sv[3] = { impl, name, hid };  /* refs 11, 12, 15 */
+    static const int si[3] = { 11, 12, 15 };
+    for (int i = 0; i < 3; i++) {
+        off[si[i]] = n;
+        size_t kl = strlen(sv[i]);
+        if (kl < 15) {
+            out[n++] = 0x50 | kl;
+        } else {
+            out[n++] = 0x5f;
+            out[n++] = 0x10;
+            out[n++] = kl;
+        }
+        memcpy(out + n, sv[i], kl);
+        n += kl;
+    }
+    off[13] = n;
+    out[n++] = 0x09;                          /* true */
+    off[14] = n;
+    out[n++] = 0x50 | 4;                      /* the fourcc again */
+    memcpy(out + n, fcc, 4);
+    n += 4;
+    off[16] = n;
+    out[n++] = 0xd0;                          /* VTDecoderCapabilities = {} */
+    off[17] = n;
+    out[n++] = 0x09;                          /* true */
+    off[18] = n;
+    out[n++] = 0x10;                          /* 1-byte int */
+    out[n++] = 100;
+    uint32_t table = n;
+    for (int i = 0; i < 19; i++) {
+        stw_be_p(out + n, off[i]);
+        n += 2;
+    }
+    memset(out + n, 0, 32);                   /* trailer */
+    out[n + 6] = 2;                           /* offset int size */
+    out[n + 7] = 1;                           /* object ref size */
+    stq_be_p(out + n + 8, 19);                /* objects */
+    stq_be_p(out + n + 16, 0);                /* top object */
+    stq_be_p(out + n + 24, table);            /* offset table offset */
+    return n + 32;
+}
+
+/* TEMP lab (task58): answer 'dcap' - the guest's per-codec capabilities
+ * query (",ver", ",cod").  Until now it fell into the generic-template
+ * branch: a reply without ",dca", so every capabilities copy starved.  The
+ * file property replaces the built-in dictionary bytes verbatim (a raw
+ * bplist) so reply shapes iterate without rebuilds. */
+static void vtpv_reply_dcap(AppleVtpv *s, int slot, uint64_t total)
+{
+    uint32_t clen = 0;
+    const uint8_t *cod = vtpv_para_find(s->msg, total, 0x2c636f64u /* ',cod' */, &clen);
+    uint32_t codec = (cod && clen >= 4) ? ldl_be_p(cod) : 0;
+    uint8_t pl[VTPV_DCAP_PLIST_MAX];
+    uint32_t plen = vtpv_dcap_plist(pl, codec);
+    const char *src = "built-in";
+    if (s->dcap_file) {
+        FILE *f = fopen(s->dcap_file, "rb");
+        if (f) {
+            long flen = 0;
+            fseek(f, 0, SEEK_END);
+            flen = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (flen >= 8 && flen <= (long)sizeof(pl) &&
+                fread(pl, 1, flen, f) == (size_t)flen) {
+                plen = flen;
+                src = s->dcap_file;
+            }
+            fclose(f);
+        }
+    }
+    uint8_t paras[0x40 + VTPV_DCAP_PLIST_MAX];
+    uint32_t be_ver;
+    uint32_t n = 0;
+    stl_be_p(&be_ver, 6);
+    n += vtpv_para_put(paras + n, 0x2c766572u /* ',ver' */, "=u32", &be_ver, 4);
+    n += vtpv_para_put(paras + n, 0x2c646361u /* ',dca' */, "=pls", pl, plen);
+    char fcc[5];
+    vtpv_log4cc(fcc, codec);
+    lab_elog("apple-vtpv: 'dcap' %.4s -> ',dca' %u B (%s)\n", fcc, plen, src);
+    vtpv_send_h2g2(s, slot, 0x64636170u /* 'dcap' */, 4, s->msg + 0x10, s->msg + 0x20,
+                   paras, n);
+}
+
 /* TEMP lab (Opus 10-28, q1239): the first events after each session create,
  * host-timestamped from its '+dec' - lines up with the guest's clerk timeouts */
 static void vtpv_vtrace(AppleVtpv *s, const char *what, uint64_t a, uint64_t b)
@@ -2225,16 +2392,60 @@ static void vtpv_dec_drain(AppleVtpv *s, VtpvSess *se)
     qemu_mutex_unlock(&s->dec_lock);
 }
 
+/* TEMP lab (Zcode 29-10 task63): vtpv_dx_reset for any session, not just
+ * s->cur - the idle sweep below needs it. */
+static void vtpv_dx_reset_se(AppleVtpv *s, VtpvSess *se)
+{
+    vtpv_dec_drain(s, se);
+    vtpv_tile_drain(s, se, false);
+    vtpv_dx_close(se->dx);
+    se->dx = NULL;
+    se->dx_api = VTPV_API_D3D12;
+    se->dx_codec = -1;
+    se->dx_cfg_len = 0;
+    se->dpba_w = se->dpba_h = 0;      /* outbuf: the next stream announces its size again */
+}
+
 static void vtpv_dx_reset(AppleVtpv *s)
 {
-    vtpv_dec_drain(s, s->cur);
-    vtpv_tile_drain(s, s->cur, false);
-    vtpv_dx_close(s->cur->dx);
-    s->cur->dx = NULL;
-    s->cur->dx_api = VTPV_API_D3D12;
-    s->cur->dx_codec = -1;
-    s->cur->dx_cfg_len = 0;
-    s->cur->dpba_w = s->cur->dpba_h = 0;      /* outbuf: the next stream announces its size again */
+    vtpv_dx_reset_se(s, s->cur);
+}
+
+/* TEMP lab (Zcode 29-10 task63): both leak runs showed the same shape (dx
+ * +1 a video playback, pooled=0) - NO close of any kind reached the
+ * orphaned decoder: not '-dec', not an eviction (the 64-slot table never
+ * filled on multiapp; what looked like the Intel fix was eviction
+ * pressure).  A live video session always has guest traffic, so a session
+ * whose decoder is open but whose uuid has been silent past
+ * VTPV_DX_IDLE_MS (default 15000, 0 = off) is an orphan: return its
+ * decoder to the pool from this once-a-second sweep.  A paused video pays
+ * one decoder reopen past the idle window - against the ~100 QEMU handles
+ * each orphan held forever. */
+static void vtpv_dx_close_idle(AppleVtpv *s)
+{
+    static int64_t last_sweep;
+    int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    if (last_sweep && now - last_sweep < 1000000) {
+        return;
+    }
+    last_sweep = now;
+    const char *e = getenv("VTPV_DX_IDLE_MS");
+    long idle_ms = e ? atol(e) : 15000;
+    if (idle_ms <= 0) {
+        return;
+    }
+    for (int i = 0; i < VTPV_SESS; i++) {
+        VtpvSess *se = &s->sess[i];
+        if (!se->used || !se->dx || !se->last_us) {
+            continue;
+        }
+        if (now - se->last_us < idle_ms * 1000) {
+            continue;
+        }
+        lab_elog("apple-vtpv: session silent %lld ms - decoder returned (dx-close-idle, task63)\n",
+                 (long long)((now - se->last_us) / 1000));
+        vtpv_dx_reset_se(s, se);
+    }
 }
 
 /* a session ends (its uuid deregistered, or evicted): decoder, waiting
@@ -2266,6 +2477,38 @@ static void vtpv_sess_free(AppleVtpv *s, VtpvSess *se)
     memset(se, 0, sizeof(*se));
     se->dx_codec = -1;
     se->owner = s;
+}
+
+/* TEMP lab (Zcode 29-10 task61): the per-second handle census - QEMU's own
+ * HandleCount beside every kernel object the decode backend holds, so a
+ * growing count is attributed or the device acquitted from the log.  The
+ * audit found the C paths balanced (events/threads close in dx_destroy and
+ * ka_stop, the decoder pool is bounded); if qemu= climbs while the rest stay
+ * flat, the growth is elsewhere - driver-side objects of the Vulkan
+ * engine's allocations are the next suspect (POOLS_BOUND, task60). */
+static void vtpv_note_handles(AppleVtpv *s)
+{
+    static int64_t last_us;
+    int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    if (last_us && now - last_us < 1000000) {
+        return;
+    }
+    last_us = now;
+    int sess_used = 0;
+    for (int i = 0; i < VTPV_SESS; i++) {
+        if (s->sess[i].used) {
+            sess_used++;
+        }
+    }
+    VtpvDxHandles h;
+    vtpv_dx_handles(&h);
+    DWORD hc = 0;
+#ifdef _WIN32
+    GetProcessHandleCount(GetCurrentProcess(), &hc);
+#endif
+    lab_elog("vtpv_handles qemu=%lu sess=%d dx=%d pooled=%d ev=%d heap=%d thr=%d\n",
+             (unsigned long)hc, sess_used, h.open, h.pooled, h.events, h.heaps,
+             h.threads);
 }
 
 /* the session a message belongs to; a new uuid takes a free entry or the
@@ -4018,6 +4261,9 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
     uint32_t type = be32_to_cpu(be_type);
     uint32_t flags = be32_to_cpu(be_flags);
     s->cur = vtpv_sess_get(s, s->msg + 0x10);
+    s->cur->last_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);  /* TEMP lab (task63): idle clock */
+    vtpv_note_handles(s);    /* TEMP lab (task61): rate-limited to 1/s */
+    vtpv_dx_close_idle(s);   /* TEMP lab (task63): rate-limited to 1/s */
     char t4[5];
     vtpv_log4cc(t4, type);
     if (type == 0x64746669u /* 'dtfi' */ || type == 0x64696e76u /* 'dinv' */) {
@@ -4026,6 +4272,15 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
     } else if (type == 0x2d646563u /* '-dec' */) {
         vtpv_tile_drain(s, s->cur, true);
         vtpv_tdem_flush(s, s->msg + 0x10, true);    /* the decoder is gone */
+        /* TEMP lab (Zcode 29-10 task62): the decoder IS gone - return it.
+         * Until now the session kept its VtpvDx alive until its slot was
+         * evicted, and the 64-slot table never filled under multiapp
+         * (a1247 census: dx +1 a round, pooled=0, sess flat) - every Safari
+         * video left a live decoder, with its events, heaps and keep-alive
+         * thread, forever. The pool takes it; a follow-up 'dsts' on this
+         * session reopens or pool-hits, the same road a format change takes
+         * via 'dinv'. */
+        vtpv_dx_reset(s);
     } else if (type == 0x5444656du /* 'TDem' */ && (flags & 8)) {
         /* the ack of a 'TDem' we sent: EmitDecodedTile - the guest's tile
          * handler included - has returned, a window slot is free */
@@ -4931,6 +5186,12 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
         reply_tpl = vtpv_tpl_generic;
         reply_tpl_len = sizeof(vtpv_tpl_generic);
         patch_type = true;
+    }
+    if (type == 0x64636170u /* 'dcap' */) {
+        /* the per-codec capabilities query: a reply of its own, not the
+         * generic template (which carries no ",dca") */
+        vtpv_reply_dcap(s, slot, total);
+        return;
     }
     if (reply_tpl) {
         if (s->verbose) {
@@ -5978,6 +6239,7 @@ static const Property vtpv_properties[] = {
     DEFINE_PROP_STRING("reply_generic", AppleVtpv, reply_generic),
     DEFINE_PROP_STRING("reply_dsup", AppleVtpv, reply_dsup),
     DEFINE_PROP_STRING("dpba_file", AppleVtpv, dpba_file),
+    DEFINE_PROP_STRING("dcap_file", AppleVtpv, dcap_file), /* TEMP lab (task58): override the 'dcap' dictionary bplist */
     DEFINE_PROP_BOOL("mock_dbuf", AppleVtpv, mock_dbuf, false),
     DEFINE_PROP_BOOL("mock_demt", AppleVtpv, mock_demt, false),
     DEFINE_PROP_BOOL("outbuf", AppleVtpv, outbuf, true),

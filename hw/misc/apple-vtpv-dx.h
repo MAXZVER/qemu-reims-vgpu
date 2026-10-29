@@ -83,4 +83,20 @@ void vtpv_dx_close(VtpvDx *d);
 /* Close for good: a decoder that refused its stream. */
 void vtpv_dx_discard(VtpvDx *d);
 
+/* TEMP lab (Zcode 29-10 task61): the handle census of this backend - every
+ * kernel object it creates (CreateEventA / CreateThread /
+ * OpenExistingHeapFromAddress), so a growing QEMU HandleCount is attributed
+ * to it or it is acquitted from the log alone.  The audit that motivated
+ * it: dx_destroy/ka_stop close everything they made and the decoder pool is
+ * bounded; these counters say it live. */
+typedef struct VtpvDxHandles {
+    int open;       /* live decoders (created - destroyed) */
+    int pooled;     /* of those, sitting in the reuse pool */
+    int events;     /* live CreateEventA events */
+    int heaps;      /* live OpenExistingHeapFromAddress heaps */
+    int threads;    /* live keep-alive threads */
+} VtpvDxHandles;
+
+void vtpv_dx_handles(VtpvDxHandles *h);
+
 #endif /* HW_MISC_APPLE_VTPV_DX_H */

@@ -144,6 +144,12 @@ struct VtpvDx {
 #define POOL_MAX 8
 #define POOL_TTL_MS 5000.0
 static SRWLOCK pool_lock = SRWLOCK_INIT;
+
+/* TEMP lab (task61): see VtpvDxHandles in the header. */
+static LONG dx_opened, dx_destroyed;
+static LONG ev_created, ev_closed;
+static LONG heaps_opened, heaps_released;
+static LONG ka_started, ka_joined;
 static VtpvDx *pool[POOL_MAX];
 static AVBufferRef *dev_cache[2][2];        /* [cuda][nv] */
 
@@ -228,6 +234,7 @@ static int queue_init(VtpvDx *d)
         ID3D12VideoProcessCommandList_Close(s->vlist);
     }
     d->ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+    InterlockedIncrement(&ev_created);
     return 0;
 }
 
@@ -277,7 +284,9 @@ static void ka_start(VtpvDx *d)
     }
     ID3D12GraphicsCommandList_Close(d->ka_list);
     d->ka_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+    InterlockedIncrement(&ev_created);
     d->ka_thread = CreateThread(NULL, 0, ka_main, d, 0, NULL);
+    if (d->ka_thread) InterlockedIncrement(&ka_started);
 }
 
 static void ka_stop(VtpvDx *d)
@@ -286,6 +295,7 @@ static void ka_stop(VtpvDx *d)
         InterlockedExchange(&d->ka_stop, 1);
         WaitForSingleObject(d->ka_thread, INFINITE);
         CloseHandle(d->ka_thread);
+        InterlockedIncrement(&ka_joined);
         d->ka_thread = NULL;
     }
     if (d->ka_list) ID3D12GraphicsCommandList_Release(d->ka_list);
@@ -293,7 +303,7 @@ static void ka_stop(VtpvDx *d)
     if (d->ka_src) ID3D12Resource_Release(d->ka_src);
     if (d->ka_dst) ID3D12Resource_Release(d->ka_dst);
     if (d->ka_fence) ID3D12Fence_Release(d->ka_fence);
-    if (d->ka_ev) CloseHandle(d->ka_ev);
+    if (d->ka_ev) { CloseHandle(d->ka_ev); InterlockedIncrement(&ev_closed); }
     d->ka_list = NULL; d->ka_alloc = NULL; d->ka_src = d->ka_dst = NULL; d->ka_fence = NULL; d->ka_ev = NULL;
 }
 
@@ -310,7 +320,7 @@ static void slots_free(VtpvDx *d)
     for (int i = 0; i < NSLOT; i++) {
         Slot *s = &d->slot[i];
         if (s->buf) { ID3D12Resource_Release(s->buf); s->buf = NULL; }
-        if (s->heap) { ID3D12Heap_Release(s->heap); s->heap = NULL; }
+        if (s->heap) { ID3D12Heap_Release(s->heap); s->heap = NULL; InterlockedIncrement(&heaps_released); }
         if (s->mem) { VirtualFree(s->mem, 0, MEM_RELEASE); s->mem = NULL; }
     }
 }
@@ -324,6 +334,7 @@ static int slot_mem(VtpvDx *d, Slot *s)
     HRESULT h = ID3D12Device3_OpenExistingHeapFromAddress(d3, s->mem, &IID_ID3D12Heap, (void **)&s->heap);
     ID3D12Device3_Release(d3);
     if (FAILED(h)) { fprintf(stderr, "vtpv-dx: OpenExistingHeapFromAddress -> %#lx\n", (unsigned long)h); return -1; }
+    InterlockedIncrement(&heaps_opened);
     D3D12_RESOURCE_DESC bd = { .Dimension = D3D12_RESOURCE_DIMENSION_BUFFER, .Width = d->memsz, .Height = 1,
         .DepthOrArraySize = 1, .MipLevels = 1, .Format = DXGI_FORMAT_UNKNOWN, .SampleDesc = { 1, 0 },
         .Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR, .Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER };
@@ -751,6 +762,7 @@ VtpvDx *vtpv_dx_open(const char *gpu, const char *api, VtpvDxCodec codec,
     }
     VtpvDx *d = calloc(1, sizeof(*d));
     if (!d) return NULL;
+    InterlockedIncrement(&dx_opened);   /* the fail path destroys it again */
     QueryPerformanceFrequency(&d->qf);
     d->out = out;
     d->opaque = opaque;
@@ -892,6 +904,23 @@ void vtpv_dx_stats(const VtpvDx *d, double *ms_parse, double *ms_gpu, int *pictu
     if (pictures) *pictures = d->npics;
 }
 
+/* TEMP lab (task61): every live kernel object this backend holds, beside the
+ * pool walk.  Cheap enough for a line a second. */
+void vtpv_dx_handles(VtpvDxHandles *h)
+{
+    h->open = (int)(dx_opened - dx_destroyed);
+    int pooled = 0;
+    AcquireSRWLockExclusive(&pool_lock);
+    for (int i = 0; i < POOL_MAX; i++) {
+        if (pool[i]) pooled++;
+    }
+    ReleaseSRWLockExclusive(&pool_lock);
+    h->pooled = pooled;
+    h->events = (int)(ev_created - ev_closed);
+    h->heaps = (int)(heaps_opened - heaps_released);
+    h->threads = (int)(ka_started - ka_joined);
+}
+
 void vtpv_dx_close(VtpvDx *d)
 {
     if (!d) return;
@@ -942,6 +971,7 @@ void vtpv_dx_discard(VtpvDx *d)
 static void dx_destroy(VtpvDx *d)
 {
     if (!d) return;
+    InterlockedIncrement(&dx_destroyed);
     ka_stop(d);
     for (int i = 0; i < d->npend; i++) av_frame_free(&d->pend[i]);
     if (d->fence && d->q) {
@@ -963,7 +993,7 @@ static void dx_destroy(VtpvDx *d)
     if (d->nv12) ID3D12Resource_Release(d->nv12);
     if (d->q) ID3D12CommandQueue_Release(d->q);
     if (d->fence) ID3D12Fence_Release(d->fence);
-    if (d->ev) CloseHandle(d->ev);
+    if (d->ev) { CloseHandle(d->ev); InterlockedIncrement(&ev_closed); }
     free(d->conv);
     av_frame_free(&d->fr);
     av_frame_free(&d->sw);
