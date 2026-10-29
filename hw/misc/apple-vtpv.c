@@ -421,6 +421,7 @@ struct AppleVtpv {
     bool first_kick;                /* TEMP lab (prop, default off): decode a stream's first picture in the kick */
     bool sw_main10;                 /* TEMP lab (prop, default on): 10-bit HEVC sessions refused -> guest decode */
     bool dec_warm;                  /* TEMP lab (prop, default on): open the decoder at 'dsts'/'dsta', ahead of the first 'dfrm' */
+    bool vp9;                       /* TEMP lab (prop, default off): set the VP9 caps bit (VTPV_CAPS) so the guest offers vp09 sessions */
     int64_t vtr_t0;                 /* TEMP lab vtrace: the last '+dec' (us), 0 = none yet */
     int vtr_n;                      /* TEMP lab vtrace: events logged since it */
     bool dbuf_ask_hold;            /* 0005 (prop, default on): hold each 'Dbuf' ask until the session's next 'dfrm' */
@@ -2193,6 +2194,13 @@ static void vtpv_sbf_codec_first(AppleVtpv *s, const uint8_t *sbf, uint32_t n)
             s->dec_codec = 0;
         } else if (codec == VTPV_DX_HEVC) {
             s->dec_codec = 1;
+        } else if (codec == VTPV_DX_VP9) {
+            /* TEMP lab (vp9): the vk path's early detect used to leave the
+             * codec stale for VP9/AV1 - the decoder would open as whatever
+             * the previous session set. */
+            s->dec_codec = 2;
+        } else if (codec == VTPV_DX_AV1) {
+            s->dec_codec = 3;
         }
     }
 }
@@ -5207,7 +5215,13 @@ static uint64_t vtpv_mmio_read(void *opaque, hwaddr addr, unsigned size)
         v = s->irq_pending;
         break;
     case VTPV_CAPS:
-        v = 0;    /* stage 2: codec bits */
+        /* Codec bits, layout per the device family's enum order
+         * (VTPV_DX_H264, HEVC, VP9, AV1): bit0 H264, bit1 HEVC, bit2 VP9,
+         * bit3 AV1. H264/HEVC are the protocol baseline and reach the
+         * device at caps=0; the guest's VideoToolbox gates the newer
+         * codecs (WebKit: VTIsHardwareDecodeSupported('vp09')) on these
+         * bits, which is why VP9 stayed software. TEMP lab (prop vp9). */
+        v = (1u << 0) | (1u << 1) | (s->vp9 ? (1u << 2) : 0u);
         break;
     case VTPV_MSG_KICK:
         v = s->slot[s->client_id].last_kick;
@@ -5971,6 +5985,7 @@ static const Property vtpv_properties[] = {
     DEFINE_PROP_BOOL("first-kick", AppleVtpv, first_kick, false), /* TEMP lab: on = first picture decoded in the kick */
     DEFINE_PROP_BOOL("sw-main10", AppleVtpv, sw_main10, true), /* TEMP lab: off = our decoder takes 10-bit HEVC too */
     DEFINE_PROP_BOOL("dec-warm", AppleVtpv, dec_warm, true), /* 0004: open the decoder at 'dsts', ahead of the first 'dfrm' */
+    DEFINE_PROP_BOOL("vp9", AppleVtpv, vp9, false), /* TEMP lab: advertise the VP9 caps bit */
     DEFINE_PROP_BOOL("ask-hold", AppleVtpv, dbuf_ask_hold, true), /* 0005: each 'Dbuf' ask waits for the session's next 'dfrm' */
     DEFINE_PROP_BOOL("decthread", AppleVtpv, decthread, true),
     DEFINE_PROP_BOOL("lat-log", AppleVtpv, lat_log, false), /* TEMP lab: log each 'dfrm' reply's take time */
