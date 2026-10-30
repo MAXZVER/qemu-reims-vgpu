@@ -121,6 +121,9 @@ typedef struct VtpvSess {
                                    * pending dfrm reply (clerk deadline ~4 ms) */
     uint64_t ask_hold_us;          /* 0005: when the hold was set (aged release) */
     uint32_t shed_n;                /* frames shed and not completed yet */
+    uint8_t pump_gate;              /* q1375: which exit of vtpv_pump_dbuf_cur ran last */
+    bool realtime;                  /* a 'dfrm' carried kVTDecodeFrame_1xRealTimePlayback
+                                   * (',dfl' bit 2): a player - only these shed */
     uint32_t pace_warm, pace_cold; /* diag: recycled vs fresh answer surfaces */
     uint64_t pace_seen[256];
     uint32_t pace_seen_n, pace_seen_i;
@@ -208,6 +211,7 @@ static const char *const vtpv_api_name[] = { "d3d12", "cuda", "sw" };
                                  * MMIO write for a send's whole register
                                  * sequence (slot, surf[], total, surfdesc) */
 #define VTPV_KICKDESC_MAGIC 0x31494b56u /* 'VKI1' */
+#define VTPV_OUTBOX_PEND 0x140  /* RO  u32 x16: outbox entries per slot (Opus 10-30) */
 #define VTPV_KICK_HOLD  0x138   /* W1  u64: GPA of the sender's u32 pair {token,
                                  * done}: the kext keeps this kick's surfaces
                                  * pinned when the device writes a nonzero token,
@@ -2283,6 +2287,11 @@ static void vtpv_send_dbuf(AppleVtpv *s, int slot, uint64_t frame_id,
     s->cur->frame[free_i].decoded = false;
     s->cur->frame[free_i].shed = false;
         s->cur->frame[free_i].dno = s->dno && s->decthread && (s->cur_dfl & (1u << 1));
+        if ((s->cur_dfl & (1u << 2)) && !s->cur->realtime) {
+            s->cur->realtime = true;
+            lab_elog("apple-vtpv: sess%d real-time playback from frame %llu (dfl 0x%x) - backlog shed on\n",
+                     (int)(s->cur - s->sess), (unsigned long long)frame_id, s->cur_dfl);
+        }
         s->cur->frame[free_i].pace_drop = s->pace_drop_next;
         s->pace_drop_next = false;
         if (s->cur->frame[free_i].pace_drop) {
@@ -2308,6 +2317,29 @@ static void vtpv_send_dbuf(AppleVtpv *s, int slot, uint64_t frame_id,
     }
     vtpv_pump_dbuf(s, slot, uuid16);
     vtpv_shed(s, s->cur);
+    {
+        /* q1375: frames piling up without asks - say which gate holds them */
+        VtpvSess *se = s->cur;
+        uint32_t waiting = 0;
+        int old = -1;
+        for (int i = 0; i < VTPV_FRAMES; i++) {
+            if (se->frame[i].in_use && !se->frame[i].dbuf_sent && !se->frame[i].shed) {
+                waiting++;
+                if (old < 0 || se->frame[i].seq < se->frame[old].seq) {
+                    old = i;
+                }
+            }
+        }
+        if (waiting >= 16 && !(waiting & (waiting - 1)) && old >= 0) {
+            lab_elog("apple-vtpv: pump-stall sess%d waiting=%u gate=%u dbuf_out=%u ask_hold=%d wait=%d "
+                     "ans_q=%u dpba=%ux%u oldest=%llu(q=%d d=%d smp=%d nv12=%d) rt=%d\n",
+                     (int)(se - s->sess), waiting, se->pump_gate, se->dbuf_out, se->ask_hold,
+                     se->pump_wait, g_queue_get_length(&s->ans_q), se->dpba_w, se->dpba_h,
+                     (unsigned long long)se->frame[old].frame_id, se->frame[old].queued,
+                     se->frame[old].decoded, se->frame[old].sample != NULL,
+                     se->frame[old].nv12 != NULL, se->realtime);
+        }
+    }
 }
 
 #define DBUF_GATE_COLD_WIN 6       /* cold answers per 5 s window to trip; the measured hidden
@@ -2344,7 +2376,12 @@ static void vtpv_gate_note_answer(AppleVtpv *s, VtpvSess *se, uint32_t surf0)
                     g_note, s->dbuf_gate_live, s->dbuf_gate);
         }
     }
-    if (!s->dbuf_gate) {
+    /* q1377: the hidden-layer signature belongs to a real-time player.  An
+     * export (avconvert: decoder -> encoder, ',dfl' never 1xRealTime) holds its
+     * buffers in the encoder, the pool answers cold surfaces, and the gate
+     * tripped ON for it - then nothing re-pumps an idle reader and the export
+     * deadlocked (q1375: 492 of 600 frames, then 300 s of nothing) */
+    if (!s->dbuf_gate || !se || !se->realtime) {
         return;
     }
     bool warm = false;
@@ -2496,6 +2533,9 @@ static void vtpv_pump_dbuf(AppleVtpv *s, int slot, const uint8_t *uuid16)
     s->cur = was;
 }
 
+/* q1375: the pump remembers where it stopped (pump_gate), for the stall log in vtpv_send_dbuf */
+#define VTPV_PUMP_GATE(k) do { se->pump_gate = (k); return; } while (0)
+
 static void vtpv_pump_dbuf_cur(AppleVtpv *s, int slot, const uint8_t *uuid16)
 {
     VtpvSess *se = s->cur;
@@ -2542,7 +2582,7 @@ static void vtpv_pump_dbuf_cur(AppleVtpv *s, int slot, const uint8_t *uuid16)
             }
         }
         if (next < 0) {
-            return;
+            VTPV_PUMP_GATE(1);
         }
         /* TEMP lab dno: the oldest waiting frame was asked not to be output -
          * decode it now, in decode order (every older frame is already queued
@@ -2576,10 +2616,10 @@ static void vtpv_pump_dbuf_cur(AppleVtpv *s, int slot, const uint8_t *uuid16)
             continue;
         }
         if (se->dbuf_out >= VTPV_DBUF_INFLIGHT) {
-            return;
+            VTPV_PUMP_GATE(2);
         }
         if (se->ask_hold) {
-            return;   /* 0005: the next dfrm (or the aged release) re-pumps */
+            VTPV_PUMP_GATE(3);   /* 0005: the next dfrm (or the aged release) re-pumps */
         }
         if (s->outbuf && !se->dpba_w && s->ans_async && s->decthread && s->dec_ahead &&
             (se->frame[next].sample || se->frame[next].queued)) {
@@ -2594,7 +2634,7 @@ static void vtpv_pump_dbuf_cur(AppleVtpv *s, int slot, const uint8_t *uuid16)
             if (!done) {
                 memcpy(se->pump_uuid, uuid16, 16);
                 se->pump_wait = true;
-                return;
+                VTPV_PUMP_GATE(4);
             }
         }
         if (s->outbuf && !se->dpba_w && s->ans_async && se->frame[next].nv12 && se->frame[next].w) {
@@ -2608,7 +2648,7 @@ static void vtpv_pump_dbuf_cur(AppleVtpv *s, int slot, const uint8_t *uuid16)
          * argument).  A decoded picture still asks - it completes at once */
         if (s->ans_async && s->decthread && !se->frame[next].nv12 &&
             g_queue_get_length(&s->ans_q) >= 16) {
-            return;
+            VTPV_PUMP_GATE(5);
         }
         /*
          * TEMP lab dec-ahead (Opus 10-28, q1200): the guest answers a 'Dbuf'
@@ -2639,7 +2679,7 @@ static void vtpv_pump_dbuf_cur(AppleVtpv *s, int slot, const uint8_t *uuid16)
             if (!ready && behind <= 3) {
                 memcpy(se->pump_uuid, uuid16, 16);
                 se->pump_wait = true;
-                return;
+                VTPV_PUMP_GATE(6);
             }
         }
         if (s->dec_pace_live) {
@@ -2668,16 +2708,16 @@ static void vtpv_pump_dbuf_cur(AppleVtpv *s, int slot, const uint8_t *uuid16)
                 timer_mod(s->pace_timer,
                           qemu_clock_get_us(QEMU_CLOCK_REALTIME) + s->pace_ivl_us / 4);
             }
-            return;
+            VTPV_PUMP_GATE(7);
         }
-        if (s->dbuf_gate && s->gate_on) {
+        if (s->dbuf_gate && s->gate_on && se->realtime) {
             /* hidden-like: throttle to ~8 'Dbuf'/s (the player degrades to a
              * hidden-tab cadence instead of freezing - v3's hard hold worked
              * but stalled the switch-back 824 ms; v4's probe-lift flapped on
              * the pool's recycled stock).  Lift = the clean window (v5). */
             int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
             if (now < s->gate_probe_us) {
-                return;
+                VTPV_PUMP_GATE(8);
             }
             s->gate_probe_us = now + DBUF_GATE_PROBE_US;
         }
@@ -2782,7 +2822,11 @@ static void vtpv_pace_tick(void *opaque)
  * up with the clock. */
 static void vtpv_shed(AppleVtpv *s, VtpvSess *se)
 {
-    if (!s->backlog || !s->decthread) {
+    /* q1374: only a real-time player may lose frames.  avconvert's export
+     * (',dfl' 0x9, never the 1xRealTimePlayback bit) feeds the decoder as fast
+     * as it reads and waits on the encoder - the backlog shed dropped 62 of
+     * its 600 frames and the movie writer never finished. */
+    if (!s->backlog || !s->decthread || !se->realtime) {
         return;
     }
     uint32_t waiting = 0;
@@ -4030,7 +4074,16 @@ static void vtpv_send_eemt(AppleVtpv *s, int slot, const uint8_t *uuid16,
      * ',sbf'; all but the last are flagged (flags & ~0x12) | 0x10, the last
      * keeps the plain flags.  Cutting one para stream across entries (85a)
      * was never reassembled - 0 acks for every 1080p frame. */
-    const uint32_t piece_max = 0x3800;   /* < 0x4000 (host) and one h2g entry */
+    /* q1373: a piece must fit an EMPTY ring wherever its head stands.  The
+     * producer cannot move head, so an entry E enters an empty ring at t only
+     * if qsize - t >= E or t > E (vtpv_dq_enqueue) - with 0x3800 pieces in the
+     * 16372 B ring every head in 2108..14400 refused them, and the 112 B efrm
+     * replies walked the head through that window in ~110 frames: avconvert's
+     * 42 KB 1080p samples piled up 515 entries deep and the export hung.  Half
+     * the ring minus the entry/para overhead fits at every head position. */
+    uint32_t ring = s->slot[slot].h2g_len > sizeof(struct io_dq_header)
+                    ? s->slot[slot].h2g_len - (uint32_t)sizeof(struct io_dq_header) : 0;
+    const uint32_t piece_max = MAX(0x400u, MIN(0x3800u, ring / 2 > 0x100 ? ring / 2 - 0x100 : 0));
     uint32_t off = 0, piece = MIN(sn, piece_max);
     n += vtpv_para_put(paras + n, 0x2c736266u /* ',sbf' */, "=sbf", sbuf, piece);
     off = piece;
@@ -7104,6 +7157,13 @@ static uint64_t vtpv_mmio_read(void *opaque, hwaddr addr, unsigned size)
         break;
     case VTPV_DEBUGVAL:
         v = s->debugval;
+        break;
+    case VTPV_OUTBOX_PEND ... VTPV_OUTBOX_PEND + 4 * VTPV_MAX_SLOT - 1:
+        /* Opus 10-30: entries this slot still has in the outbox - the kext's
+         * reply-sync holds a request's sender until ring AND outbox drained
+         * (a 1080p sample is pieces that wait here; releasing the sender at
+         * the first one let the next reply cut into the chain, q1371) */
+        v = g_queue_get_length(&s->slot[((addr - VTPV_OUTBOX_PEND) / 4) % VTPV_MAX_SLOT].outbox);
         break;
     default: {
         /* slot registers read back their stored values (the kext logs real GPAs) */
