@@ -1365,16 +1365,22 @@ static bool vtpv_send_h2g2(AppleVtpv *s, int slot, uint32_t type, uint32_t flags
      * para stream simply flows across entries.  Every entry carries the
      * full header; the non-final ones set flag 0x10 (partial - no reply
      * clerk is armed for them), the final one the real flags. */
+    /* Opus 10-30 (q1366): push_entry returns false when an entry goes to the
+     * outbox instead of straight into the ring - it is still queued, in
+     * order.  Stopping there dropped every chunk after the first: avconvert's
+     * 1080p frames (> 16 KB) reached the guest as a lone partial 'Eemt', none
+     * was ever acked, the decoder's pool drained and the export stalled
+     * (-16356, nothing written). */
     uint32_t off = 0;
-    bool ok = true;
-    while (ok && off < paras_len) {
+    bool straight = true;
+    while (off < paras_len) {
         uint32_t take = MIN(paras_len - off, VTPV_H2G_ENTRY_MAX - 0x30);
         uint32_t eflags = off + take < paras_len ? ((flags & ~1u) | 0x10u) : flags;
-        ok = vtpv_h2g_push_entry(s, slot, type, eflags, uuid16, id8,
-                                 paras + off, take);
+        straight &= vtpv_h2g_push_entry(s, slot, type, eflags, uuid16, id8,
+                                        paras + off, take);
         off += take;
     }
-    return ok;
+    return straight;
 }
 
 /* 'Dbuf': ask the guest to allocate this frame's output pixel buffer */
@@ -4011,14 +4017,37 @@ static void vtpv_send_eemt(AppleVtpv *s, int slot, const uint8_t *uuid16,
                        (uint8_t *)&be_err, 4);
     n += vtpv_para_put(paras + n, 0x2c65666cu /* ',efl' */, "=u32",
                        (uint8_t *)&be_efl, 4);
-    n += vtpv_para_put(paras + n, 0x2c736266u /* ',sbf' */, "=sbf", sbuf, sn);
     if (uui) {
         n += vtpv_para_put(paras + n, 0x2c757569u /* ',uui' */, "=uui", uui, 16);
     }
     s->host_msg_id++;
     uint8_t id8[8];
     stq_be_p(id8, s->host_msg_id);
-    vtpv_send_h2g(s, slot, 0x45656d74u /* 'Eemt' */, uuid16, id8, paras, n);
+    /* Opus 10-30 (q1367): a big sample goes the way VideoToolbox's host side
+     * sends it (0x7ff8155e1199..0x7ff8155e1359 in the 25A354 dsc): the first
+     * 'Eemt' carries ,frm/,err/,efl/,uui plus the first piece of the sample
+     * in its own ',sbf'; every further piece is a separate 'Eemt' holding only
+     * ',sbf'; all but the last are flagged (flags & ~0x12) | 0x10, the last
+     * keeps the plain flags.  Cutting one para stream across entries (85a)
+     * was never reassembled - 0 acks for every 1080p frame. */
+    const uint32_t piece_max = 0x3800;   /* < 0x4000 (host) and one h2g entry */
+    uint32_t off = 0, piece = MIN(sn, piece_max);
+    n += vtpv_para_put(paras + n, 0x2c736266u /* ',sbf' */, "=sbf", sbuf, piece);
+    off = piece;
+    if (off >= sn) {
+        vtpv_send_h2g(s, slot, 0x45656d74u /* 'Eemt' */, uuid16, id8, paras, n);
+    } else {
+        vtpv_h2g_push_entry(s, slot, 0x45656d74u, 0x11, uuid16, id8, paras, n);
+        uint8_t *pp = g_malloc(0x40 + piece_max);
+        while (off < sn) {
+            piece = MIN(sn - off, piece_max);
+            uint32_t pn = vtpv_para_put(pp, 0x2c736266u /* ',sbf' */, "=sbf", sbuf + off, piece);
+            off += piece;
+            vtpv_h2g_push_entry(s, slot, 0x45656d74u, off < sn ? 0x11 : 0x1, uuid16, id8,
+                                pp, pn);
+        }
+        g_free(pp);
+    }
     if (err == 0) {
         s->enc_emitted++;
     }

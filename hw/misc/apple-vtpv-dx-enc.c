@@ -550,12 +550,15 @@ static void dxe_sps_pps_nals(struct VtpvDxE *e, uint8_t *sps, uint32_t *sps_len,
     dxe_bw_ue(&b, (e->h + 15) / 16 - 1);
     dxe_bw_bit(&b, 1);                /* frame_mbs_only_flag */
     dxe_bw_bit(&b, 1);                /* direct_8x8_inference_flag */
-    if ((e->w & 15) || (e->h & 15)) { /* frame_cropping in luma samples */
+    if ((e->w & 15) || (e->h & 15)) {
+        /* frame_cropping offsets count CropUnitX/Y = 2 luma samples for
+         * 4:2:0 frame_mbs_only (7.4.2.1.1) - Opus 10-30 (q1363): written in
+         * plain samples, 1080 lines cropped 16 and decoded as 1072 */
         dxe_bw_bit(&b, 1);
         dxe_bw_ue(&b, 0);
-        dxe_bw_ue(&b, ((e->w + 15) / 16) * 16 - e->w);   /* right */
+        dxe_bw_ue(&b, (((e->w + 15) / 16) * 16 - e->w) / 2);   /* right */
         dxe_bw_ue(&b, 0);
-        dxe_bw_ue(&b, ((e->h + 15) / 16) * 16 - e->h);   /* bottom */
+        dxe_bw_ue(&b, (((e->h + 15) / 16) * 16 - e->h) / 2);   /* bottom */
     } else {
         dxe_bw_bit(&b, 0);
     }
