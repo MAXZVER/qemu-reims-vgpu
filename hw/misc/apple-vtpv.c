@@ -122,6 +122,7 @@ typedef struct VtpvSess {
     uint64_t ask_hold_us;          /* 0005: when the hold was set (aged release) */
     uint32_t shed_n;                /* frames shed and not completed yet */
     uint8_t pump_gate;              /* q1375: which exit of vtpv_pump_dbuf_cur ran last */
+    bool async_seen;                /* q1376: a 'dfrm' asked kVTDecodeFrame_EnableAsynchronousDecompression */
     bool realtime;                  /* a 'dfrm' carried kVTDecodeFrame_1xRealTimePlayback
                                    * (',dfl' bit 2): a player - only these shed */
     uint32_t pace_warm, pace_cold; /* diag: recycled vs fresh answer surfaces */
@@ -2287,6 +2288,7 @@ static void vtpv_send_dbuf(AppleVtpv *s, int slot, uint64_t frame_id,
     s->cur->frame[free_i].decoded = false;
     s->cur->frame[free_i].shed = false;
         s->cur->frame[free_i].dno = s->dno && s->decthread && (s->cur_dfl & (1u << 1));
+        s->cur->async_seen |= (s->cur_dfl & 1u) != 0;
         if ((s->cur_dfl & (1u << 2)) && !s->cur->realtime) {
             s->cur->realtime = true;
             lab_elog("apple-vtpv: sess%d real-time playback from frame %llu (dfl 0x%x) - backlog shed on\n",
@@ -2822,18 +2824,25 @@ static void vtpv_pace_tick(void *opaque)
  * up with the clock. */
 static void vtpv_shed(AppleVtpv *s, VtpvSess *se)
 {
-    /* q1374: only a real-time player may lose frames.  avconvert's export
-     * (',dfl' 0x9, never the 1xRealTimePlayback bit) feeds the decoder as fast
-     * as it reads and waits on the encoder - the backlog shed dropped 62 of
-     * its 600 frames and the movie writer never finished. */
-    if (!s->backlog || !s->decthread || !se->realtime) {
+    /* q1374/q1376: frames may be lost only where a player would drop them
+     * itself.  avconvert's export (',dfl' 0x9, never 1xRealTimePlayback) feeds
+     * the decoder as fast as it reads while its answers keep flowing - the
+     * shed dropped 62 of its 600 frames and the writer never finished.  The
+     * 4K Aerial wallpaper (the shed's reason, q1199) decodes synchronously
+     * (',dfl' 0x0) and answers at its display rate while it feeds far ahead:
+     * 512 waiting per session in q1376 without the shed; the export never had
+     * 16 waiting (q1377).  So: real-time and synchronous sessions shed at the
+     * backlog; an asynchronous non-real-time one only past 64 (a safety net
+     * for the frame table, never reached by avconvert). */
+    if (!s->backlog || !s->decthread) {
         return;
     }
+    uint32_t cap = (se->realtime || !se->async_seen) ? s->backlog : MAX(s->backlog, 64u);
     uint32_t waiting = 0;
     for (int i = 0; i < VTPV_FRAMES; i++) {
         waiting += se->frame[i].in_use && !se->frame[i].dbuf_sent && !se->frame[i].shed;
     }
-    while (waiting > s->backlog) {
+    while (waiting > cap) {
         int old = -1;
         for (int i = 0; i < VTPV_FRAMES; i++) {
             if (se->frame[i].in_use && !se->frame[i].dbuf_sent && !se->frame[i].shed &&
