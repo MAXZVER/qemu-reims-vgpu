@@ -2,9 +2,9 @@
  * TEMP (lab): apple-vtpv-dx-enc.c - D3D12 Video Encode backend for the VTPV
  * device's ENCODE side (Zcode, task77, 30-10).  H.264 first, on the NVIDIA
  * adapter by default ("nv", the RTX 4060 of the Intel stand) or the Intel
- * iGPU ("int"), NV12 in host memory, Annex-B bytes out (SPS/PPS+IDR per
- * frame while the GOP is 1 - every sample self-contained, which is exactly
- * what the first end-to-end frame needs).
+ * iGPU ("int"), NV12 in host memory, AVCC bytes out (task83: [BE32 len]
+ * [NAL]..., parameter sets first - exactly what the device's 'Eemt' sample
+ * wants; GOP 1 keeps every sample self-contained).
  *
  * All signatures checked against C:/msys64/ucrt64/include/d3d12video.h
  * (the task65 header lesson): CreateVideoEncoder/CreateVideoEncoderHeap on
@@ -63,23 +63,97 @@ struct VtpvDxE {
      * in open() and the recording in encode() use the SAME instances */
     D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_H264 gop;
     D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264 cc;
-    D3D12_VIDEO_ENCODER_RATE_CONTROL_CBR cbr;
+    D3D12_VIDEO_ENCODER_RATE_CONTROL_VBR vbr;
     D3D12_VIDEO_ENCODER_RATE_CONTROL rc;
     UINT64 bits_cap, meta_cap;
     UINT frame;
+    int counted;                   /* task83: in the live-encoder census */
+    int rc_dirty;                  /* task85b: set_rate ran - the next frame
+                                    * submits RATE_CONTROL_CHANGE */
+    CRITICAL_SECTION rate_cs;      /* task85b: the device's kick thread
+                                    * retargets while the worker records */
 };
+
+/* task83: the census counter - Interlocked, so the encode worker's closes
+ * race nothing (apple-vtpv.c prints it in the vtpv_handles line). */
+static LONG volatile dxe_open_n;
+
+int vtpv_dxe_open_count(void)
+{
+    return (int)dxe_open_n;
+}
+
+/* task85b: the session retargets its rate between frames.  0 keeps each
+ * value; peak 0 tracks 2x target.  The next encode() submits the change
+ * with D3D12_VIDEO_ENCODER_SEQUENCE_CONTROL_FLAG_RATE_CONTROL_CHANGE. */
+void vtpv_dxe_set_rate(VtpvDxE *eh, uint64_t bitrate, uint64_t peak, uint32_t fps)
+{
+    struct VtpvDxE *e = (struct VtpvDxE *)eh;
+    if (!e || !e->enc) {
+        return;
+    }
+    if (!fps) {
+        fps = e->rc.TargetFrameRate.Numerator ? e->rc.TargetFrameRate.Numerator : 30;
+    }
+    EnterCriticalSection(&e->rate_cs);
+    if (bitrate) {
+        e->vbr.TargetAvgBitRate = bitrate;
+        if (!peak) {
+            e->vbr.PeakBitRate = bitrate * 2;
+        }
+        e->vbr.VBVCapacity = e->vbr.TargetAvgBitRate * 2 / fps;
+        e->vbr.InitialVBVFullness = e->vbr.TargetAvgBitRate / fps;
+    }
+    if (peak) {
+        e->vbr.PeakBitRate = peak;
+    }
+    e->rc.TargetFrameRate.Numerator = fps;
+    e->rc.TargetFrameRate.Denominator = 1;
+    e->rc_dirty = 1;
+    LeaveCriticalSection(&e->rate_cs);
+}
+
+uint64_t vtpv_dxe_target(VtpvDxE *eh)
+{
+    struct VtpvDxE *e = (struct VtpvDxE *)eh;
+    return e && e->enc ? e->vbr.TargetAvgBitRate : 0;
+}
+
+uint32_t vtpv_dxe_fps(VtpvDxE *eh)
+{
+    struct VtpvDxE *e = (struct VtpvDxE *)eh;
+    return e && e->enc ? e->rc.TargetFrameRate.Numerator : 0;
+}
 
 static UINT dxe_align(UINT v, UINT a)
 {
     return (v + a - 1) & ~(a - 1);
 }
 
+/* task85: the GOP structure lives HERE and nowhere else - intra-only while
+ * the encoder runs NULL-recon (no references: every frame an IDR, every
+ * sample self-contained).  When the reference wiring lands, this is the one
+ * place that turns into a real GOP. */
+static D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_H264 dxe_gop_cfg(void)
+{
+    return (D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_H264){
+        .GOPLength = 1, .PPicturePeriod = 0,
+        .pic_order_cnt_type = 0,
+        /* task81: minus4 = 4 (256 frame_num/POC-lsb values) - with 0 the
+         * raw FrameDecodingOrderNumber outgrew the 16-value field at
+         * frame 16 and the recording turned invalid */
+        .log2_max_frame_num_minus4 = 4,
+        .log2_max_pic_order_cnt_lsb_minus4 = 4,
+    };
+}
+
 VtpvDxE *vtpv_dxe_open(const char *gpu, uint32_t w, uint32_t h,
                        uint32_t fps, uint32_t bitrate)
 {
     struct VtpvDxE *e = calloc(1, sizeof(*e));
-    (void)fps;
-    (void)bitrate;                    /* CBR fixed inside encode() for v1 */
+    if (!fps) {
+        fps = 30;                     /* task85: the args are honored now */
+    }
     if (!e) {
         return NULL;
     }
@@ -146,33 +220,32 @@ VtpvDxE *vtpv_dxe_open(const char *gpu, uint32_t w, uint32_t h,
      * (no d3d12SDKLayers.dll).  ValidationFlags name the exact broken field;
      * the query mirrors what encode() submits by construction (shared
      * session structs). */
-    e->gop = (D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_H264){
-        .GOPLength = 1, .PPicturePeriod = 0,
-        .pic_order_cnt_type = 0,
-        /* task81: minus4 = 4 (256 frame_num/POC-lsb values) - with 0 the
-         * raw FrameDecodingOrderNumber outgrew the 16-value field at
-         * frame 16 and the recording turned invalid */
-        .log2_max_frame_num_minus4 = 4,
-        .log2_max_pic_order_cnt_lsb_minus4 = 4,
-    };
+    e->gop = dxe_gop_cfg();
     e->cc = (D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264){
         .ConfigurationFlags = D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_FLAG_ENABLE_CABAC_ENCODING,
         .DirectModeConfig = D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_DIRECT_MODES_DISABLED,
         .DisableDeblockingFilterConfig =
             D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_SLICES_DEBLOCKING_MODE_FLAG_0_ALL_LUMA_CHROMA_SLICE_BLOCK_EDGES_ALWAYS_FILTERED,
     };
-    e->cbr = (D3D12_VIDEO_ENCODER_RATE_CONTROL_CBR){
+    /* task85: VBR by default - target ~= 0.1 bit/pixel/frame (1080p30
+     * ~6 Mbit/s, a 5K screen recording scales along), peak 2x,
+     * MaxFrameBitSize one bit per pixel: an IDR of hard content fits, and
+     * the chunked 'Eemt' (apple-vtpv.c) carries any frame now.  No starved
+     * default: the rate a session asks for rides on top of this ('eprp'). */
+    UINT64 dxe_target = bitrate ? bitrate : (UINT64)w * h * fps / 10;
+    e->vbr = (D3D12_VIDEO_ENCODER_RATE_CONTROL_VBR){
         .InitialQP = 26, .MinQP = 1, .MaxQP = 51,
-        .MaxFrameBitSize = 400000,      /* ~3x the CBR per-frame budget */
-        .TargetBitRate = 4000000,
-        .VBVCapacity = 1000000,
-        .InitialVBVFullness = 750000,
+        .MaxFrameBitSize = (UINT64)w * h,
+        .TargetAvgBitRate = dxe_target,
+        .PeakBitRate = dxe_target * 2,
+        .VBVCapacity = dxe_target * 2 / fps,
+        .InitialVBVFullness = dxe_target / fps,
     };
     e->rc = (D3D12_VIDEO_ENCODER_RATE_CONTROL){
-        .Mode = D3D12_VIDEO_ENCODER_RATE_CONTROL_MODE_CBR,
+        .Mode = D3D12_VIDEO_ENCODER_RATE_CONTROL_MODE_VBR,
         .Flags = D3D12_VIDEO_ENCODER_RATE_CONTROL_FLAG_NONE,
-        .ConfigParams = { .DataSize = sizeof(e->cbr), .pConfiguration_CBR = &e->cbr },
-        .TargetFrameRate = { 30, 1 },
+        .ConfigParams = { .DataSize = sizeof(e->vbr), .pConfiguration_VBR = &e->vbr },
+        .TargetFrameRate = { fps, 1 },
     };
     {
         D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_DESC sup_res = { w, h };
@@ -302,7 +375,7 @@ VtpvDxE *vtpv_dxe_open(const char *gpu, uint32_t w, uint32_t h,
         .SampleDesc = { 1, 0 },
         /* task79: the input texture crosses queues via the COMMON-state
          * handoff (COPY -> ENCODE); textures need this flag for that */
-        .Flags = getenv("DXE_NO_SIMUL") ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,  /* TEMP bisect */
+        .Flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
     };
     /* task78: NV12 is planar - the upload layout IS the copyable footprints
      * of the two subresources, and the copy records one
@@ -357,6 +430,9 @@ VtpvDxE *vtpv_dxe_open(const char *gpu, uint32_t w, uint32_t h,
         return NULL;
     }
     e->frame = 0;
+    e->counted = 1;
+    InitializeCriticalSection(&e->rate_cs);
+    InterlockedIncrement(&dxe_open_n);
     fprintf(stderr, "vtpv-dx-enc: open %ux%u bits_cap=%llu meta_cap=%llu\n",
             w, h, (unsigned long long)e->bits_cap, (unsigned long long)e->meta_cap);
     return e;
@@ -367,8 +443,9 @@ VtpvDxE *vtpv_dxe_open(const char *gpu, uint32_t w, uint32_t h,
  * session config exactly: profile High + CABAC, level 52, 4:2:0,
  * log2_max_frame_num/pic_order_cnt_lsb minus4 = 4, max_num_ref_frames 1,
  * MB dims + luma crop for non-mod16 heights, deblocking-control present.
- * Annex-B out: [start code][SPS][start code][PPS]; the guest delivery
- * (3b glue) converts to AVCC lengths + avcC. */
+ * task83: the writer emits the two RAW NALs (rbsp + emulation prevention,
+ * no start codes) - the AVCC sample prefixes each with a BE32 length and
+ * vtpv_dxe_avcc packs them into the guest's avcC. */
 struct dxe_bw {
     uint8_t *buf;
     uint32_t cap, len;
@@ -438,10 +515,18 @@ static uint32_t dxe_epb(const uint8_t *src, uint32_t len, uint8_t *dst, uint32_t
     return n;
 }
 
-static uint32_t dxe_write_sps_pps(struct VtpvDxE *e, uint8_t *out, uint32_t cap)
+static void dxe_be32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v >> 24);
+    p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);
+    p[3] = (uint8_t)v;
+}
+
+static void dxe_sps_pps_nals(struct VtpvDxE *e, uint8_t *sps, uint32_t *sps_len,
+                             uint8_t *pps, uint32_t *pps_len)
 {
     uint8_t rbsp[64];
-    uint32_t total = 0;
     struct dxe_bw b = { rbsp, sizeof(rbsp), 0, 0 };
     dxe_bw_bits(&b, 0x67, 8);         /* NAL: ref_idc 3, type 7 (SPS) */
     /* task82: H.264 7.3.2.1 - profile/constraints/level come BEFORE
@@ -476,9 +561,7 @@ static uint32_t dxe_write_sps_pps(struct VtpvDxE *e, uint8_t *out, uint32_t cap)
     }
     dxe_bw_bit(&b, 0);                /* vui_parameters_present */
     dxe_bw_rbsp_trailing(&b);
-
-    memcpy(out, "\x00\x00\x00\x01", 4);
-    total = 4 + dxe_epb(rbsp, b.len, out + 4, cap - 4);
+    *sps_len = dxe_epb(rbsp, b.len, sps, 64);
 
     b = (struct dxe_bw){ rbsp, sizeof(rbsp), 0, 0 };
     dxe_bw_bits(&b, 0x68, 8);         /* NAL: ref_idc 3, type 8 (PPS) */
@@ -498,10 +581,75 @@ static uint32_t dxe_write_sps_pps(struct VtpvDxE *e, uint8_t *out, uint32_t cap)
     dxe_bw_bit(&b, 0);                /* constrained_intra_pred */
     dxe_bw_bit(&b, 0);                /* redundant_pic_cnt_present */
     dxe_bw_rbsp_trailing(&b);
+    *pps_len = dxe_epb(rbsp, b.len, pps, 64);
+}
 
-    memcpy(out + total, "\x00\x00\x00\x01", 4);
-    total += 4 + dxe_epb(rbsp, b.len, out + total + 4, cap - total - 4);
-    return total;
+/* task83: the encoder writes Annex-B (start codes); AVCC wants every NAL
+ * behind a BE32 length.  A properly terminated NAL never ends in 0x00 (the
+ * rbsp stop bit), so trailing zeros are safe to trim. */
+static bool dxe_annexb_to_avcc(const uint8_t *src, uint32_t n, uint8_t *dst,
+                               uint32_t cap, uint32_t *out_len)
+{
+    uint32_t o = 0, i = 0;
+    while (i + 3 <= n) {
+        if (!(src[i] == 0 && src[i + 1] == 0 && src[i + 2] == 1)) {
+            i++;
+            continue;
+        }
+        uint32_t nal = i + 3, len = 0;
+        for (uint32_t k = nal; k < n; k++) {
+            if (k + 2 < n && src[k] == 0 && src[k + 1] == 0 && src[k + 2] == 1) {
+                break;
+            }
+            len++;
+        }
+        while (len && src[nal + len - 1] == 0) {
+            len--;
+        }
+        if (len == 0 || o + 4 + len > cap) {
+            return false;
+        }
+        dxe_be32(dst + o, len);
+        memcpy(dst + o + 4, src + nal, len);
+        o += 4 + len;
+        i = nal + len;
+    }
+    *out_len = o;
+    return o > 0;
+}
+
+/* task83: the avcC record for the guest's format description -
+ * [1, 100, 0, 52, 0xff, 0xe1, <SPS>, 1, <PPS>], exactly the shape on the
+ * wire (vtpv-msgs.log.dxfail0: 01 64 00 0b ff e1 ...). */
+int vtpv_dxe_avcc(VtpvDxE *eh, uint8_t *out, uint32_t cap)
+{
+    struct VtpvDxE *e = (struct VtpvDxE *)eh;
+    if (!e) {
+        return -1;
+    }
+    uint8_t sn[64], pn[64];
+    uint32_t slen = 0, plen = 0;
+    dxe_sps_pps_nals(e, sn, &slen, pn, &plen);
+    if (slen + plen + 11u > cap) {
+        return -1;
+    }
+    uint32_t n = 0;
+    out[n++] = 1;                    /* configurationVersion */
+    out[n++] = 100;                  /* AVCProfileIndication: High */
+    out[n++] = 0;                    /* profile_compat / constraint flags */
+    out[n++] = 52;                   /* AVCLevelIndication: 5.2 */
+    out[n++] = 0xff;                 /* lengthSizeMinusOne = 3 (4-byte prefixes) */
+    out[n++] = 0xe1;                 /* one sequence parameter set */
+    out[n++] = (uint8_t)(slen >> 8);
+    out[n++] = (uint8_t)slen;
+    memcpy(out + n, sn, slen);
+    n += slen;
+    out[n++] = 1;                    /* one picture parameter set */
+    out[n++] = (uint8_t)(plen >> 8);
+    out[n++] = (uint8_t)plen;
+    memcpy(out + n, pn, plen);
+    n += plen;
+    return (int)n;
 }
 
 int vtpv_dxe_encode(VtpvDxE *eh, const uint8_t *y, uint32_t y_stride,
@@ -574,16 +722,9 @@ int vtpv_dxe_encode(VtpvDxE *eh, const uint8_t *y, uint32_t y_stride,
     /* 3. per-frame control: the session's config (the SUPPORT query ran
      * against these very instances); GOP-1/32 per the auto-fix, always IDR
      * via pic.FrameType so every sample stays self-contained */
-    /* task82: the full reference set - USED_AS_REFERENCE_PICTURE with one
-     * DPB slot (recon array slice 0); if this still fails Close, the
-     * DXE_NO_RECON NULL-recon path is the 3b ship (intra-only works) */
-    D3D12_VIDEO_ENCODER_REFERENCE_PICTURE_DESCRIPTOR_H264 refd = {
-        .ReconstructedPictureResourceIndex = 0,
-        .IsLongTermReference = FALSE,
-        .PictureOrderCountNumber = (e->frame * 2u) & 0xffu,
-        .FrameDecodingOrderNumber = e->frame & 0xffu,
-        .TemporalLayerIndex = 0,
-    };
+    /* task83: NULL-recon is THE path (q1341: 30/30 frames, ffmpeg clean) -
+     * intra-only; the reference set stays behind VTPV_DX_ENC_RECON until a
+     * Close-safe wiring for it is found */
     D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_H264 pic = {
         .FrameType = D3D12_VIDEO_ENCODER_FRAME_TYPE_H264_IDR_FRAME,
         /* wrap inside log2_max_frame_num/pic_order_cnt_lsb (8 bits with
@@ -592,16 +733,36 @@ int vtpv_dxe_encode(VtpvDxE *eh, const uint8_t *y, uint32_t y_stride,
         .FrameDecodingOrderNumber = e->frame & 0xffu,
         .List0ReferenceFramesCount = 0,
         .List1ReferenceFramesCount = 0,
-        .ReferenceFramesReconPictureDescriptorsCount = getenv("DXE_NO_RECON") ? 0 : 1,
-        .pReferenceFramesReconPictureDescriptors = getenv("DXE_NO_RECON") ? NULL : &refd,
+    };
+    D3D12_VIDEO_ENCODER_PICTURE_CONTROL_DESC pd = {
+        .Flags = D3D12_VIDEO_ENCODER_PICTURE_CONTROL_FLAG_NONE,
+        .PictureControlCodecData = { .DataSize = sizeof(pic), .pH264PicData = &pic },
+        .ReferenceFrames = { 0, NULL, NULL },
+    };
+#ifdef VTPV_DX_ENC_RECON
+    D3D12_VIDEO_ENCODER_REFERENCE_PICTURE_DESCRIPTOR_H264 refd = {
+        .ReconstructedPictureResourceIndex = 0,
+        .IsLongTermReference = FALSE,
+        .PictureOrderCountNumber = (e->frame * 2u) & 0xffu,
+        .FrameDecodingOrderNumber = e->frame & 0xffu,
+        .TemporalLayerIndex = 0,
     };
     ID3D12Resource *recon_arr[1] = { e->recon };
-    D3D12_VIDEO_ENCODER_PICTURE_CONTROL_DESC pd = {
-        .Flags = getenv("DXE_NO_RECON") ? D3D12_VIDEO_ENCODER_PICTURE_CONTROL_FLAG_NONE : D3D12_VIDEO_ENCODER_PICTURE_CONTROL_FLAG_USED_AS_REFERENCE_PICTURE,
-        .PictureControlCodecData = { .DataSize = sizeof(pic), .pH264PicData = &pic },
-        .ReferenceFrames = { getenv("DXE_NO_RECON") ? 0 : 1, getenv("DXE_NO_RECON") ? NULL : recon_arr, NULL },
-    };
+    pic.ReferenceFramesReconPictureDescriptorsCount = 1;
+    pic.pReferenceFramesReconPictureDescriptors = &refd;
+    pd.Flags = D3D12_VIDEO_ENCODER_PICTURE_CONTROL_FLAG_USED_AS_REFERENCE_PICTURE;
+    pd.ReferenceFrames.NumTexture2Ds = 1;
+    pd.ReferenceFrames.ppTexture2Ds = recon_arr;
+#endif
+    /* task85b: a retarget ('eset'/'emul') rides the sequence-control change
+     * flag; the rate structs are shared with the kick-thread setter, so the
+     * recording holds rate_cs through Close (EncodeFrame reads the config
+     * while recording). */
+    uint32_t sqf = e->rc_dirty ? D3D12_VIDEO_ENCODER_SEQUENCE_CONTROL_FLAG_RATE_CONTROL_CHANGE
+                               : D3D12_VIDEO_ENCODER_SEQUENCE_CONTROL_FLAG_NONE;
+    EnterCriticalSection(&e->rate_cs);
     D3D12_VIDEO_ENCODER_SEQUENCE_CONTROL_DESC sq = {
+        .Flags = sqf,
         .RateControl = e->rc,
         .PictureTargetResolution = { e->w, e->h },
         .SelectedLayoutMode = D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_FULL_FRAME,
@@ -615,7 +776,7 @@ int vtpv_dxe_encode(VtpvDxE *eh, const uint8_t *y, uint32_t y_stride,
     };
     D3D12_VIDEO_ENCODER_ENCODEFRAME_OUTPUT_ARGUMENTS oa = {
         .Bitstream = { .pBuffer = e->bits, .FrameStartOffset = 0 },
-        .ReconstructedPicture = { .pReconstructedPicture = getenv("DXE_NO_RECON") ? NULL : e->recon },  /* TEMP bisect */
+        .ReconstructedPicture = { .pReconstructedPicture = NULL },
         .EncoderOutputMetadata = { .pBuffer = e->hwmeta, .Offset = 0 },
     };
 
@@ -648,9 +809,7 @@ int vtpv_dxe_encode(VtpvDxE *eh, const uint8_t *y, uint32_t y_stride,
     };
     ID3D12VideoEncodeCommandList2_Reset(e->cl, e->alloc);
     ID3D12VideoEncodeCommandList2_ResourceBarrier(e->cl, nb, bar);
-    if (!getenv("DXE_SKIP_ENCODE")) {   /* TEMP bisect (Opus 10-30) */
-        ID3D12VideoEncodeCommandList2_EncodeFrame(e->cl, e->enc, e->heap, &ia, &oa);
-    }
+    ID3D12VideoEncodeCommandList2_EncodeFrame(e->cl, e->enc, e->heap, &ia, &oa);
     /* Opus 10-30 (dxeprobe rc -5 = Close failed): ResolveEncoderOutputMetadata
      * reads the hardware metadata in VIDEO_ENCODE_READ and writes the resolved
      * buffer in VIDEO_ENCODE_WRITE; everything else goes back to COMMON. */
@@ -674,9 +833,7 @@ int vtpv_dxe_encode(VtpvDxE *eh, const uint8_t *y, uint32_t y_stride,
     D3D12_VIDEO_ENCODER_RESOLVE_METADATA_OUTPUT_ARGUMENTS ro = {
         .ResolvedLayoutMetadata = { .pBuffer = e->rmeta, .Offset = 0 },
     };
-    if (!getenv("DXE_SKIP_RESOLVE")) {   /* TEMP bisect (Opus 10-30) */
-        ID3D12VideoEncodeCommandList2_ResolveEncoderOutputMetadata(e->cl, &ri, &ro);
-    }
+    ID3D12VideoEncodeCommandList2_ResolveEncoderOutputMetadata(e->cl, &ri, &ro);
     D3D12_RESOURCE_BARRIER rb2_[2] = {
         DXE_T(e->hwmeta, D3D12_RESOURCE_STATE_VIDEO_ENCODE_READ, D3D12_RESOURCE_STATE_COMMON),
         DXE_T(e->rmeta, D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE, D3D12_RESOURCE_STATE_COMMON),
@@ -685,8 +842,11 @@ int vtpv_dxe_encode(VtpvDxE *eh, const uint8_t *y, uint32_t y_stride,
 #undef DXE_T
 
     if (FAILED(ID3D12VideoEncodeCommandList2_Close(e->cl))) {
+        LeaveCriticalSection(&e->rate_cs);
         return -5;
     }
+    e->rc_dirty = 0;      /* the change is recorded into this command list */
+    LeaveCriticalSection(&e->rate_cs);
     cll = (ID3D12CommandList *)e->cl;
     ID3D12CommandQueue_ExecuteCommandLists(e->q, 1, &cll);
     e->fence_val++;
@@ -717,16 +877,34 @@ int vtpv_dxe_encode(VtpvDxE *eh, const uint8_t *y, uint32_t y_stride,
     if (FAILED(ID3D12Resource_Map(e->bits, 0, &rng, (void **)&srcb))) {
         return -9;
     }
-    /* task81: SPS/PPS ahead of every sample (GOP 1 = all IDR) */
-    uint8_t hdr[128];
-    uint32_t hlen = dxe_write_sps_pps(e, hdr, sizeof(hdr));
-    if ((uint64_t)hlen + written > out_cap) {
-        written = out_cap > hlen ? out_cap - hlen : 0;
+    /* task83: AVCC out - [BE32 len][NAL]..., SPS/PPS first so every sample
+     * is self-contained (GOP 1 = all IDR).  The D3D12 bitstream is Annex-B;
+     * its start codes become the length prefixes. */
+    uint8_t hdr[136];
+    uint32_t hlen = 0;
+    {
+        uint8_t sn[64], pn[64];
+        uint32_t slen = 0, plen = 0;
+        dxe_sps_pps_nals(e, sn, &slen, pn, &plen);
+        dxe_be32(hdr + hlen, slen);
+        hlen += 4;
+        memcpy(hdr + hlen, sn, slen);
+        hlen += slen;
+        dxe_be32(hdr + hlen, plen);
+        hlen += 4;
+        memcpy(hdr + hlen, pn, plen);
+        hlen += plen;
+    }
+    uint32_t body = 0;
+    if (!dxe_annexb_to_avcc(srcb, (uint32_t)written, out + hlen, out_cap - hlen,
+                            &body)) {
+        ID3D12Resource_Unmap(e->bits, 0, NULL);
+        fprintf(stderr, "vtpv-dx-enc: frame %u AVCC convert failed\n", e->frame);
+        return -10;
     }
     memcpy(out, hdr, hlen);
-    memcpy(out + hlen, srcb, (size_t)written);
     ID3D12Resource_Unmap(e->bits, 0, NULL);
-    *out_len = hlen + (uint32_t)written;
+    *out_len = hlen + body;
     e->frame++;
     return 0;
 }
@@ -739,6 +917,12 @@ void vtpv_dxe_close(VtpvDxE *eh)
     }
     if (e->frame) {
         fprintf(stderr, "vtpv-dx-enc: close after %u frames\n", e->frame);
+    }
+    if (e->counted) {
+        InterlockedDecrement(&dxe_open_n);
+    }
+    if (e->rate_cs.DebugInfo) {
+        DeleteCriticalSection(&e->rate_cs);
     }
     if (e->upload) ID3D12Resource_Release(e->upload);
     if (e->tex) ID3D12Resource_Release(e->tex);

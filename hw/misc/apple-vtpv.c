@@ -145,6 +145,15 @@ typedef struct VtpvSess {
     uint32_t dx_cfg_len;
     uint8_t dx_api;                 /* VTPV_API_*: the decoder this session moved to */
     VtpvDxSink dx_sink;
+    /* task83: the session's D3D12 encoder - opened at its 'esta' dims, one
+     * per session, closed as a job on the encode worker ('-enc'/'einv' or
+     * teardown; never from the caller's context - it may be mid-encode) */
+    VtpvDxE *dxe;
+    uint32_t dxe_w, dxe_h;          /* the dims it was opened with */
+    uint32_t enc_cod;               /* '+enc' codec fourcc ('avc1'), 0 = none */
+    bool efds_sent;                 /* the format description went out */
+    uint8_t dxe_avcc[64];           /* its avcC, built at open */
+    uint32_t dxe_avcc_len;
 } VtpvSess;
 
 /* the decoders a session tries, in order: the GPU's D3D12 Video (Intel by
@@ -260,7 +269,7 @@ struct AppleVtpv {
      * refusal until the host encoder backend exists */
     bool enc;
     char *reply_encs;               /* bplist overriding the built-in ',enc' payload */
-    uint32_t enc_seen[10];          /* first-paras logging, one slot per encode type */
+    uint32_t enc_seen[16];          /* first-paras logging, one slot per encode type */
     uint32_t encs_fcc;              /* task75: the live encode session's ',cod' fourcc */
     char *reply_plusdec;            /* stage-2: file whose bytes answer '+dec' */
     char *reply_generic;            /* stage-3: ',ver'+',err' template for any other sync
@@ -302,6 +311,15 @@ struct AppleVtpv {
     } dec_job[VTPV_SESS * VTPV_DBUF_INFLIGHT];
     uint32_t dec_head, dec_n;
     VtpvSess *dec_busy;             /* session the thread is decoding for */
+    /* task83: the encode worker - one thread, jobs from every encoder
+     * session in arrival order; results leave on enc_bh (BQL) */
+    QemuThread enc_thread;
+    QemuMutex enc_lock;
+    QemuCond enc_cond;
+    GQueue enc_q, enc_done;
+    bool enc_busy;                  /* the worker holds a job (under enc_lock) */
+    QEMUBH *enc_bh;
+    uint64_t enc_accepted, enc_emitted;
     const uint8_t *ob_sample;       /* this dfrm's sample (inside msg) for vtpv_send_dbuf */
     uint32_t ob_sample_len;
     bool ob_first;                  /* this dfrm's picture was decoded in place (stream start) */
@@ -1288,11 +1306,12 @@ static uint32_t vtpv_pba_plist(uint8_t *out, uint32_t w, uint32_t h, uint32_t pi
     return n + 32;
 }
 
-static bool vtpv_send_h2g2(AppleVtpv *s, int slot, uint32_t type, uint32_t flags,
-                           const uint8_t *uuid16, const uint8_t *id8,
-                           uint8_t *paras, uint32_t paras_len)
+/* one host->guest entry: the 'vtpv' header + payload, msglog mirror, push */
+static bool vtpv_h2g_push_entry(AppleVtpv *s, int slot, uint32_t type, uint32_t flags,
+                                const uint8_t *uuid16, const uint8_t *id8,
+                                const uint8_t *data, uint32_t len)
 {
-    uint8_t *buf = g_malloc0(0x30 + paras_len);
+    uint8_t *buf = g_malloc0(0x30 + len);
     stl_be_p(buf, 0x30);                     /* 'vtpv' atom size, not total */
     memcpy(buf + 4, "vtpv", 4);
     stl_be_p(buf + 8, type);
@@ -1300,8 +1319,8 @@ static bool vtpv_send_h2g2(AppleVtpv *s, int slot, uint32_t type, uint32_t flags
                                           * nA27), 4 = reply */
     memcpy(buf + 0x10, uuid16, 16);
     memcpy(buf + 0x20, id8, 8);
-    if (paras_len) {
-        memcpy(buf + 0x30, paras, paras_len);
+    if (len) {
+        memcpy(buf + 0x30, data, len);
     }
     {
         /* mirror every outgoing host->guest message into the msglog so the
@@ -1312,16 +1331,44 @@ static bool vtpv_send_h2g2(AppleVtpv *s, int slot, uint32_t type, uint32_t flags
             vtpv_log4cc(t4, type);
             fprintf(f, "=== OUT slot=%d time=%lld size=%llu type=%s\n", slot,
                     (long long)qemu_clock_get_ns(QEMU_CLOCK_REALTIME),
-                    (unsigned long long)(0x30 + paras_len), t4);
-            vtpv_hex(f, buf, 0x30 + paras_len);
+                    (unsigned long long)(0x30 + len), t4);
+            vtpv_hex(f, buf, 0x30 + len);
             fprintf(f, "\n");
             fclose(f);
         }
     }
     /* flags 4 = a reply (the 'dtil' reply): it passes the queue like the template replies */
-    bool ok = vtpv_dq_push2(s, slot, buf, 0x30 + paras_len, flags == 4);
+    bool ok = vtpv_dq_push2(s, slot, buf, 0x30 + len, flags == 4);
     vtpv_raise(s, slot);
     g_free(buf);
+    return ok;
+}
+
+static bool vtpv_send_h2g2(AppleVtpv *s, int slot, uint32_t type, uint32_t flags,
+                           const uint8_t *uuid16, const uint8_t *id8,
+                           uint8_t *paras, uint32_t paras_len)
+{
+    if (0x30 + paras_len <= VTPV_H2G_ENTRY_MAX) {
+        return vtpv_h2g_push_entry(s, slot, type, flags, uuid16, id8,
+                                   paras, paras_len);
+    }
+    /* task85: oversize (an 'Eemt' sample) - the chunked form.  The receiver
+     * concatenates the messages' parameter streams and parses the whole
+     * (the 'Eemt' flags-0x10 path, o87: each partial message is appended as
+     * a CMBlockBuffer reference into the session's accumulator and the
+     * final message's paras are read out of the accumulated buffer), so the
+     * para stream simply flows across entries.  Every entry carries the
+     * full header; the non-final ones set flag 0x10 (partial - no reply
+     * clerk is armed for them), the final one the real flags. */
+    uint32_t off = 0;
+    bool ok = true;
+    while (ok && off < paras_len) {
+        uint32_t take = MIN(paras_len - off, VTPV_H2G_ENTRY_MAX - 0x30);
+        uint32_t eflags = off + take < paras_len ? ((flags & ~1u) | 0x10u) : flags;
+        ok = vtpv_h2g_push_entry(s, slot, type, eflags, uuid16, id8,
+                                 paras + off, take);
+        off += take;
+    }
     return ok;
 }
 
@@ -1550,16 +1597,254 @@ static void vtpv_reply_dcap(AppleVtpv *s, int slot, uint64_t total)
  * parser) and FUN_7ff81585a606 (the '+enc' sender). */
 #define VTPV_ENC_REFUSE_ERR  (-12915)  /* kVTVideoEncoderNotAvailableNow; o85 pins it */
 #define VTPV_ENCS_PLIST_MAX  768
-static const uint32_t vtpv_enc_types[10] = {
+static const uint32_t vtpv_enc_types[15] = {
     0x656e6373u /* 'encs' */,  0x2b656e63u /* '+enc' */,  0x2d656e63u /* '-enc' */,
     0x6566726du /* 'efrm' */,  0x65737461u /* 'esta' */,  0x65737473u /* 'ests' */,
     0x45706261u /* 'Epba' */,  0x45656d74u /* 'Eemt' */,  0x65696e76u /* 'einv' */,
-    0x65737570u /* 'esup' */,
+    0x65737570u /* 'esup' */,  0x65706672u /* 'epfr' */,  0x65636f70u /* 'ecop' */,
+    0x65636672u /* 'ecfr' */,  0x65736574u /* 'eset' */,  0x656d756cu /* 'emul' */,
 };
+
+/* ---- task85b: the smallest bplist reader/writer the property wire needs.
+ * The shapes are pinned: 'eset' {',key' string, ',val' scalar}, 'emul'
+ * {',pro' dict of scalars}, 'ecop' {',key' string} (o87).  Decodes the top
+ * object: bool, int, (long) ASCII string, one-level array, one dict of
+ * scalar values; builds the single-object plists the ',val' replies ride. */
+enum { VTPV_BP_BOOL = 1, VTPV_BP_INT, VTPV_BP_STR, VTPV_BP_ARR, VTPV_BP_DICT };
+typedef struct VtpvBpVal {
+    int kind;
+    bool b;
+    int64_t i;
+    char s[40];
+    int n;                         /* ARR elements / DICT pairs */
+    struct VtpvBpVal *el;          /* ARR: values; DICT: keys then values */
+} VtpvBpVal;
+
+/* Opus 10-30: a struct cannot hold an array of itself (o104 build) - the
+ * container's elements come from a ring of nodes instead.  All parsing runs
+ * under the BQL and one message needs at most 16 + 2 nodes, so the ring
+ * never wraps over values a handler is still reading. */
+static VtpvBpVal vtpv_bp_ring[256];
+static unsigned vtpv_bp_ring_pos;
+
+static VtpvBpVal *vtpv_bp_nodes(int n)
+{
+    if (vtpv_bp_ring_pos + n > G_N_ELEMENTS(vtpv_bp_ring)) {
+        vtpv_bp_ring_pos = 0;
+    }
+    VtpvBpVal *el = &vtpv_bp_ring[vtpv_bp_ring_pos];
+    vtpv_bp_ring_pos += n;
+    memset(el, 0, sizeof(*el) * n);
+    return el;
+}
+
+static uint64_t vtpv_bp_be(const uint8_t *p, int n)
+{
+    uint64_t v = 0;
+    while (n--) {
+        v = (v << 8) | *p++;
+    }
+    return v;
+}
+
+static const uint8_t *vtpv_bp_obj(const uint8_t *pl, uint32_t len, uint64_t idx)
+{
+    if (len < 42) {                /* 8 hdr + 1 obj + 1 offset + 32 trailer */
+        return NULL;
+    }
+    const uint8_t *tr = pl + len - 32;
+    int osz = tr[6], rsz = tr[7];
+    uint64_t nobj = vtpv_bp_be(tr + 8, 8), tab = vtpv_bp_be(tr + 24, 8);
+    if (!osz || osz > 8 || !rsz || rsz > 8 || idx >= nobj ||
+        tab + (idx + 1) * osz > len) {
+        return NULL;
+    }
+    uint64_t off = vtpv_bp_be(pl + tab + idx * osz, osz);
+    return off < len ? pl + off : NULL;
+}
+
+/* depth caps the recursion: 2 reads an array's/dict's scalar members */
+static bool vtpv_bp_val(const uint8_t *pl, uint32_t len, const uint8_t *o,
+                        VtpvBpVal *v, int depth)
+{
+    memset(v, 0, sizeof(*v));
+    if (!o || o >= pl + len || !depth--) {
+        return false;
+    }
+    uint8_t m = *o++;
+    uint32_t cnt = m & 0xf;
+    const uint8_t *tr = pl + len - 32;
+    int rsz = tr[7];
+    if (m <= 0x09) {
+        v->kind = VTPV_BP_BOOL;
+        v->b = m == 0x09;
+        return true;
+    }
+    if ((m >> 4) == 0x1) {
+        int nb = 1 << (m & 0xf);
+        if (nb > 8 || o + nb > pl + len) {
+            return false;
+        }
+        v->kind = VTPV_BP_INT;
+        v->i = (int64_t)vtpv_bp_be(o, nb);
+        return true;
+    }
+    if ((m >> 4) == 0x5 && cnt != 0xf) {
+        if (o + cnt > pl + len) {
+            return false;
+        }
+        v->kind = VTPV_BP_STR;
+        memcpy(v->s, o, MIN(cnt, sizeof(v->s) - 1));
+        return true;
+    }
+    if (m == 0x5f) {                       /* long ASCII: 0x5f 0x1n <len> */
+        if (o + 2 > pl + len || (*o >> 4) != 0x1) {
+            return false;
+        }
+        int ib = 1 << (*o++ & 0xf);
+        if (ib > 2 || o + ib > pl + len) {
+            return false;
+        }
+        uint32_t sl = (uint32_t)vtpv_bp_be(o, ib);
+        o += ib;
+        if (o + sl > pl + len) {
+            return false;
+        }
+        v->kind = VTPV_BP_STR;
+        memcpy(v->s, o, MIN(sl, sizeof(v->s) - 1));
+        return true;
+    }
+    if ((m >> 4) == 0xa || (m >> 4) == 0xd) {
+        bool is_dict = (m >> 4) == 0xd;
+        if (cnt == 0xf) {                  /* 0xaf/0xdf: int length follows */
+            if (o + 2 > pl + len || (*o >> 4) != 0x1) {
+                return false;
+            }
+            int ib = 1 << (*o++ & 0xf);
+            if (ib > 2 || o + ib > pl + len) {
+                return false;
+            }
+            cnt = (uint32_t)vtpv_bp_be(o, ib);
+            o += ib;
+        }
+        int nrefs = is_dict ? cnt * 2 : cnt;
+        if (cnt > 8 || o + (uint64_t)nrefs * rsz > pl + len) {
+            return false;
+        }
+        v->el = vtpv_bp_nodes(nrefs ? nrefs : 1);
+        for (int r = 0; r < nrefs; r++) {
+            uint64_t ref = vtpv_bp_be(o + (uint64_t)r * rsz, rsz);
+            if (!vtpv_bp_val(pl, len, vtpv_bp_obj(pl, len, ref), &v->el[r], depth)) {
+                return false;
+            }
+            if (is_dict && r < (int)cnt && v->el[r].kind != VTPV_BP_STR) {
+                return false;              /* property names are strings */
+            }
+        }
+        v->kind = is_dict ? VTPV_BP_DICT : VTPV_BP_ARR;
+        v->n = cnt;                        /* dict: key i = el[i], value i = el[i+cnt] */
+        return true;
+    }
+    return false;                          /* real/utf16/data: not on this wire */
+}
+
+/* a full single-object plist: header, the object, its offset, the trailer */
+static uint32_t vtpv_bp_finish(uint8_t *out, uint32_t obj_len)
+{
+    uint32_t tab = 8 + obj_len;
+    out[tab] = 8;                          /* offset table: object 0 at 8 */
+    memset(out + tab + 1, 0, 32);
+    out[tab + 7] = 1;                      /* offset int size */
+    out[tab + 8] = 1;                      /* object ref size */
+    stq_be_p(out + tab + 9, 1);            /* one object */
+    stq_be_p(out + tab + 17, 0);           /* top object */
+    stq_be_p(out + tab + 25, tab);         /* offset table offset */
+    return tab + 1 + 32;
+}
+
+static uint32_t vtpv_bp_bool_pl(uint8_t *out, bool v)
+{
+    memcpy(out, "bplist00", 8);
+    out[8] = v ? 0x09 : 0x08;
+    return vtpv_bp_finish(out, 1);
+}
+
+static uint32_t vtpv_bp_int_pl(uint8_t *out, int64_t v)
+{
+    memcpy(out, "bplist00", 8);
+    if (v >= INT32_MIN && v <= INT32_MAX) {
+        out[8] = 0x12;
+        stl_be_p(out + 9, (uint32_t)v);
+        return vtpv_bp_finish(out, 5);
+    }
+    out[8] = 0x13;
+    stq_be_p(out + 9, (uint64_t)v);
+    return vtpv_bp_finish(out, 9);
+}
+
+static uint32_t vtpv_bp_str_pl(uint8_t *out, const char *s)
+{
+    memcpy(out, "bplist00", 8);
+    size_t l = strlen(s);
+    if (l < 15) {
+        out[8] = 0x50 | (uint8_t)l;
+        memcpy(out + 9, s, l);
+        return vtpv_bp_finish(out, 1 + l);
+    }
+    out[8] = 0x5f;
+    out[9] = 0x10;
+    out[10] = (uint8_t)l;
+    memcpy(out + 11, s, l);
+    return vtpv_bp_finish(out, 3 + l);
+}
+
+/* apply one property to the session's encoder; true = acknowledged (rate
+ * keys retarget, the known rest is honoured by the fixed configuration) */
+static bool vtpv_enc_apply_prop(AppleVtpv *s, const char *key, const VtpvBpVal *v)
+{
+    VtpvDxE *dxe = s->cur->dxe;
+    if (!dxe) {
+        return false;
+    }
+    if (strcmp(key, "AverageBitRate") == 0) {
+        if (v->kind == VTPV_BP_INT && v->i > 0) {
+            vtpv_dxe_set_rate(dxe, (uint64_t)v->i, 0, 0);
+            lab_elog("apple-vtpv: enc prop AverageBitRate -> %lld b/s\n",
+                     (long long)v->i);
+        }
+        return true;
+    }
+    if (strcmp(key, "DataRateLimits") == 0) {
+        if (v->kind == VTPV_BP_ARR && v->n >= 2 && v->el[0].kind == VTPV_BP_INT &&
+            v->el[1].kind == VTPV_BP_INT && v->el[1].i > 0) {
+            uint64_t peak = (uint64_t)v->el[0].i / (uint64_t)v->el[1].i;
+            if (peak) {
+                vtpv_dxe_set_rate(dxe, 0, peak, 0);
+                lab_elog("apple-vtpv: enc prop DataRateLimits -> peak %llu b/s\n",
+                         (unsigned long long)peak);
+            }
+        }
+        return true;
+    }
+    if (strcmp(key, "ExpectedFrameRate") == 0) {
+        if (v->kind == VTPV_BP_INT && v->i > 0 && v->i <= 240) {
+            vtpv_dxe_set_rate(dxe, 0, 0, (uint32_t)v->i);
+            lab_elog("apple-vtpv: enc prop ExpectedFrameRate -> %lld\n",
+                     (long long)v->i);
+        }
+        return true;
+    }
+    /* MaxKeyFrameInterval (honoured by GOP 1 - intra-only), ProfileLevel
+     * (High, fixed), Quality, RealTime: acknowledged as-is */
+    return strcmp(key, "MaxKeyFrameInterval") == 0 ||
+           strcmp(key, "ProfileLevel") == 0 ||
+           strcmp(key, "Quality") == 0 ||
+           strcmp(key, "RealTime") == 0;
+}
 
 static int vtpv_enc_type_idx(uint32_t type)
 {
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < (int)ARRAY_SIZE(vtpv_enc_types); i++) {
         if (vtpv_enc_types[i] == type) {
             return i;
         }
@@ -1717,6 +2002,20 @@ static void vtpv_reply_encs(AppleVtpv *s, int slot)
                    paras, n);
 }
 
+/* task85b: a bare typed ',err' reply - the property wire answers with
+ * exactly this shape (o87 appends nothing else on 'eset'/'emul'/'ecop') */
+static void vtpv_reply_enc_refuse_err(AppleVtpv *s, int slot, uint32_t type,
+                                      int32_t err)
+{
+    uint8_t paras[0x40];
+    uint32_t be_err;
+    uint32_t n = 0;
+    stl_be_p(&be_err, (uint32_t)err);
+    n += vtpv_para_put(paras + n, 0x2c657272u /* ',err' */, "=s32",
+                       (uint8_t *)&be_err, 4);
+    vtpv_send_h2g2(s, slot, type, 4, s->msg + 0x10, s->msg + 0x20, paras, n);
+}
+
 /* typed refusal: ',err' != 0.  The guest's encoder creation fails and its
  * selection falls through to the next encoder (software) - the encode-side
  * mirror of how a refused 'dsta' falls back to software decode. */
@@ -1765,9 +2064,10 @@ static void vtpv_reply_enc_ok(AppleVtpv *s, int slot, uint32_t type, bool hin)
  * session's codec (',cod' captured at '+enc'). */
 static uint32_t vtpv_esup_plist(uint8_t *out, uint32_t codec)
 {
-    static const char *keys[6] = {
+    static const char *keys[7] = {
         "AllowFrameReordering", "AverageBitRate", "ExpectedFrameRate",
         "MaxKeyFrameInterval", "ProfileLevel", "RealTime",
+        "UsingHardwareAcceleratedVideoEncoder",
     };
     const char *profiles[3];
     int nprof = 0;
@@ -1779,24 +2079,25 @@ static uint32_t vtpv_esup_plist(uint8_t *out, uint32_t codec)
         profiles[nprof++] = "H264_Main_AutoLevel";
         profiles[nprof++] = "H264_High_AutoLevel";
     }
-    int nobj = 13 + nprof;    /* 0 dict, 1..6 keys, 7 false, 8 int32, 9 fps,
-                               * 10 interval, 11 true, 12 array, 13.. profiles */
-    uint16_t off[16];
+    int nobj = 14 + nprof;    /* 0 dict, 1..7 keys, 8 false, 9 int32, 10 fps,
+                               * 11 interval, 12 true, 13 array, 14.. profiles */
+    uint16_t off[20];
     uint32_t n = 0;
     memcpy(out, "bplist00", 8);
     n = 8;
     off[0] = n;
-    out[n++] = 0xd6;                         /* dict, 6 pairs */
-    for (int i = 1; i <= 6; i++) {
+    out[n++] = 0xd7;                         /* dict, 7 pairs */
+    for (int i = 1; i <= 7; i++) {
         out[n++] = i;                        /* key refs */
     }
-    out[n++] = 7;                            /* value refs in key order: */
-    out[n++] = 8;                            /*  false, bitrate, fps,       */
-    out[n++] = 9;                            /*  interval, profiles, true   */
-    out[n++] = 10;
-    out[n++] = 12;
+    out[n++] = 8;                            /* value refs in key order: */
+    out[n++] = 9;                            /*  false, bitrate, fps,        */
+    out[n++] = 10;                           /*  interval, profiles, true,   */
     out[n++] = 11;
-    for (int i = 0; i < 6; i++) {
+    out[n++] = 13;
+    out[n++] = 12;
+    out[n++] = 12;                           /*  UsingHW shares the true     */
+    for (int i = 0; i < 7; i++) {
         off[1 + i] = n;
         size_t kl = strlen(keys[i]);
         if (kl < 15) {
@@ -1809,28 +2110,28 @@ static uint32_t vtpv_esup_plist(uint8_t *out, uint32_t codec)
         memcpy(out + n, keys[i], kl);
         n += kl;
     }
-    off[7] = n;
+    off[8] = n;
     out[n++] = 0x08;                         /* AllowFrameReordering = false */
-    off[8] = n;                              /* AverageBitRate = 20 Mbps */
+    off[9] = n;                              /* AverageBitRate = 20 Mbps */
     out[n++] = 0x12;
     stl_be_p(out + n, 20000000);
     n += 4;
-    off[9] = n;
+    off[10] = n;
     out[n++] = 0x10;                         /* ExpectedFrameRate = 60 */
     out[n++] = 60;
-    off[10] = n;
+    off[11] = n;
     out[n++] = 0x11;                         /* MaxKeyFrameInterval = 240 */
     out[n++] = 0x00;
     out[n++] = 0xf0;
-    off[11] = n;
-    out[n++] = 0x09;                         /* RealTime = true */
     off[12] = n;
+    out[n++] = 0x09;                         /* RealTime/UsingHW = true */
+    off[13] = n;
     out[n++] = 0xa0 | nprof;                 /* ProfileLevel array */
     for (int i = 0; i < nprof; i++) {
-        out[n++] = 13 + i;
+        out[n++] = 14 + i;
     }
     for (int i = 0; i < nprof; i++) {
-        off[13 + i] = n;
+        off[14 + i] = n;
         size_t kl = strlen(profiles[i]);
         if (kl < 15) {
             out[n++] = 0x50 | kl;
@@ -1858,9 +2159,10 @@ static uint32_t vtpv_esup_plist(uint8_t *out, uint32_t codec)
 
 static void vtpv_reply_esup(AppleVtpv *s, int slot)
 {
-    uint8_t pl[320];
-    uint32_t plen = vtpv_esup_plist(pl, s->encs_fcc);
-    uint8_t paras[0x40 + 320];
+    uint8_t pl[384];      /* task85b: +UsingHardwareAcceleratedVideoEncoder */
+    uint32_t cod = s->cur && s->cur->enc_cod ? s->cur->enc_cod : s->encs_fcc;
+    uint32_t plen = vtpv_esup_plist(pl, cod);
+    uint8_t paras[0x40 + 384];
     uint32_t be_ver, be_err;
     uint32_t n = 0;
     stl_be_p(&be_ver, 6);
@@ -1869,7 +2171,7 @@ static void vtpv_reply_esup(AppleVtpv *s, int slot)
     n += vtpv_para_put(paras + n, 0x2c657272u /* ',err' */, "=s32", &be_err, 4);
     n += vtpv_para_put(paras + n, 0x2c737570u /* ',sup' */, "=pls", pl, plen);
     char fcc[5];
-    vtpv_log4cc(fcc, s->encs_fcc);
+    vtpv_log4cc(fcc, cod);
     lab_elog("apple-vtpv: enc esup %.4s -> ,sup %u B\n", fcc, plen);
     vtpv_send_h2g2(s, slot, 0x65737570u /* 'esup' */, 4, s->msg + 0x10, s->msg + 0x20,
                    paras, n);
@@ -2811,6 +3113,8 @@ static void vtpv_dx_reset(AppleVtpv *s)
  * decoder to the pool from this once-a-second sweep.  A paused video pays
  * one decoder reopen past the idle window - against the ~100 QEMU handles
  * each orphan held forever. */
+static void vtpv_enc_close_async(AppleVtpv *s, VtpvDxE *dxe);
+
 static void vtpv_dx_close_idle(AppleVtpv *s)
 {
     static int64_t last_sweep;
@@ -2859,6 +3163,12 @@ static void vtpv_sess_free(AppleVtpv *s, VtpvSess *se)
     s->infl_n = keep;
     qemu_mutex_unlock(&s->dec_lock);
     vtpv_dx_close(se->dx);
+    if (se->dxe) {
+        /* task83: the encoder closes on the worker - a job may still be
+         * encoding with it (the job borrowed it before the session died) */
+        vtpv_enc_close_async(s, se->dxe);
+        se->dxe = NULL;
+    }
     for (int i = 0; i < VTPV_FRAMES; i++) {
         g_free(se->frame[i].nv12);
         g_free(se->frame[i].sample);
@@ -2896,9 +3206,9 @@ static void vtpv_note_handles(AppleVtpv *s)
 #ifdef _WIN32
     GetProcessHandleCount(GetCurrentProcess(), &hc);
 #endif
-    lab_elog("vtpv_handles qemu=%lu sess=%d dx=%d pooled=%d ev=%d heap=%d thr=%d\n",
+    lab_elog("vtpv_handles qemu=%lu sess=%d dx=%d pooled=%d ev=%d heap=%d thr=%d enc=%d\n",
              (unsigned long)hc, sess_used, h.open, h.pooled, h.events, h.heaps,
-             h.threads);
+             h.threads, vtpv_dxe_open_count());
 }
 
 /* the session a message belongs to; a new uuid takes a free entry or the
@@ -3272,6 +3582,358 @@ static bool vtpv_fill_surface(AppleVtpv *s, const VtpvKickSurf *ks, const uint8_
         }
     }
     return true;
+}
+
+/* ---- task83: the encode worker (one frame end to end behind enc=on) ----
+ *
+ * 'efrm' is accepted in the kick (reply ',err' 0 + ',inf' 0), the frame is
+ * read out of the pinned source IOSurface and encoded on THIS thread, and
+ * the 'Efds'/'Eemt' delivery runs on the main loop (enc_bh) - the same
+ * split the decode side uses (dfrm reply now, Demt from the bh). */
+
+typedef struct VtpvEncJob {
+    int slot;
+    VtpvSess *se;                  /* BQL-only after queueing (uuid check) */
+    uint8_t uuid16[16];
+    uint64_t frame_id;
+    VtpvKickSurf ks;               /* .pages owned (the kick's copy dies) */
+    uint8_t pts[24], dur[24];      /* CMTime is opaque: raw copies both ways */
+    bool has_uui;
+    uint8_t uui[16];
+    uint32_t w, h;                 /* dims copied at accept time */
+    VtpvDxE *dxe;                  /* borrowed until its close job runs */
+    bool close;                    /* a close request: only dxe is set */
+    /* the worker's result */
+    int rc;
+    uint8_t *avcc;
+    uint32_t avcc_len;
+} VtpvEncJob;
+
+static void vtpv_enc_job_free(VtpvEncJob *j)
+{
+    if (!j) {
+        return;
+    }
+    g_free(j->ks.pages);
+    g_free(j->avcc);
+    g_free(j);
+}
+
+/* the read twin of vtpv_fill_surface: the guest's pinned NV12 -> one tight
+ * host buffer (reads never arm the write-fault tracker - vtpv_ksurf_read) */
+static uint8_t *vtpv_enc_read_frame(AppleVtpv *s, const VtpvKickSurf *ks,
+                                    uint32_t w, uint32_t h)
+{
+    if (ks->planes != 2 ||
+        (ks->pixfmt != 0x34323076u /* '420v' */ &&
+         ks->pixfmt != 0x34323066u /* '420f' */)) {
+        lab_elog("apple-vtpv: enc efrm: surface %u is %.4s %u planes - not NV12\n",
+                 ks->id, (const char *)&ks->pixfmt, ks->planes);
+        return NULL;
+    }
+    uint32_t cw = (w + 1) & ~1u, ch = (h + 1) / 2;
+    uint8_t *nv12 = g_malloc((size_t)w * h + (size_t)cw * ch);
+    bool ok = true;
+    for (uint32_t y = 0; ok && y < h; y++) {
+        ok = vtpv_ksurf_read(s, ks, ks->off[0] + (uint64_t)y * ks->bpr[0],
+                             nv12 + (size_t)y * w, MIN(w, ks->pw[0]));
+    }
+    for (uint32_t y = 0; ok && y < ch; y++) {
+        ok = vtpv_ksurf_read(s, ks, ks->off[1] + (uint64_t)y * ks->bpr[1],
+                             nv12 + (size_t)w * h + (size_t)y * cw,
+                             MIN(cw, ks->pw[1] * 2));
+    }
+    if (!ok) {
+        lab_elog("apple-vtpv: enc efrm: surface %u read past its allocation\n", ks->id);
+        g_free(nv12);
+        return NULL;
+    }
+    return nv12;
+}
+
+/* close a session's encoder from any context: the job serializes behind
+ * whatever encode borrowed it (vtpv_sess_free / '-enc' / 'einv' / re-'esta') */
+static void vtpv_enc_close_async(AppleVtpv *s, VtpvDxE *dxe)
+{
+    VtpvEncJob *j = g_new0(VtpvEncJob, 1);
+    j->close = true;
+    j->dxe = dxe;
+    qemu_mutex_lock(&s->enc_lock);
+    g_queue_push_tail(&s->enc_q, j);
+    qemu_cond_broadcast(&s->enc_cond);
+    qemu_mutex_unlock(&s->enc_lock);
+}
+
+static void *vtpv_enc_thread(void *opaque)
+{
+    AppleVtpv *s = opaque;
+    qemu_mutex_lock(&s->enc_lock);
+    for (;;) {
+        VtpvEncJob *j;
+        while (!(j = g_queue_pop_head(&s->enc_q))) {
+            qemu_cond_wait(&s->enc_cond, &s->enc_lock);
+        }
+        s->enc_busy = true;
+        qemu_mutex_unlock(&s->enc_lock);
+        if (j->close) {
+            vtpv_dxe_close(j->dxe);
+            vtpv_enc_job_free(j);
+            /* Opus 10-30 (q1341): the loop top waits with enc_lock HELD -
+             * re-take it, or the cond wait releases an unowned SRW lock and
+             * the next kick's enc_lock blocks the main loop forever */
+            qemu_mutex_lock(&s->enc_lock);
+            s->enc_busy = false;
+            continue;
+        }
+        uint8_t *nv12 = vtpv_enc_read_frame(s, &j->ks, j->w, j->h);
+        if (nv12) {
+            j->avcc = g_malloc((size_t)j->w * j->h + 4096);
+            j->rc = vtpv_dxe_encode(j->dxe, nv12, j->w,
+                                    nv12 + (size_t)j->w * j->h, j->w, 0,
+                                    j->avcc, (uint32_t)((size_t)j->w * j->h + 4096),
+                                    &j->avcc_len);
+            g_free(nv12);
+        }
+        qemu_mutex_lock(&s->enc_lock);
+        g_queue_push_tail(&s->enc_done, j);
+        s->enc_busy = false;
+        qemu_bh_schedule(s->enc_bh);
+        /* enc_lock stays held into the next wait (see the close path) */
+    }
+    return NULL;
+}
+
+/* the 'efrm' accept: ',err' 0 + ',inf' 0 - the sender's parser gates on both
+ * (FUN_7ff815540d0f in the o87 log) */
+static void vtpv_reply_efrm_ok(AppleVtpv *s, int slot, uint32_t type)
+{
+    uint8_t paras[0x40];
+    uint32_t be_ver, be_err, be_inf;
+    uint32_t n = 0;
+    stl_be_p(&be_ver, 6);
+    stl_be_p(&be_err, 0);
+    stl_be_p(&be_inf, 0);
+    n += vtpv_para_put(paras + n, 0x2c766572u /* ',ver' */, "=u32", &be_ver, 4);
+    n += vtpv_para_put(paras + n, 0x2c657272u /* ',err' */, "=s32", &be_err, 4);
+    n += vtpv_para_put(paras + n, 0x2c696e66u /* ',inf' */, "=u32", &be_inf, 4);
+    vtpv_send_h2g2(s, slot, type, 4, s->msg + 0x10, s->msg + 0x20, paras, n);
+}
+
+static uint32_t vtpv_atom_put(uint8_t *p, const char tag[4],
+                              const uint8_t *body, uint32_t len)
+{
+    stl_be_p(p, 8 + len);
+    memcpy(p + 4, tag, 4);
+    if (len) {
+        memcpy(p + 8, body, len);
+    }
+    return 8 + len;
+}
+
+/* the serialized CMSampleBuffer ('sbuf') 'Eemt' carries, byte-modelled on
+ * the guest's own dfrm samples (vtpv-msgs.log.dxfail0..2): 'opts' = the PTS
+ * CMTime, 'stia' = {duration, PTS, DTS} as three native CMTimes, 'sdat' =
+ * the AVCC bytes, then count and size.  NO 'fdsc' - the format description
+ * lives on the session ('Efds' put it there); the guest's own later frames
+ * carry none either (dxfail1/2). */
+/* CMTime {int64 value, int32 timescale, uint32 flags, int64 epoch}: wire BE -> native LE */
+static void vtpv_cmtime_be_to_le(uint8_t *dst, const uint8_t *src)
+{
+    stq_le_p(dst, ldq_be_p(src));
+    stl_le_p(dst + 8, ldl_be_p(src + 8));
+    stl_le_p(dst + 12, ldl_be_p(src + 12));
+    stq_le_p(dst + 16, ldq_be_p(src + 16));
+}
+
+static uint32_t vtpv_enc_sbuf(uint8_t *out, uint32_t cap, const uint8_t *pts,
+                              const uint8_t *dur, const uint8_t *sdat, uint32_t sl)
+{
+    if (cap < 8 + (8 + 24) + (8 + 72) + (8 + sl) + (8 + 4) + (8 + 4)) {
+        return 0;
+    }
+    uint8_t opts[24], stia[72], nsmp[4], ssiz[4];
+    /* Opus 10-30 (q1346): the ',pts'/',dur' paras are big-endian wire
+     * CMTimes, the sample's atoms are native little-endian (the guest's own
+     * 'dfrm' samples: opts = 00..00 1e000000 01000000); copied raw, the app
+     * saw pts 72057594037927936/503316480 and most frames failed */
+    vtpv_cmtime_be_to_le(opts, pts);
+    vtpv_cmtime_be_to_le(stia, dur);
+    vtpv_cmtime_be_to_le(stia + 24, pts);
+    vtpv_cmtime_be_to_le(stia + 48, pts);    /* DTS = PTS: intra-only */
+    stl_le_p(nsmp, 1);
+    stl_le_p(ssiz, sl);
+    uint32_t sub = 0;
+    sub += vtpv_atom_put(out + 8 + sub, "opts", opts, 24);
+    sub += vtpv_atom_put(out + 8 + sub, "stia", stia, 72);
+    sub += vtpv_atom_put(out + 8 + sub, "sdat", sdat, sl);
+    sub += vtpv_atom_put(out + 8 + sub, "nsmp", nsmp, 4);
+    sub += vtpv_atom_put(out + 8 + sub, "ssiz", ssiz, 4);
+    stl_be_p(out, 8 + sub);
+    memcpy(out + 4, "sbuf", 4);
+    return 8 + sub;
+}
+
+/* 'Efds': the session's format description - the guest builds a
+ * CMVideoFormatDescription from the avcC (',ext' = a one-pair bplist
+ * {"avcC": <data>}); its reply is ',err' + '=fds' and every 'Eemt' sample
+ * parses against it (o87: VTEncoderSessionCreateVideoFormatDescription). */
+static void vtpv_send_efds(AppleVtpv *s, int slot, const uint8_t *uuid16,
+                           uint32_t cod, uint32_t w, uint32_t h,
+                           const uint8_t *avcc, uint32_t avcc_len)
+{
+    uint8_t pl[192];
+    uint8_t off[3];
+    uint32_t n = 0;
+    memcpy(pl, "bplist00", 8);
+    n = 8;
+    off[0] = n;
+    pl[n++] = 0xd1;                /* dict, one pair */
+    pl[n++] = 1;                   /* key ref */
+    pl[n++] = 2;                   /* value ref */
+    off[1] = n;
+    pl[n++] = 0x54;                /* ASCII string, 4 chars */
+    memcpy(pl + n, "avcC", 4);
+    n += 4;
+    off[2] = n;
+    pl[n++] = 0x4f;                /* data, int length follows */
+    pl[n++] = 0x10;                /* 1-byte int */
+    pl[n++] = (uint8_t)avcc_len;   /* avcC < 256 B */
+    memcpy(pl + n, avcc, avcc_len);
+    n += avcc_len;
+    uint32_t table = n;
+    memcpy(pl + n, off, 3);
+    n += 3;
+    memset(pl + n, 0, 32);
+    pl[n + 6] = 1;                 /* offset int size */
+    pl[n + 7] = 1;                 /* object ref size */
+    stq_be_p(pl + n + 8, 3);       /* 3 objects */
+    stq_be_p(pl + n + 16, 0);      /* top object = the dict */
+    stq_be_p(pl + n + 24, table);
+    n += 32;
+
+    uint8_t paras[64 + 192];
+    uint32_t be_cod, be_w, be_h, p = 0;
+    stl_be_p(&be_cod, cod);
+    stl_be_p(&be_w, w);
+    stl_be_p(&be_h, h);
+    p += vtpv_para_put(paras + p, 0x2c636f64u /* ',cod' */, "=s32",
+                       (uint8_t *)&be_cod, 4);
+    p += vtpv_para_put(paras + p, 0x2c776474u /* ',wdt' */, "=s32",
+                       (uint8_t *)&be_w, 4);
+    p += vtpv_para_put(paras + p, 0x2c686774u /* ',hgt' */, "=s32",
+                       (uint8_t *)&be_h, 4);
+    p += vtpv_para_put(paras + p, 0x2c657874u /* ',ext' */, "=pls", pl, n);
+    s->host_msg_id++;
+    uint8_t id8[8];
+    stq_be_p(id8, s->host_msg_id);
+    lab_elog("apple-vtpv: enc Efds %.4s %ux%u (avcC %u B)\n",
+             (const char *)&cod, w, h, avcc_len);
+    vtpv_send_h2g(s, slot, 0x45666473u /* 'Efds' */, uuid16, id8, paras, p);
+}
+
+/* 'Eemt': the encoded sample - ',frm' + ',err' + ',efl' + the serialized
+ * CMSampleBuffer, ',uui' when the frame carried one (it releases the
+ * guest-side pixel-buffer reference).  The "=sbf" tag follows the '=fds'
+ * naming the CMFormatDescription reply uses (o87) - the one wire guess
+ * left; switch to "=pls" if the guest's parser is tag-strict. */
+static void vtpv_send_eemt(AppleVtpv *s, int slot, const uint8_t *uuid16,
+                           uint64_t frame_id, int32_t err,
+                           const uint8_t *pts, const uint8_t *dur,
+                           const uint8_t *sdat, uint32_t sl,
+                           const uint8_t *uui)
+{
+    uint32_t cap = 200 + sl;
+    uint8_t *sbuf = g_malloc(cap);
+    uint32_t sn = vtpv_enc_sbuf(sbuf, cap, pts, dur, sdat, sl);
+    uint8_t *paras = g_malloc(0x80 + sn);
+    uint32_t n = 0;
+    uint64_t be_frm = cpu_to_be64(frame_id);
+    int32_t be_err = cpu_to_be32(err);
+    uint32_t be_efl = 0;
+    n += vtpv_para_put(paras + n, 0x2c66726du /* ',frm' */, "=s64",
+                       (uint8_t *)&be_frm, 8);
+    n += vtpv_para_put(paras + n, 0x2c657272u /* ',err' */, "=s32",
+                       (uint8_t *)&be_err, 4);
+    n += vtpv_para_put(paras + n, 0x2c65666cu /* ',efl' */, "=u32",
+                       (uint8_t *)&be_efl, 4);
+    n += vtpv_para_put(paras + n, 0x2c736266u /* ',sbf' */, "=sbf", sbuf, sn);
+    if (uui) {
+        n += vtpv_para_put(paras + n, 0x2c757569u /* ',uui' */, "=uui", uui, 16);
+    }
+    s->host_msg_id++;
+    uint8_t id8[8];
+    stq_be_p(id8, s->host_msg_id);
+    vtpv_send_h2g(s, slot, 0x45656d74u /* 'Eemt' */, uuid16, id8, paras, n);
+    if (err == 0) {
+        s->enc_emitted++;
+    }
+    g_free(paras);
+    g_free(sbuf);
+}
+
+static void vtpv_enc_bh(void *opaque)
+{
+    AppleVtpv *s = opaque;
+    for (;;) {
+        qemu_mutex_lock(&s->enc_lock);
+        VtpvEncJob *j = g_queue_pop_head(&s->enc_done);
+        qemu_mutex_unlock(&s->enc_lock);
+        if (!j) {
+            return;
+        }
+        if (j->close) {
+            vtpv_enc_job_free(j);
+            continue;
+        }
+        bool live = j->se && j->se->used &&
+                    memcmp(j->se->uuid, j->uuid16, 16) == 0 &&
+                    j->se->dxe == j->dxe;
+        if (!live) {
+            lab_elog("apple-vtpv: enc frame %llu dropped - its session is gone\n",
+                     (unsigned long long)j->frame_id);
+        } else if (j->rc == 0 && j->avcc && j->avcc_len) {
+            if (!j->se->efds_sent) {
+                vtpv_send_efds(s, j->slot, j->uuid16, j->se->enc_cod,
+                               j->w, j->h, j->se->dxe_avcc, j->se->dxe_avcc_len);
+                j->se->efds_sent = true;
+            }
+            vtpv_send_eemt(s, j->slot, j->uuid16, j->frame_id, 0, j->pts,
+                           j->dur, j->avcc, j->avcc_len,
+                           j->has_uui ? j->uui : NULL);
+            if ((s->enc_emitted & 15) == 1) {
+                lab_elog("apple-vtpv: enc emitted %llu (accepted %llu)\n",
+                         (unsigned long long)s->enc_emitted,
+                         (unsigned long long)s->enc_accepted);
+            }
+        } else {
+            /* the encode failed: complete the frame with the malfunction
+             * error so the app's callback runs - an 'Eemt' that never comes
+             * would hang it (an empty 'sdat' keeps the sample parseable) */
+            lab_elog("apple-vtpv: enc frame %llu failed rc=%d len=%u -> Eemt -12903\n",
+                     (unsigned long long)j->frame_id, j->rc, j->avcc_len);
+            vtpv_send_eemt(s, j->slot, j->uuid16, j->frame_id, -12903,
+                           j->pts, j->dur, NULL, 0, j->has_uui ? j->uui : NULL);
+        }
+        vtpv_enc_job_free(j);
+    }
+}
+
+/* wait (bounded) until the worker holds no job, then deliver every finished
+ * frame in order; true when the worker went idle in time */
+static bool vtpv_enc_drain(AppleVtpv *s)
+{
+    int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    bool idle = false;
+    while (!idle && qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t0 < 500000) {
+        qemu_mutex_lock(&s->enc_lock);
+        idle = g_queue_is_empty(&s->enc_q) && !s->enc_busy;
+        qemu_mutex_unlock(&s->enc_lock);
+        if (!idle) {
+            g_usleep(100);
+        }
+    }
+    vtpv_enc_bh(s);
+    return idle;
 }
 
 /* decoded picture -> guest surface: rows repacked to the surface pitches */
@@ -5610,7 +6272,35 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                 }
                 lab_elog("apple-vtpv: enc %.4s #%u total %u: %s\n", t5, seq, total, hex);
             }
+            if ((type == 0x65706672u /* 'epfr' */ ||
+                 type == 0x65636f70u /* 'ecop' */ ||
+                 type == 0x65736574u /* 'eset' */ ||
+                 type == 0x656d756cu /* 'emul' */) && seq < 2) {
+                /* task85: the property messages q1341 showed live (epfr/ecop
+                 * ride between 'esup' and the first 'efrm') - their paras run
+                 * past the 288 window, so dump them whole; the plist keys
+                 * inside name the property the session wants honored */
+                uint32_t pdump = total < 0x30 + 1024 ? total : 0x30 + 1024;
+                char phex[3 * 1024 + 1];
+                uint32_t pm = 0;
+                for (uint32_t i = 0; i < pdump && pm + 3 <= sizeof(phex); i++) {
+                    pm += snprintf(phex + pm, sizeof(phex) - pm, "%02x ", s->msg[i]);
+                }
+                lab_elog("apple-vtpv: enc %.4s #%u total %u: %s\n", t5, seq, total, phex);
+            }
             s->enc_seen[ei]++;
+            if (type == 0x2d656e63u /* '-enc' */ && !(flags & 1)) {
+                /* task83: the encoder is gone - close it on the worker (a
+                 * job may still be encoding with it).  No reply: '-enc'
+                 * carries no request flag, the '-dec' precedent. */
+                if (s->cur->dxe) {
+                    vtpv_enc_close_async(s, s->cur->dxe);
+                    s->cur->dxe = NULL;
+                    s->cur->efds_sent = false;
+                    lab_elog("apple-vtpv: enc -enc -> close\n");
+                }
+                return;
+            }
             if (flags & 1) {
                 /* TEMP lab (Zcode 10-30, task74): '+enc' is answered
                  * honestly now (q1329 proved the registry - the session
@@ -5630,18 +6320,236 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                                                         0x2c636f64u /* ',cod' */, &cl);
                     if (cod && cl >= 4) {
                         s->encs_fcc = ldl_be_p(cod);
+                        s->cur->enc_cod = s->encs_fcc;
                     }
                     lab_elog("apple-vtpv: enc +enc -> ok (,hin {})\n");
                     vtpv_reply_enc_ok(s, slot, type, true);
                 } else if (type == 0x65737570u /* 'esup' */) {
                     vtpv_reply_esup(s, slot);
                 } else if (type == 0x65696e76u /* 'einv' */) {
-                    lab_elog("apple-vtpv: enc einv -> ok\n");
+                    /* task83: invalidate = the encoder closes (as a worker
+                     * job); the reply still goes out at once */
+                    if (s->cur->dxe) {
+                        vtpv_enc_close_async(s, s->cur->dxe);
+                        s->cur->dxe = NULL;
+                        s->cur->efds_sent = false;
+                        lab_elog("apple-vtpv: enc einv -> close\n");
+                    } else {
+                        lab_elog("apple-vtpv: enc einv -> ok\n");
+                    }
                     vtpv_reply_enc_ok(s, slot, type, false);
-                } else if (type == 0x65737461u /* 'esta' */ ||
-                           type == 0x65737473u /* 'ests' */) {
+                } else if (type == 0x65737461u /* 'esta' */) {
+                    /* task83: open the session's encoder at the announced
+                     * dims (',vdi' = two BE u32).  A failed open REFUSES
+                     * 'esta' so the guest falls to its software encoder
+                     * instead of walking into refused 'efrm's. */
+                    uint32_t vl = 0;
+                    const uint8_t *vdi = vtpv_para_find(s->msg, total,
+                                                        0x2c766469u /* ',vdi' */, &vl);
+                    if (s->cur->dxe) {   /* a re-'esta': the old one goes */
+                        vtpv_enc_close_async(s, s->cur->dxe);
+                        s->cur->dxe = NULL;
+                        s->cur->efds_sent = false;
+                    }
+                    if (vdi && vl >= 8) {
+                        uint32_t w = ldl_be_p(vdi), h = ldl_be_p(vdi + 4);
+                        const char *egpu = getenv("VTPV_ENC_GPU");
+                        s->cur->dxe = vtpv_dxe_open(egpu && *egpu ? egpu : "nv",
+                                                    w, h, 30, 0); /* task85: 0 = the 0.1 bpp/frame default */
+                        if (s->cur->dxe) {
+                            s->cur->dxe_w = w;
+                            s->cur->dxe_h = h;
+                            s->cur->dxe_avcc_len = (uint32_t)vtpv_dxe_avcc(
+                                s->cur->dxe, s->cur->dxe_avcc,
+                                sizeof(s->cur->dxe_avcc));
+                            if (!s->cur->enc_cod) {
+                                s->cur->enc_cod = 0x61766331u; /* 'avc1' */
+                            }
+                            lab_elog("apple-vtpv: enc esta %ux%u -> open "
+                                     "(avcC %u B, encoders=%d)\n",
+                                     w, h, s->cur->dxe_avcc_len,
+                                     vtpv_dxe_open_count());
+                            vtpv_reply_enc_ok(s, slot, type, false);
+                            /* Opus 10-30 (q1348): NOT here - an 'Efds' right
+                             * behind the 'esta' reply stalls the session (no
+                             * 'esup' ever follows); it rides the first frame */
+                        } else {
+                            lab_elog("apple-vtpv: enc esta %ux%u -> refuse (open failed)\n",
+                                     w, h);
+                            vtpv_reply_enc_refuse(s, slot, type);
+                        }
+                    } else {
+                        lab_elog("apple-vtpv: enc esta: no ,vdi -> refuse\n");
+                        vtpv_reply_enc_refuse(s, slot, type);
+                    }
+                } else if (type == 0x65737473u /* 'ests' */) {
                     lab_elog("apple-vtpv: enc %.4s -> ok\n", t5);
                     vtpv_reply_enc_ok(s, slot, type, false);
+                } else if (type == 0x65636672u /* 'ecfr' */) {
+                    /* Opus 10-30 (q1343): CompleteFrames.  The guest sends it
+                     * after its last 'efrm' and fails the session (-19092 in
+                     * vtenc) when the reply overtakes frames still in the
+                     * worker.  Drain the worker (bounded), deliver every
+                     * finished frame's 'Eemt' first, then answer ok. */
+                    int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+                    bool idle = vtpv_enc_drain(s);
+                    lab_elog("apple-vtpv: enc ecfr -> ok after %lld us%s\n",
+                             (long long)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t0),
+                             idle ? "" : " (worker still busy)");
+                    vtpv_reply_efrm_ok(s, slot, type);
+                } else if (type == 0x6566726du /* 'efrm' */) {
+                    /* task83: accept + encode + 'Eemt'.  The reply goes out
+                     * NOW - the sender waits synchronously and the clerk
+                     * deadline is milliseconds (the 'dfrm' lesson). */
+                    uint32_t eflen = 0, eplen = 0, edlen = 0, eulen = 0;
+                    const uint8_t *efrm_frm = vtpv_para_find(s->msg, total,
+                                                        0x2c66726du /* ',frm' */, &eflen);
+                    const uint8_t *efrm_pts = vtpv_para_find(s->msg, total,
+                                                        0x2c707473u /* ',pts' */, &eplen);
+                    const uint8_t *efrm_dur = vtpv_para_find(s->msg, total,
+                                                        0x2c647572u /* ',dur' */, &edlen);
+                    const uint8_t *efrm_uui = vtpv_para_find(s->msg, total,
+                                                        0x2c757569u /* ',uui' */, &eulen);
+                    const VtpvKickSurf *eks = nsurf ? vtpv_kick_surf(s, sl->surf[0]) : NULL;
+                    if (!s->cur->dxe) {
+                        lab_elog("apple-vtpv: enc efrm: no encoder -> refuse\n");
+                        vtpv_reply_enc_refuse(s, slot, type);
+                    } else if (!efrm_frm || eflen != 8) {
+                        lab_elog("apple-vtpv: enc efrm: bad ,frm -> refuse\n");
+                        vtpv_reply_enc_refuse(s, slot, type);
+                    } else if (!eks) {
+                        lab_elog("apple-vtpv: enc efrm: no source surface -> refuse\n");
+                        vtpv_reply_enc_refuse(s, slot, type);
+                    } else {
+                        VtpvEncJob *j = g_new0(VtpvEncJob, 1);
+                        j->slot = slot;
+                        j->se = s->cur;
+                        j->dxe = s->cur->dxe;
+                        j->w = s->cur->dxe_w;
+                        j->h = s->cur->dxe_h;
+                        memcpy(j->uuid16, s->msg + 0x10, 16);
+                        j->frame_id = ldq_be_p(efrm_frm);
+                        j->ks = *eks;   /* the kick's copy dies with the kick */
+                        j->ks.pages = g_memdup2(eks->pages,
+                                                (eks->npages ? eks->npages : 1) *
+                                                    sizeof(uint64_t));
+                        if (efrm_pts && eplen == 24) {
+                            memcpy(j->pts, efrm_pts, 24);
+                        }
+                        if (efrm_dur && edlen == 24) {
+                            memcpy(j->dur, efrm_dur, 24);
+                        }
+                        if (efrm_uui && eulen == 16) {
+                            j->has_uui = true;
+                            memcpy(j->uui, efrm_uui, 16);
+                        }
+                        vtpv_reply_efrm_ok(s, slot, type);
+                        qemu_mutex_lock(&s->enc_lock);
+                        g_queue_push_tail(&s->enc_q, j);
+                        qemu_cond_broadcast(&s->enc_cond);
+                        qemu_mutex_unlock(&s->enc_lock);
+                        s->enc_accepted++;
+                        /* Opus 10-30 (q1347): the guest keeps ONE frame in
+                         * flight - a frame whose 'Eemt' lands after the next
+                         * 'efrm' fails -19092 (only each session's last frame
+                         * came through).  Its 'Eemt' goes out right behind
+                         * the reply, before this kick returns. */
+                        vtpv_enc_drain(s);
+                    }
+                } else if (type == 0x65706672u /* 'epfr' */) {
+                    /* o87 names it VTVideoEncoderPrepareToEncodeFrames; the
+                     * honest-ok reply has not disturbed the walk (q1342/43) */
+                    lab_elog("apple-vtpv: enc epfr -> ok\n");
+                    vtpv_reply_enc_ok(s, slot, type, false);
+                } else if (type == 0x65636f70u /* 'ecop' */) {
+                    /* copy property by ',key' - the reply carries ',err' and
+                     * ',val' only when a value exists (o87); a property we do
+                     * not track answers the typed -12900 */
+                    uint32_t ekl = 0;
+                    const uint8_t *ekp = vtpv_para_find(s->msg, total,
+                                                         0x2c6b6579u /* ',key' */, &ekl);
+                    VtpvBpVal ekv;
+                    if (!ekp || !vtpv_bp_val(ekp, ekl, vtpv_bp_obj(ekp, ekl, 0), &ekv, 1) ||
+                        ekv.kind != VTPV_BP_STR) {
+                        lab_elog("apple-vtpv: enc ecop: bad ,key -> -12900\n");
+                        vtpv_reply_enc_refuse_err(s, slot, type, -12900);
+                    } else {
+                        uint8_t epl[80];
+                        uint32_t epln = 0;
+                        bool ehave = true;
+                        if (strcmp(ekv.s, "UsingHardwareAcceleratedVideoEncoder") == 0) {
+                            epln = vtpv_bp_bool_pl(epl, true);
+                        } else if (strcmp(ekv.s, "AverageBitRate") == 0) {
+                            epln = vtpv_bp_int_pl(epl, (int64_t)vtpv_dxe_target(s->cur->dxe));
+                        } else if (strcmp(ekv.s, "ExpectedFrameRate") == 0) {
+                            epln = vtpv_bp_int_pl(epl, vtpv_dxe_fps(s->cur->dxe));
+                        } else if (strcmp(ekv.s, "MaxKeyFrameInterval") == 0) {
+                            epln = vtpv_bp_int_pl(epl, 1);
+                        } else if (strcmp(ekv.s, "RealTime") == 0) {
+                            epln = vtpv_bp_bool_pl(epl, true);
+                        } else if (strcmp(ekv.s, "ProfileLevel") == 0) {
+                            epln = vtpv_bp_str_pl(epl, "H264_High_AutoLevel");
+                        } else {
+                            ehave = false;
+                        }
+                        if (ehave) {
+                            uint8_t paras[64 + 80];
+                            uint32_t be_err, en = 0;
+                            stl_be_p(&be_err, 0);
+                            en += vtpv_para_put(paras + en, 0x2c657272u /* ',err' */,
+                                                "=s32", (uint8_t *)&be_err, 4);
+                            en += vtpv_para_put(paras + en, 0x2c76616cu /* ',val' */,
+                                                "=pls", epl, epln);
+                            lab_elog("apple-vtpv: enc ecop %s -> %u B value\n",
+                                     ekv.s, epln);
+                            vtpv_send_h2g2(s, slot, type, 4, s->msg + 0x10,
+                                           s->msg + 0x20, paras, en);
+                        } else {
+                            lab_elog("apple-vtpv: enc ecop %s -> -12900\n", ekv.s);
+                            vtpv_reply_enc_refuse_err(s, slot, type, -12900);
+                        }
+                    }
+                } else if (type == 0x65736574u /* 'eset' */) {
+                    /* set one property: {',key' string, ',val' scalar} ->
+                     * ',err' only (o87: VTVideoEncoderSetProperty) */
+                    uint32_t ekl = 0, evl = 0;
+                    const uint8_t *ekp = vtpv_para_find(s->msg, total,
+                                                         0x2c6b6579u /* ',key' */, &ekl);
+                    const uint8_t *evp = vtpv_para_find(s->msg, total,
+                                                         0x2c76616cu /* ',val' */, &evl);
+                    VtpvBpVal ekv, evv;
+                    if (ekp && evp &&
+                        vtpv_bp_val(ekp, ekl, vtpv_bp_obj(ekp, ekl, 0), &ekv, 1) &&
+                        ekv.kind == VTPV_BP_STR &&
+                        vtpv_bp_val(evp, evl, vtpv_bp_obj(evp, evl, 0), &evv, 2)) {
+                        vtpv_reply_enc_refuse_err(
+                            s, slot, type,
+                            vtpv_enc_apply_prop(s, ekv.s, &evv) ? 0 : -12900);
+                    } else {
+                        lab_elog("apple-vtpv: enc eset: unparseable -> -12900\n");
+                        vtpv_reply_enc_refuse_err(s, slot, type, -12900);
+                    }
+                } else if (type == 0x656d756cu /* 'emul' */) {
+                    /* set a batch: {',pro' dict of scalars} -> ',err' only
+                     * (o87 strips read-only keys, sets each pair) */
+                    uint32_t epl = 0;
+                    const uint8_t *epp = vtpv_para_find(s->msg, total,
+                                                         0x2c70726fu /* ',pro' */, &epl);
+                    VtpvBpVal edv;
+                    int32_t eerr = 0;
+                    if (epp && vtpv_bp_val(epp, epl, vtpv_bp_obj(epp, epl, 0), &edv, 2) &&
+                        edv.kind == VTPV_BP_DICT) {
+                        for (int i = 0; i < edv.n; i++) {
+                            if (!vtpv_enc_apply_prop(s, edv.el[i].s,
+                                                     &edv.el[i + edv.n])) {
+                                eerr = -12900;
+                            }
+                        }
+                    } else {
+                        eerr = -12900;
+                    }
+                    lab_elog("apple-vtpv: enc emul -> ,err %d\n", eerr);
+                    vtpv_reply_enc_refuse_err(s, slot, type, eerr);
                 } else {
                     lab_elog("apple-vtpv: enc %.4s -> refuse %d\n", t5, VTPV_ENC_REFUSE_ERR);
                     vtpv_reply_enc_refuse(s, slot, type);
@@ -6663,6 +7571,13 @@ static void vtpv_realize(PCIDevice *dev, Error **errp)
     s->tile_bh = qemu_bh_new(vtpv_tile_bh, s);
     s->ahead_bh = qemu_bh_new(vtpv_ahead_bh, s);
     qemu_thread_create(&s->tile_thread, "vtpv-tiles", vtpv_tile_thread, s,
+                       QEMU_THREAD_DETACHED);
+    g_queue_init(&s->enc_q);            /* task83: the encode worker */
+    g_queue_init(&s->enc_done);
+    qemu_mutex_init(&s->enc_lock);
+    qemu_cond_init(&s->enc_cond);
+    s->enc_bh = qemu_bh_new(vtpv_enc_bh, s);
+    qemu_thread_create(&s->enc_thread, "vtpv-encode", vtpv_enc_thread, s,
                        QEMU_THREAD_DETACHED);
     s->pool_min = 10;               /* 0002: VTPV_POOL_MIN (0 = omit the key) */
     {
