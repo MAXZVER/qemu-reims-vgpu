@@ -1566,32 +1566,36 @@ static int vtpv_enc_type_idx(uint32_t type)
     return -1;
 }
 
-/* bplist00 array of two encoder entries (avc1, hvc1): object 0 the array,
- * 1/2 the entry dicts (8 pairs, key objects shared), 3..10 the keys, then
- * the values.  Refs 1 byte (22 objects), offsets 2 bytes. */
+/* bplist00 array of two encoder entries (avc1, hvc1) - the v6 payload
+ * q1329 proved LIVE (task74): the consumer reads VTCodecType (INT32
+ * fourcc), VTRating, VTCodecName, Hide, CMClassImplementationName,
+ * CMClassImplementationID (the o86 CFSTR dumps); VTIsHardwareAccelerated
+ * and VTHostEncoderID ride along as tolerated extras.  Object 0 the
+ * array, 1/2 the entry dicts (8 pairs, key objects shared), 3..10 the
+ * keys, then the values.  Refs 1 byte (24 objects), offsets 2 bytes. */
 static uint32_t vtpv_encs_plist(uint8_t *out)
 {
     static const char *keys[8] = {
-        "CMCClassImplementationID", "CMCClassImplementationName",
-        "IsPreferredInternalPlugin", "VTCodectType",
-        "VTEncoderCapabilities", "VTHostEncoderID",
-        "VTIsHardwareAccelerated", "VTRating",
+        "VTCodecType", "VTRating", "VTCodecName", "Hide",
+        "CMClassImplementationName", "CMClassImplementationID",
+        "VTIsHardwareAccelerated", "VTHostEncoderID",
     };
     static const struct {
         uint32_t fcc;
-        const char *name;
+        const char *cname;              /* VTCodecName */
+        const char *name;               /* CMClassImplementationName */
     } encs[2] = {
-        { 0x61766331u /* 'avc1' */, "Paravirtual H.264" },
-        { 0x68766331u /* 'hvc1' */, "Paravirtual HEVC" },
+        { 0x61766331u /* 'avc1' */, "H.264", "Paravirtual H.264" },
+        { 0x68766331u /* 'hvc1' */, "HEVC", "Paravirtual HEVC" },
     };
-    /* value refs in key order: implID, name, preferred(true=13), codecType,
-     * capabilities({}=15), hostEncoderID, hwAccelerated(true=13), rating(17) */
+    /* value refs in key order (v6): codec(int32), rating(12), codecName,
+     * hide(13), implName, implID, hw(17), hostID */
     static const uint8_t valrefs[2][8] = {
-        { 11, 12, 13, 14, 15, 16, 13, 17 },
-        { 18, 19, 13, 20, 15, 21, 13, 17 },
+        { 11, 12, 14, 13, 15, 16, 17, 18 },
+        { 19, 12, 20, 13, 21, 22, 17, 23 },
     };
-    static const int si[2][3] = { { 11, 12, 16 }, { 18, 19, 21 } };
-    uint16_t off[22];
+    static const int si[2][4] = { { 14, 15, 16, 18 }, { 20, 21, 22, 23 } };
+    uint16_t off[24];
     uint32_t n = 0;
     memcpy(out, "bplist00", 8);
     n = 8;
@@ -1626,7 +1630,7 @@ static uint32_t vtpv_encs_plist(uint8_t *out)
         vtpv_log4cc(fcc, encs[e].fcc);
         snprintf(impl, sizeof(impl), "com.apple.videotoolbox.pv.%s", fcc);
         snprintf(hid, sizeof(hid), "pv-%s-0", fcc);
-        const char *sv[3] = { impl, encs[e].name, hid };
+        const char *sv[4] = { encs[e].cname, encs[e].name, impl, hid };
         for (int i = 0; i < 3; i++) {
             off[si[e][i]] = n;
             size_t kl = strlen(sv[i]);
@@ -1641,28 +1645,31 @@ static uint32_t vtpv_encs_plist(uint8_t *out)
             n += kl;
         }
     }
+    off[11] = n;                              /* VTCodecType 'avc1', int32 */
+    out[n++] = 0x12;
+    stl_be_p(out + n, encs[0].fcc);
+    n += 4;
+    off[19] = n;                              /* 'hvc1' */
+    out[n++] = 0x12;
+    stl_be_p(out + n, encs[1].fcc);
+    n += 4;
+    off[12] = n;
+    out[n++] = 0x11;                          /* VTRating 300, 2-byte int */
+    out[n++] = 0x01;
+    out[n++] = 0x2c;
     off[13] = n;
-    out[n++] = 0x09;                          /* true (preferred, hardware) */
-    off[14] = n;
-    out[n++] = 0x50 | 4;                      /* 'avc1' */
-    out[n++] = 0x61; out[n++] = 0x76; out[n++] = 0x63; out[n++] = 0x31;
-    off[15] = n;
-    out[n++] = 0xd0;                          /* VTEncoderCapabilities = {} */
+    out[n++] = 0x08;                          /* Hide = false */
     off[17] = n;
-    out[n++] = 0x10;                          /* VTRating: 1-byte int */
-    out[n++] = 300;
-    off[20] = n;
-    out[n++] = 0x50 | 4;                      /* 'hvc1' */
-    out[n++] = 0x68; out[n++] = 0x76; out[n++] = 0x63; out[n++] = 0x31;
+    out[n++] = 0x09;                          /* VTIsHardwareAccelerated */
     uint32_t table = n;
-    for (int i = 0; i < 22; i++) {
+    for (int i = 0; i < 24; i++) {
         stw_be_p(out + n, off[i]);
         n += 2;
     }
     memset(out + n, 0, 32);                   /* trailer */
     out[n + 6] = 2;                           /* offset int size */
     out[n + 7] = 1;                           /* object ref size */
-    stq_be_p(out + n + 8, 22);                /* objects */
+    stq_be_p(out + n + 8, 24);                /* objects */
     stq_be_p(out + n + 16, 0);                /* top object */
     stq_be_p(out + n + 24, table);            /* offset table offset */
     return n + 32;
@@ -1671,8 +1678,18 @@ static uint32_t vtpv_encs_plist(uint8_t *out)
 static void vtpv_reply_encs(AppleVtpv *s, int slot)
 {
     uint8_t pl[VTPV_ENCS_PLIST_MAX];
-    uint32_t plen = vtpv_encs_plist(pl);
+    uint32_t plen = 0;
     const char *src = "built-in";
+    /* TEMP lab (Opus 10-30, q1329/q1331): the payload the guest's encoder
+     * registry accepted (encs v6, generated into apple-vtpv-replies.h by
+     * mkcaps.py); the hand-built bplist below it was not registered (q1331:
+     * 15 encoder entries, no '+enc').  It stays only as a size fallback. */
+    if (sizeof(vtpv_encs_payload) <= sizeof(pl)) {
+        memcpy(pl, vtpv_encs_payload, sizeof(vtpv_encs_payload));
+        plen = sizeof(vtpv_encs_payload);
+    } else {
+        plen = vtpv_encs_plist(pl);
+    }
     if (s->reply_encs) {
         FILE *f = fopen(s->reply_encs, "rb");
         if (f) {
@@ -1710,6 +1727,26 @@ static void vtpv_reply_enc_refuse(AppleVtpv *s, int slot, uint32_t type)
     stl_be_p(&be_ver, 6);
     stl_be_p(&be_err, (uint32_t)(int32_t)VTPV_ENC_REFUSE_ERR);
     n += vtpv_para_put(paras + n, 0x2c766572u /* ',ver' */, "=u32", &be_ver, 4);
+    n += vtpv_para_put(paras + n, 0x2c657272u /* ',err' */, "=s32", &be_err, 4);
+    vtpv_send_h2g2(s, slot, type, 4, s->msg + 0x10, s->msg + 0x20, paras, n);
+}
+
+/* TEMP lab (Zcode 10-30, task74): the honest encoder-session reply -
+ * ',ver' + ',hin' (the sender REQUIRES the host-info dict even on error,
+ * FUN_7ff81585a606 in the o85 log) + ',err' 0.  The empty plist is the
+ * same 42 bytes the '+dec' template ships. */
+static void vtpv_reply_enc_ok(AppleVtpv *s, int slot, uint32_t type, bool hin)
+{
+    uint8_t paras[0x40 + 64];
+    uint32_t be_ver, be_err;
+    uint32_t n = 0;
+    stl_be_p(&be_ver, 6);
+    stl_be_p(&be_err, 0);
+    n += vtpv_para_put(paras + n, 0x2c766572u /* ',ver' */, "=u32", &be_ver, 4);
+    if (hin) {
+        n += vtpv_para_put(paras + n, 0x2c68696eu /* ',hin' */, "=pls",
+                           vtpv_empty_plist, sizeof(vtpv_empty_plist));
+    }
     n += vtpv_para_put(paras + n, 0x2c657272u /* ',err' */, "=s32", &be_err, 4);
     vtpv_send_h2g2(s, slot, type, 4, s->msg + 0x10, s->msg + 0x20, paras, n);
 }
@@ -5449,8 +5486,27 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
             }
             s->enc_seen[ei]++;
             if (flags & 1) {
-                lab_elog("apple-vtpv: enc %.4s -> refuse %d\n", t5, VTPV_ENC_REFUSE_ERR);
-                vtpv_reply_enc_refuse(s, slot, type);
+                /* TEMP lab (Zcode 10-30, task74): '+enc' is answered
+                 * honestly now (q1329 proved the registry - the session
+                 * exists, the follow-on messages keep arriving and land in
+                 * the dumper above); 'esta'/'ests' pass validation the same
+                 * way; 'efrm' and friends still get the typed refusal, so a
+                 * session that started against us fails loudly instead of
+                 * hanging - until the dx encoder backend answers them for
+                 * real.  Keep enc=off outside the lab: a RequireHW client
+                 * that reaches a refused 'efrm' has no mid-session software
+                 * fallback. */
+                if (type == 0x2b656e63u /* '+enc' */) {
+                    lab_elog("apple-vtpv: enc +enc -> ok (,hin {})\n");
+                    vtpv_reply_enc_ok(s, slot, type, true);
+                } else if (type == 0x65737461u /* 'esta' */ ||
+                           type == 0x65737473u /* 'ests' */) {
+                    lab_elog("apple-vtpv: enc %.4s -> ok\n", t5);
+                    vtpv_reply_enc_ok(s, slot, type, false);
+                } else {
+                    lab_elog("apple-vtpv: enc %.4s -> refuse %d\n", t5, VTPV_ENC_REFUSE_ERR);
+                    vtpv_reply_enc_refuse(s, slot, type);
+                }
             }
             return;
         }
