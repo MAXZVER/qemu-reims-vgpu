@@ -127,7 +127,7 @@ typedef struct VtpvSess {
         int idx;
         uint64_t id;
         int64_t t_us;               /* 28-10 (o29): submitted at - the age watchdog */
-    } infl[8];                      /* q1379: per session (was the device's) - dec_lock */
+    } infl[16];                     /* q1379: per session (was the device's) - dec_lock; q1389: 16 = reorder depth */
     uint32_t infl_n;
     bool dec_busy;                  /* a decode worker is decoding for it (the tile thread waits it out) */
     bool orphan_logged;             /* q1382: an orphan 'dfrm' was refused and logged */
@@ -2858,8 +2858,11 @@ static void vtpv_shed(AppleVtpv *s, VtpvSess *se)
     /* q1378: 64 still shed 129 of a 300-frame clip fed at once (vtdec, the
      * Telegram pattern) - waiting frames hold compressed samples only, so an
      * async client may queue up to 3/4 of the table before anything sheds */
-    uint32_t cap = (se->realtime || !se->async_seen) ? s->backlog
-                                                     : MAX(s->backlog, (uint32_t)(VTPV_FRAMES * 3 / 4));
+    /* q1390: synchronous clients feed AHEAD of time, not late - a sync
+     * HEVC probe kept 94 of 600 frames, the wallpaper stood still.  Only a
+     * real-time player sheds at the backlog; the wallpaper's load is the
+     * sync-tid thinning's job. */
+    uint32_t cap = se->realtime ? s->backlog : MAX(s->backlog, (uint32_t)(VTPV_FRAMES * 3 / 4));
     uint32_t waiting = 0;
     for (int i = 0; i < VTPV_FRAMES; i++) {
         waiting += se->frame[i].in_use && !se->frame[i].dbuf_sent && !se->frame[i].shed;
@@ -4240,12 +4243,14 @@ static void vtpv_route_picture(AppleVtpv *s, VtpvSess *se, int64_t tag)
                 s->stat_route_hit++;
                 continue;                           /* leaves the FIFO */
             }
-            if (i < (uint32_t)hit_i) {
-                /* older, produced no picture */
-                se->frame[idx].decoded = true;
-                s->stat_route_miss++;
-                continue;
-            }
+            /* q1389: the others stay - pictures come back in DISPLAY order
+             * (the decoder's reorder delay), so an older submission without
+             * its picture yet is not a miss: the 240 fps HEVC wallpaper
+             * (B-pyramid, five temporal layers) had nearly every frame
+             * marked pictureless this way on the 4090 (5289 of 5542 4K
+             * decodes) - black, then green wallpaper.  A frame that really
+             * yields nothing resolves at the settle (flush, a full infl, the
+             * 100 ms age watchdog). */
             se->infl[keep++] = se->infl[i];
         }
         se->infl_n = keep;
@@ -4783,7 +4788,7 @@ static void *vtpv_dec_thread(void *opaque)
 
 /* q1378: one session may hold at most this many frame jobs in the shared
  * ring - the wallpaper's two 4K streams filled all of it before */
-#define VTPV_DEC_PER_SESS 8
+#define VTPV_DEC_PER_SESS 16        /* q1389: 8 -> 16, room for a 4K session's dec-ahead */
 
 /* jobs of this session in the ring (dec_lock held) */
 static uint32_t vtpv_dec_jobs_of(AppleVtpv *s, VtpvSess *se)
@@ -4804,14 +4809,40 @@ static bool vtpv_dec_queue(AppleVtpv *s, VtpvSess *se, int idx)
          * slot outlived the frame, the slot was reused and the stale job
          * decoded the NEXT frame out of order ("Could not find ref") */
         ok = true;
-    } else if (s->dec_n < ARRAY_SIZE(s->dec_job) && vtpv_dec_jobs_of(s, se) < VTPV_DEC_PER_SESS) {
-        uint32_t t = (s->dec_head + s->dec_n) % ARRAY_SIZE(s->dec_job);
-        s->dec_job[t].se = se;
-        s->dec_job[t].idx = idx;
-        s->dec_n++;
-        se->frame[idx].queued = true;
-        qemu_cond_broadcast(&s->dec_cond);
-        ok = true;
+    } else {
+        /* q1389: decode order is the session's arrival order, always.  With
+         * the per-session cap, an asked frame could fail to queue while the
+         * dec-ahead loop queued LATER frames of the same session: HEVC
+         * decoded out of order (garbage, a green wallpaper), the asked frame
+         * never decoded (pump-stall oldest q=0, 512 waiting) and the
+         * wallpaper previews in Settings hung behind it.  Queue the older
+         * frames that still need a decode first; stop at the first refusal. */
+        for (;;) {
+            int o = -1;
+            for (int i = 0; i < VTPV_FRAMES; i++) {
+                if (se->frame[i].in_use && !se->frame[i].queued && se->frame[i].sample &&
+                    !se->frame[i].nv12 && se->frame[i].seq <= se->frame[idx].seq &&
+                    (o < 0 || se->frame[i].seq < se->frame[o].seq)) {
+                    o = i;
+                }
+            }
+            if (o < 0) {
+                o = idx;            /* nothing older pending: idx itself, as before */
+            }
+            if (s->dec_n >= ARRAY_SIZE(s->dec_job) || vtpv_dec_jobs_of(s, se) >= VTPV_DEC_PER_SESS) {
+                break;
+            }
+            uint32_t t = (s->dec_head + s->dec_n) % ARRAY_SIZE(s->dec_job);
+            s->dec_job[t].se = se;
+            s->dec_job[t].idx = o;
+            s->dec_n++;
+            se->frame[o].queued = true;
+            qemu_cond_broadcast(&s->dec_cond);
+            if (o == idx) {
+                ok = true;
+                break;
+            }
+        }
     }
     qemu_mutex_unlock(&s->dec_lock);
     return ok;
