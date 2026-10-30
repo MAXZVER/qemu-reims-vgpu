@@ -7071,10 +7071,6 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                          (unsigned long long)s->last_frame_id);
             }
         }
-        if (non_tile_dfrm && s->tid_drop_now && reply_tpl == vtpv_tpl_generic &&
-            rlen == (long)sizeof(vtpv_tpl_generic)) {
-            stl_be_p(rep + 104, 1u << 1);   /* ',inf' = kVTDecodeInfo_FrameDropped */
-        }
         if (type == 0x64737473u /* 'dsts' */ && reply_tpl == vtpv_tpl_generic &&
             rlen == (long)sizeof(vtpv_tpl_generic)) {
             if (!s->tiles || (s->tiles_one_session && s->tile_sessions > 0)) {
@@ -7192,9 +7188,12 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
             vtpv_send_dbuf(s, slot, s->last_frame_id, s->msg + 0x10);
         } else if (s->ob_sample) {
             vtpv_send_dbuf(s, slot, s->last_frame_id, s->msg + 0x10);
-        } else if (s->tid_drop_now) {
-            s->tid_drop_now = false;    /* q1386: completed in its reply already */
         } else {
+            /* q1386: a sync-tid drop lands here too.  o128 answered it only
+             * in the dfrm reply (',inf' FrameDropped, no 'Demt') - on Mish's
+             * AMD VM the wallpaper stayed black and the lock screen too: the
+             * guest session still waits for every frame's emit. */
+            s->tid_drop_now = false;
             /* nothing to show for this sample: complete it as dropped
              * (kVTDecodeInfo_FrameDropped) so the session never waits on it */
             uint8_t zero_uuid[16] = { 0 };
