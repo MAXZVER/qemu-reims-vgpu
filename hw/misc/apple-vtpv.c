@@ -4307,6 +4307,7 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
     uint32_t type = be32_to_cpu(be_type);
     uint32_t flags = be32_to_cpu(be_flags);
     s->cur = vtpv_sess_get(s, s->msg + 0x10);
+    s->cur->slot = slot;    /* TEMP lab (Opus 10-30): the owner slot, for the reuse drop below */
     s->cur->last_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);  /* TEMP lab (task63): idle clock */
     vtpv_note_handles(s);    /* TEMP lab (task61): rate-limited to 1/s */
     vtpv_dx_close_idle(s);   /* TEMP lab (task63): rate-limited to 1/s */
@@ -5586,13 +5587,43 @@ static uint64_t vtpv_mmio_read(void *opaque, hwaddr addr, unsigned size)
     return v;
 }
 
+/* TEMP lab (Opus 10-30, q1313): the kext frees a slot when its client closes
+ * or dies without telling the device, so the sessions of a process killed
+ * mid-decode stayed in the table with their undelivered pictures until LRU
+ * eviction at 64 (q1313: sess 12 -> 63 over eight rounds, QEMU private memory
+ * +110 MB a round).  A new client announcing its own h2g queue on the slot is
+ * the end of the previous owner: drop every session that slot owned.  Sessions
+ * are found by uuid; a live client never re-announces its queue. */
+static void vtpv_sess_drop_slot(AppleVtpv *s, int slot)
+{
+    uint8_t uuids[VTPV_SESS][16];
+    int n = 0;
+    for (int i = 0; i < VTPV_SESS; i++) {
+        if (s->sess[i].used && s->sess[i].slot == slot) {
+            memcpy(uuids[n++], s->sess[i].uuid, 16);
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        vtpv_sess_drop(s, uuids[i]);
+    }
+    if (n) {
+        lab_elog("apple-vtpv: slot%d re-announced by a new client - dropped %d session(s) of the previous owner\n",
+                 slot, n);
+    }
+}
+
 static void vtpv_set_reg64(AppleVtpv *s, uint32_t off, uint64_t val)
 {
     AppleVtpvSlot *sl = &s->slot[s->client_id];
     switch (off) {
     case VTPV_G2H_GPA: sl->g2h_gpa = val; break;
     case VTPV_G2H_LEN: sl->g2h_len = val; break;
-    case VTPV_H2G_GPA: sl->h2g_gpa = val; break;
+    case VTPV_H2G_GPA:
+        if (val && sl->h2g_gpa && val != sl->h2g_gpa) {
+            vtpv_sess_drop_slot(s, s->client_id);
+        }
+        sl->h2g_gpa = val;
+        break;
     case VTPV_H2G_LEN: sl->h2g_len = val; break;
     case VTPV_UUID_GPA: sl->uuid_gpa = val; break;
     default: return;
