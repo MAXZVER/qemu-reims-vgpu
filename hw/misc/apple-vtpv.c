@@ -154,7 +154,10 @@ typedef struct VtpvSess {
     bool efds_sent;                 /* the format description went out */
     uint64_t enc_pre_bitrate;       /* properties set before 'esta' (avconvert) */
     uint32_t enc_pre_fps;
+    bool epba_sent;                 /* 'Epba' (pixel buffer attributes) went out */
     uint8_t dxe_avcc[64];           /* its avcC, built at open */
+    uint8_t enc_fdsc[512];          /* the serialized format description every sample carries */
+    uint32_t enc_fdsc_len;
     uint32_t dxe_avcc_len;
 } VtpvSess;
 
@@ -3790,10 +3793,98 @@ static void vtpv_cmtime_be_to_le(uint8_t *dst, const uint8_t *src)
     stq_le_p(dst + 16, ldq_be_p(src + 16));
 }
 
-static uint32_t vtpv_enc_sbuf(uint8_t *out, uint32_t cap, const uint8_t *pts,
-                              const uint8_t *dur, const uint8_t *sdat, uint32_t sl)
+/* a one-object binary plist: an ASCII string (kind 's') or data (kind 'd'),
+ * the CFPropertyListCreateData(binary) form CoreMedia's atom values carry */
+static uint32_t vtpv_bp_one(uint8_t *out, char kind, const uint8_t *v, uint32_t len)
 {
-    if (cap < 8 + (8 + 24) + (8 + 72) + (8 + sl) + (8 + 4) + (8 + 4)) {
+    uint32_t n = 8;
+    memcpy(out, "bplist00", 8);
+    uint8_t m = kind == 's' ? 0x50 : 0x40;
+    if (len < 15) {
+        out[n++] = m | len;
+    } else {
+        out[n++] = m | 0x0f;
+        out[n++] = 0x10;           /* 1-byte int length */
+        out[n++] = (uint8_t)len;   /* < 256 */
+    }
+    memcpy(out + n, v, len);
+    n += len;
+    out[n] = 8;                    /* offset table: object 0 at 8 */
+    memset(out + n + 1, 0, 32);
+    out[n + 1 + 6] = 1;            /* offset int size */
+    out[n + 1 + 7] = 1;            /* object ref size */
+    stq_be_p(out + n + 1 + 8, 1);  /* one object */
+    stq_be_p(out + n + 1 + 16, 0); /* top = object 0 */
+    stq_be_p(out + n + 1 + 24, n); /* offset table at n */
+    return n + 1 + 32;
+}
+
+/* the sample's format description atom, as VideoToolbox's own serializer
+ * writes it (0x7ff81588fa5d in the 25A354 dsc, FigAtomWriter: BE headers,
+ * native values):
+ *   fdsc[ mdia 'vide' | vdim {w,h} | codc 'avc1' |
+ *         extn[ dict[ keyv[ strk bplist("SampleDescriptionExtensionAtoms"),
+ *                           dict[ keyv[ strk bplist("avcC"), datv bplist(<avcC>) ] ] ] ] ] ]
+ * Opus 10-30 (q1358): without it the app's samples carry no format
+ * description and avconvert's movie writer fails -16356 after 145 frames. */
+static uint32_t vtpv_enc_fdsc(uint8_t *out, uint32_t cap, uint32_t w, uint32_t h,
+                              uint32_t codec, const uint8_t *avcc, uint32_t avcc_len)
+{
+    static const char sdea[] = "SampleDescriptionExtensionAtoms";
+    uint8_t k1[96], k2[64], dv[128];
+    if (avcc_len > 80) {
+        return 0;
+    }
+    uint32_t k1n = vtpv_bp_one(k1, 's', (const uint8_t *)sdea, sizeof(sdea) - 1);
+    uint32_t k2n = vtpv_bp_one(k2, 's', (const uint8_t *)"avcC", 4);
+    uint32_t dvn = vtpv_bp_one(dv, 'd', avcc, avcc_len);
+    uint32_t inner_keyv = 8 + (8 + k2n) + (8 + dvn);
+    uint32_t inner_dict = 8 + inner_keyv;
+    uint32_t outer_keyv = 8 + (8 + k1n) + inner_dict;
+    uint32_t outer_dict = 8 + outer_keyv;
+    uint32_t extn = 8 + outer_dict;
+    uint32_t total = 8 + (8 + 4) + (8 + 8) + (8 + 4) + extn;
+    if (total > cap) {
+        return 0;
+    }
+    uint8_t v4[8];
+    uint32_t n = 0;
+    stl_be_p(out + n, total);
+    memcpy(out + n + 4, "fdsc", 4);
+    n += 8;
+    stl_le_p(v4, 0x76696465u);                 /* 'vide' */
+    n += vtpv_atom_put(out + n, "mdia", v4, 4);
+    stl_le_p(v4, w);
+    stl_le_p(v4 + 4, h);
+    n += vtpv_atom_put(out + n, "vdim", v4, 8);
+    stl_le_p(v4, codec);
+    n += vtpv_atom_put(out + n, "codc", v4, 4);
+    stl_be_p(out + n, extn);
+    memcpy(out + n + 4, "extn", 4);
+    n += 8;
+    stl_be_p(out + n, outer_dict);
+    memcpy(out + n + 4, "dict", 4);
+    n += 8;
+    stl_be_p(out + n, outer_keyv);
+    memcpy(out + n + 4, "keyv", 4);
+    n += 8;
+    n += vtpv_atom_put(out + n, "strk", k1, k1n);
+    stl_be_p(out + n, inner_dict);
+    memcpy(out + n + 4, "dict", 4);
+    n += 8;
+    stl_be_p(out + n, inner_keyv);
+    memcpy(out + n + 4, "keyv", 4);
+    n += 8;
+    n += vtpv_atom_put(out + n, "strk", k2, k2n);
+    n += vtpv_atom_put(out + n, "datv", dv, dvn);
+    return n == total ? n : 0;
+}
+
+static uint32_t vtpv_enc_sbuf(uint8_t *out, uint32_t cap, const uint8_t *pts,
+                              const uint8_t *dur, const uint8_t *sdat, uint32_t sl,
+                              const uint8_t *fdsc, uint32_t fdsc_len)
+{
+    if (cap < 8 + fdsc_len + (8 + 24) + (8 + 72) + (8 + sl) + (8 + 4) + (8 + 4)) {
         return 0;
     }
     uint8_t opts[24], stia[72], nsmp[4], ssiz[4];
@@ -3808,6 +3899,10 @@ static uint32_t vtpv_enc_sbuf(uint8_t *out, uint32_t cap, const uint8_t *pts,
     stl_le_p(nsmp, 1);
     stl_le_p(ssiz, sl);
     uint32_t sub = 0;
+    if (fdsc_len) {
+        memcpy(out + 8, fdsc, fdsc_len);   /* already a whole 'fdsc' atom */
+        sub += fdsc_len;
+    }
     sub += vtpv_atom_put(out + 8 + sub, "opts", opts, 24);
     sub += vtpv_atom_put(out + 8 + sub, "stia", stia, 72);
     sub += vtpv_atom_put(out + 8 + sub, "sdat", sdat, sl);
@@ -3826,8 +3921,13 @@ static void vtpv_send_efds(AppleVtpv *s, int slot, const uint8_t *uuid16,
                            uint32_t cod, uint32_t w, uint32_t h,
                            const uint8_t *avcc, uint32_t avcc_len)
 {
+    /* Opus 10-30 (q1349 '=fds'): a top-level "avcC" key was ignored - the
+     * guest's format description came back as a bare 86-byte ImageDescription.
+     * CoreMedia keeps the atom under SampleDescriptionExtensionAtoms:
+     * { SampleDescriptionExtensionAtoms = { avcC = <data> } } */
+    static const char sdea[] = "SampleDescriptionExtensionAtoms";
     uint8_t pl[192];
-    uint8_t off[3];
+    uint8_t off[5];
     uint32_t n = 0;
     memcpy(pl, "bplist00", 8);
     n = 8;
@@ -3836,22 +3936,32 @@ static void vtpv_send_efds(AppleVtpv *s, int slot, const uint8_t *uuid16,
     pl[n++] = 1;                   /* key ref */
     pl[n++] = 2;                   /* value ref */
     off[1] = n;
+    pl[n++] = 0x5f;                /* ASCII string, int length follows */
+    pl[n++] = 0x10;
+    pl[n++] = sizeof(sdea) - 1;
+    memcpy(pl + n, sdea, sizeof(sdea) - 1);
+    n += sizeof(sdea) - 1;
+    off[2] = n;
+    pl[n++] = 0xd1;                /* the atoms dict, one pair */
+    pl[n++] = 3;
+    pl[n++] = 4;
+    off[3] = n;
     pl[n++] = 0x54;                /* ASCII string, 4 chars */
     memcpy(pl + n, "avcC", 4);
     n += 4;
-    off[2] = n;
+    off[4] = n;
     pl[n++] = 0x4f;                /* data, int length follows */
     pl[n++] = 0x10;                /* 1-byte int */
     pl[n++] = (uint8_t)avcc_len;   /* avcC < 256 B */
     memcpy(pl + n, avcc, avcc_len);
     n += avcc_len;
     uint32_t table = n;
-    memcpy(pl + n, off, 3);
-    n += 3;
+    memcpy(pl + n, off, 5);
+    n += 5;
     memset(pl + n, 0, 32);
     pl[n + 6] = 1;                 /* offset int size */
     pl[n + 7] = 1;                 /* object ref size */
-    stq_be_p(pl + n + 8, 3);       /* 3 objects */
+    stq_be_p(pl + n + 8, 5);       /* 5 objects */
     stq_be_p(pl + n + 16, 0);      /* top object = the dict */
     stq_be_p(pl + n + 24, table);
     n += 32;
@@ -3885,11 +3995,11 @@ static void vtpv_send_eemt(AppleVtpv *s, int slot, const uint8_t *uuid16,
                            uint64_t frame_id, int32_t err,
                            const uint8_t *pts, const uint8_t *dur,
                            const uint8_t *sdat, uint32_t sl,
-                           const uint8_t *uui)
+                           const uint8_t *uui, const uint8_t *fdsc, uint32_t fdsc_len)
 {
-    uint32_t cap = 200 + sl;
+    uint32_t cap = 200 + sl + fdsc_len;
     uint8_t *sbuf = g_malloc(cap);
-    uint32_t sn = vtpv_enc_sbuf(sbuf, cap, pts, dur, sdat, sl);
+    uint32_t sn = vtpv_enc_sbuf(sbuf, cap, pts, dur, sdat, sl, fdsc, fdsc_len);
     uint8_t *paras = g_malloc(0x80 + sn);
     uint32_t n = 0;
     uint64_t be_frm = cpu_to_be64(frame_id);
@@ -3944,7 +4054,8 @@ static void vtpv_enc_bh(void *opaque)
             }
             vtpv_send_eemt(s, j->slot, j->uuid16, j->frame_id, 0, j->pts,
                            j->dur, j->avcc, j->avcc_len,
-                           j->has_uui ? j->uui : NULL);
+                           j->has_uui ? j->uui : NULL,
+                           j->se->enc_fdsc, j->se->enc_fdsc_len);
             if ((s->enc_emitted & 15) == 1) {
                 lab_elog("apple-vtpv: enc emitted %llu (accepted %llu)\n",
                          (unsigned long long)s->enc_emitted,
@@ -3957,7 +4068,7 @@ static void vtpv_enc_bh(void *opaque)
             lab_elog("apple-vtpv: enc frame %llu failed rc=%d len=%u -> Eemt -12903\n",
                      (unsigned long long)j->frame_id, j->rc, j->avcc_len);
             vtpv_send_eemt(s, j->slot, j->uuid16, j->frame_id, -12903,
-                           j->pts, j->dur, NULL, 0, j->has_uui ? j->uui : NULL);
+                           j->pts, j->dur, NULL, 0, j->has_uui ? j->uui : NULL, NULL, 0);
         }
         vtpv_enc_job_free(j);
     }
@@ -6347,6 +6458,7 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                     vtpv_enc_close_async(s, s->cur->dxe);
                     s->cur->dxe = NULL;
                     s->cur->efds_sent = false;
+                    s->cur->epba_sent = false;
                     lab_elog("apple-vtpv: enc -enc -> close\n");
                 }
                 return;
@@ -6376,6 +6488,29 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                     vtpv_reply_enc_ok(s, slot, type, true);
                 } else if (type == 0x65737570u /* 'esup' */) {
                     vtpv_reply_esup(s, slot);
+                    if (s->cur->dxe && !s->cur->epba_sent) {
+                        /* Opus 10-30 (q1357): avconvert's Remaker copies
+                         * VideoEncoderPixelBufferAttributes right after
+                         * 'esup' and fails -16103 on NULL - the PV encoder
+                         * only knows what the host's 'Epba' told it (the
+                         * host side in VideoToolbox sends 'Epba' {',pba'},
+                         * the 'Dpba' twin).  It rides this kick behind the
+                         * reply, so the kext's reply-sync lets the pump take
+                         * it before the sender returns. */
+                        uint8_t plist[192], paras[256];
+                        uint32_t pl = vtpv_pba_plist(plist, s->cur->dxe_w, s->cur->dxe_h,
+                                                     0x34323076u /* '420v' */, 0, 0);
+                        uint32_t pn = vtpv_para_put(paras, 0x2c706261u /* ',pba' */, "=pls",
+                                                    plist, pl);
+                        s->host_msg_id++;
+                        uint8_t id8[8];
+                        stq_be_p(id8, s->host_msg_id);
+                        vtpv_send_h2g(s, slot, 0x45706261u /* 'Epba' */, s->msg + 0x10, id8,
+                                      paras, pn);
+                        s->cur->epba_sent = true;
+                        lab_elog("apple-vtpv: enc Epba sent %ux%u 420v (%u plist bytes)\n",
+                                 s->cur->dxe_w, s->cur->dxe_h, pl);
+                    }
                 } else if (type == 0x65696e76u /* 'einv' */) {
                     /* task83: invalidate = the encoder closes (as a worker
                      * job); the reply still goes out at once */
@@ -6383,6 +6518,7 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                         vtpv_enc_close_async(s, s->cur->dxe);
                         s->cur->dxe = NULL;
                         s->cur->efds_sent = false;
+                        s->cur->epba_sent = false;
                         lab_elog("apple-vtpv: enc einv -> close\n");
                     } else {
                         lab_elog("apple-vtpv: enc einv -> ok\n");
@@ -6400,6 +6536,7 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                         vtpv_enc_close_async(s, s->cur->dxe);
                         s->cur->dxe = NULL;
                         s->cur->efds_sent = false;
+                        s->cur->epba_sent = false;
                     }
                     if (vdi && vl >= 8) {
                         uint32_t w = ldl_be_p(vdi), h = ldl_be_p(vdi + 4);
@@ -6416,9 +6553,12 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                             if (!s->cur->enc_cod) {
                                 s->cur->enc_cod = 0x61766331u; /* 'avc1' */
                             }
+                            s->cur->enc_fdsc_len = vtpv_enc_fdsc(
+                                s->cur->enc_fdsc, sizeof(s->cur->enc_fdsc), w, h,
+                                s->cur->enc_cod, s->cur->dxe_avcc, s->cur->dxe_avcc_len);
                             lab_elog("apple-vtpv: enc esta %ux%u -> open "
-                                     "(avcC %u B, encoders=%d)\n",
-                                     w, h, s->cur->dxe_avcc_len,
+                                     "(avcC %u B, fdsc %u B, encoders=%d)\n",
+                                     w, h, s->cur->dxe_avcc_len, s->cur->enc_fdsc_len,
                                      vtpv_dxe_open_count());
                             vtpv_reply_enc_ok(s, slot, type, false);
                             /* Opus 10-30 (q1348): NOT here - an 'Efds' right
