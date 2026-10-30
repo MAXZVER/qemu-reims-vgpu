@@ -1722,13 +1722,18 @@ static void vtpv_reply_encs(AppleVtpv *s, int slot)
  * mirror of how a refused 'dsta' falls back to software decode. */
 static void vtpv_reply_enc_refuse(AppleVtpv *s, int slot, uint32_t type)
 {
+    /* task76: ',inf' is required too - the 'efrm' reply parser gates on
+     * GetUInt32(',inf') (FUN_7ff815540d0f, o87); without it a refusal
+     * surfaces as a reply-parse error instead of the clean refusal code */
     uint8_t paras[0x40];
-    uint32_t be_ver, be_err;
+    uint32_t be_ver, be_err, be_inf;
     uint32_t n = 0;
     stl_be_p(&be_ver, 6);
     stl_be_p(&be_err, (uint32_t)(int32_t)VTPV_ENC_REFUSE_ERR);
+    stl_be_p(&be_inf, 0);
     n += vtpv_para_put(paras + n, 0x2c766572u /* ',ver' */, "=u32", &be_ver, 4);
     n += vtpv_para_put(paras + n, 0x2c657272u /* ',err' */, "=s32", &be_err, 4);
+    n += vtpv_para_put(paras + n, 0x2c696e66u /* ',inf' */, "=u32", &be_inf, 4);
     vtpv_send_h2g2(s, slot, type, 4, s->msg + 0x10, s->msg + 0x20, paras, n);
 }
 
