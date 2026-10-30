@@ -99,4 +99,23 @@ typedef struct VtpvDxHandles {
 
 void vtpv_dx_handles(VtpvDxHandles *h);
 
+/* TEMP (lab, Zcode 10-30 task77): D3D12 Video Encode backend
+ * (apple-vtpv-dx-enc.c).  H.264 first, NV12 in host memory in, Annex-B out;
+ * GOP 1 so every sample is a self-contained SPS/PPS+IDR.  gpu: "nv" (default,
+ * the RTX 4060) or "int".  Any failure -> NULL / nonzero, the caller keeps
+ * refusing encoder requests - never a hang.  Validate standalone with
+ * lab/tools/session-2026-10-02/hwsurvey/dxeprobe.c before wiring it in. */
+typedef struct VtpvDxE VtpvDxE;
+
+VtpvDxE *vtpv_dxe_open(const char *gpu, uint32_t w, uint32_t h,
+                       uint32_t fps, uint32_t bitrate);
+
+/* encode one NV12 frame; out receives Annex-B bytes (SPS/PPS on IDR frames);
+ * 0 = ok. */
+int vtpv_dxe_encode(VtpvDxE *e, const uint8_t *y, uint32_t y_stride,
+                    const uint8_t *uv, uint32_t uv_stride, int force_key,
+                    uint8_t *out, uint32_t out_cap, uint32_t *out_len);
+
+void vtpv_dxe_close(VtpvDxE *e);
+
 #endif /* HW_MISC_APPLE_VTPV_DX_H */

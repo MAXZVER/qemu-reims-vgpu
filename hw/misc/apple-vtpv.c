@@ -5600,8 +5600,10 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
             vtpv_log4cc(t5, type);
             uint32_t seq = s->enc_seen[ei];
             if (seq < 2) {
-                uint32_t dump = total < 0x30 + 96 ? total : 0x30 + 96;
-                char hex[3 * 96 + 1];
+                /* task77: 288 bytes - the whole 280-byte 'efrm' incl. the
+                 * source-surface descriptor that rides inline with it */
+                uint32_t dump = total < 0x30 + 288 ? total : 0x30 + 288;
+                char hex[3 * 288 + 1];
                 uint32_t m = 0;
                 for (uint32_t i = 0; i < dump && m + 3 <= sizeof(hex); i++) {
                     m += snprintf(hex + m, sizeof(hex) - m, "%02x ", s->msg[i]);
