@@ -261,6 +261,7 @@ struct AppleVtpv {
     bool enc;
     char *reply_encs;               /* bplist overriding the built-in ',enc' payload */
     uint32_t enc_seen[10];          /* first-paras logging, one slot per encode type */
+    uint32_t encs_fcc;              /* task75: the live encode session's ',cod' fourcc */
     char *reply_plusdec;            /* stage-2: file whose bytes answer '+dec' */
     char *reply_generic;            /* stage-3: ',ver'+',err' template for any other sync
                                      * query (dsta/dinv/...); the request's message type
@@ -1749,6 +1750,124 @@ static void vtpv_reply_enc_ok(AppleVtpv *s, int slot, uint32_t type, bool hin)
     }
     n += vtpv_para_put(paras + n, 0x2c657272u /* ',err' */, "=s32", &be_err, 4);
     vtpv_send_h2g2(s, slot, type, 4, s->msg + 0x10, s->msg + 0x20, paras, n);
+}
+
+/* TEMP lab (Zcode 10-30, task75): the 'esup' reply - the encoder's
+ * supported-property dictionary, the 'dsup' analog.  q1332: the guest asks
+ * it right after 'esta' (a bare 48-byte request) and tears the session down
+ * when it is refused.  Modelled on what VTCopySupportedPropertyDictionary-
+ * ForEncoder returns for a hardware encoder; ProfileLevel follows the
+ * session's codec (',cod' captured at '+enc'). */
+static uint32_t vtpv_esup_plist(uint8_t *out, uint32_t codec)
+{
+    static const char *keys[6] = {
+        "AllowFrameReordering", "AverageBitRate", "ExpectedFrameRate",
+        "MaxKeyFrameInterval", "ProfileLevel", "RealTime",
+    };
+    const char *profiles[3];
+    int nprof = 0;
+    if (codec == 0x68766331u /* 'hvc1' */) {
+        profiles[nprof++] = "HEVC_Main_AutoLevel";
+        profiles[nprof++] = "HEVC_Main10_AutoLevel";
+    } else {
+        profiles[nprof++] = "H264_Baseline_AutoLevel";
+        profiles[nprof++] = "H264_Main_AutoLevel";
+        profiles[nprof++] = "H264_High_AutoLevel";
+    }
+    int nobj = 13 + nprof;    /* 0 dict, 1..6 keys, 7 false, 8 int32, 9 fps,
+                               * 10 interval, 11 true, 12 array, 13.. profiles */
+    uint16_t off[16];
+    uint32_t n = 0;
+    memcpy(out, "bplist00", 8);
+    n = 8;
+    off[0] = n;
+    out[n++] = 0xd6;                         /* dict, 6 pairs */
+    for (int i = 1; i <= 6; i++) {
+        out[n++] = i;                        /* key refs */
+    }
+    out[n++] = 7;                            /* value refs in key order: */
+    out[n++] = 8;                            /*  false, bitrate, fps,       */
+    out[n++] = 9;                            /*  interval, profiles, true   */
+    out[n++] = 10;
+    out[n++] = 12;
+    out[n++] = 11;
+    for (int i = 0; i < 6; i++) {
+        off[1 + i] = n;
+        size_t kl = strlen(keys[i]);
+        if (kl < 15) {
+            out[n++] = 0x50 | kl;
+        } else {
+            out[n++] = 0x5f;
+            out[n++] = 0x10;
+            out[n++] = kl;
+        }
+        memcpy(out + n, keys[i], kl);
+        n += kl;
+    }
+    off[7] = n;
+    out[n++] = 0x08;                         /* AllowFrameReordering = false */
+    off[8] = n;                              /* AverageBitRate = 20 Mbps */
+    out[n++] = 0x12;
+    stl_be_p(out + n, 20000000);
+    n += 4;
+    off[9] = n;
+    out[n++] = 0x10;                         /* ExpectedFrameRate = 60 */
+    out[n++] = 60;
+    off[10] = n;
+    out[n++] = 0x11;                         /* MaxKeyFrameInterval = 240 */
+    out[n++] = 0x00;
+    out[n++] = 0xf0;
+    off[11] = n;
+    out[n++] = 0x09;                         /* RealTime = true */
+    off[12] = n;
+    out[n++] = 0xa0 | nprof;                 /* ProfileLevel array */
+    for (int i = 0; i < nprof; i++) {
+        out[n++] = 13 + i;
+    }
+    for (int i = 0; i < nprof; i++) {
+        off[13 + i] = n;
+        size_t kl = strlen(profiles[i]);
+        if (kl < 15) {
+            out[n++] = 0x50 | kl;
+        } else {
+            out[n++] = 0x5f;
+            out[n++] = 0x10;
+            out[n++] = kl;
+        }
+        memcpy(out + n, profiles[i], kl);
+        n += kl;
+    }
+    uint32_t table = n;
+    for (int i = 0; i < nobj; i++) {
+        stw_be_p(out + n, off[i]);
+        n += 2;
+    }
+    memset(out + n, 0, 32);                  /* trailer */
+    out[n + 6] = 2;                          /* offset int size */
+    out[n + 7] = 1;                          /* object ref size */
+    stq_be_p(out + n + 8, nobj);             /* objects */
+    stq_be_p(out + n + 16, 0);               /* top object */
+    stq_be_p(out + n + 24, table);           /* offset table offset */
+    return n + 32;
+}
+
+static void vtpv_reply_esup(AppleVtpv *s, int slot)
+{
+    uint8_t pl[320];
+    uint32_t plen = vtpv_esup_plist(pl, s->encs_fcc);
+    uint8_t paras[0x40 + 320];
+    uint32_t be_ver, be_err;
+    uint32_t n = 0;
+    stl_be_p(&be_ver, 6);
+    stl_be_p(&be_err, 0);
+    n += vtpv_para_put(paras + n, 0x2c766572u /* ',ver' */, "=u32", &be_ver, 4);
+    n += vtpv_para_put(paras + n, 0x2c657272u /* ',err' */, "=s32", &be_err, 4);
+    n += vtpv_para_put(paras + n, 0x2c737570u /* ',sup' */, "=pls", pl, plen);
+    char fcc[5];
+    vtpv_log4cc(fcc, s->encs_fcc);
+    lab_elog("apple-vtpv: enc esup %.4s -> ,sup %u B\n", fcc, plen);
+    vtpv_send_h2g2(s, slot, 0x65737570u /* 'esup' */, 4, s->msg + 0x10, s->msg + 0x20,
+                   paras, n);
 }
 
 /* TEMP lab (Opus 10-28, q1239): the first events after each session create,
@@ -5497,8 +5616,21 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                  * that reaches a refused 'efrm' has no mid-session software
                  * fallback. */
                 if (type == 0x2b656e63u /* '+enc' */) {
+                    /* remember the codec: the session's 'esup' reply
+                     * advertises the codec's ProfileLevel set */
+                    uint32_t cl = 0;
+                    const uint8_t *cod = vtpv_para_find(s->msg, total,
+                                                        0x2c636f64u /* ',cod' */, &cl);
+                    if (cod && cl >= 4) {
+                        s->encs_fcc = ldl_be_p(cod);
+                    }
                     lab_elog("apple-vtpv: enc +enc -> ok (,hin {})\n");
                     vtpv_reply_enc_ok(s, slot, type, true);
+                } else if (type == 0x65737570u /* 'esup' */) {
+                    vtpv_reply_esup(s, slot);
+                } else if (type == 0x65696e76u /* 'einv' */) {
+                    lab_elog("apple-vtpv: enc einv -> ok\n");
+                    vtpv_reply_enc_ok(s, slot, type, false);
                 } else if (type == 0x65737461u /* 'esta' */ ||
                            type == 0x65737473u /* 'ests' */) {
                     lab_elog("apple-vtpv: enc %.4s -> ok\n", t5);
