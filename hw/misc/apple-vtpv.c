@@ -81,6 +81,7 @@ typedef struct {
 /* uuids alive at once: decoder sessions (wallpaper, Safari tabs...) and the
  * per-process client uuids that only ask capabilities (ox17: 16 overflowed) */
 #define VTPV_SESS 64
+#define VTPV_DEC_WORKERS 3      /* q1379: decode workers - sessions decode in parallel */
 #define VTPV_DBUF_INFLIGHT 4 /* 'Dbuf' requests outstanding per session */
 
 /* one guest decoder session, keyed by the uuid every message carries at
@@ -122,6 +123,14 @@ typedef struct VtpvSess {
     uint64_t ask_hold_us;          /* 0005: when the hold was set (aged release) */
     uint32_t shed_n;                /* frames shed and not completed yet */
     uint8_t pump_gate;              /* q1375: which exit of vtpv_pump_dbuf_cur ran last */
+    struct {                        /* dec-async: frames submitted, picture not out yet */
+        int idx;
+        uint64_t id;
+        int64_t t_us;               /* 28-10 (o29): submitted at - the age watchdog */
+    } infl[8];                      /* q1379: per session (was the device's) - dec_lock */
+    uint32_t infl_n;
+    bool dec_busy;                  /* a decode worker is decoding for it (the tile thread waits it out) */
+    bool dec_claim;                 /* q1379: a decode worker holds it - set at pick, before dec_busy (dec_lock) */
     bool async_seen;                /* q1376: a 'dfrm' asked kVTDecodeFrame_EnableAsynchronousDecompression */
     bool realtime;                  /* a 'dfrm' carried kVTDecodeFrame_1xRealTimePlayback
                                    * (',dfl' bit 2): a player - only these shed */
@@ -319,8 +328,8 @@ struct AppleVtpv {
         VtpvSess *se;
         int idx;
     } dec_job[VTPV_SESS * VTPV_DBUF_INFLIGHT];
+    VtpvSess *dec_last;             /* q1378: the session the decode thread served last (round robin) */
     uint32_t dec_head, dec_n;
-    VtpvSess *dec_busy;             /* session the thread is decoding for */
     /* task83: the encode worker - one thread, jobs from every encoder
      * session in arrival order; results leave on enc_bh (BQL) */
     QemuThread enc_thread;
@@ -537,13 +546,6 @@ struct AppleVtpv {
     uint32_t dbuf_trace;            /* lat-log: the first 64 'Dbuf' sends/answers */
     struct { uint32_t type, n; } stat_types[8];
     GQueue ans_q;                   /* ans-async: answered 'Dbuf's, oldest first (BQL) */
-    struct {                        /* dec-async: frames submitted, picture not out yet */
-        VtpvSess *se;
-        int idx;
-        uint64_t id;
-        int64_t t_us;               /* 28-10 (o29): submitted at - the age watchdog */
-    } infl[8];
-    uint32_t infl_n;                /* decode thread only (and its dx callbacks) */
     uint64_t stat_h2g_queued, stat_reply_outboxed, stat_h2g_queued_logged;
     int64_t stat_h2g_log_ms;
     char *dec_gpu_str;             /* "nv" (default) / "int" */
@@ -971,22 +973,28 @@ static void vtpv_outbox_tick(void *opaque)
      * pipeline holds it), and an ans_q head waiting on it stalls everything
      * behind (o28's wedge).  Past 100 ms hand the decode thread a settle
      * job for the stale session; the timer stays armed while in flight */
-    if (s->infl_n) {
+    {
         int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        bool any = false;
         qemu_mutex_lock(&s->dec_lock);
-        for (uint32_t i = 0; i < s->infl_n; i++) {
-            if (now_us - s->infl[i].t_us > 100000 &&
-                s->dec_n < ARRAY_SIZE(s->dec_job)) {
-                uint32_t t = (s->dec_head + s->dec_n) % ARRAY_SIZE(s->dec_job);
-                s->dec_job[t].se = s->infl[i].se;
-                s->dec_job[t].idx = -1;          /* a settle job, not a frame */
-                s->dec_n++;
-                qemu_cond_broadcast(&s->dec_cond);
-                s->infl[i].t_us = now_us;        /* re-arm: one ask at a time */
+        for (int si = 0; si < VTPV_SESS; si++) {
+            VtpvSess *ise = &s->sess[si];
+            for (uint32_t i = 0; i < ise->infl_n; i++) {
+                any = true;
+                if (now_us - ise->infl[i].t_us > 100000 &&
+                    s->dec_n < ARRAY_SIZE(s->dec_job)) {
+                    uint32_t t = (s->dec_head + s->dec_n) % ARRAY_SIZE(s->dec_job);
+                    s->dec_job[t].se = ise;
+                    s->dec_job[t].idx = -1;      /* a settle job, not a frame */
+                    s->dec_n++;
+                    qemu_cond_broadcast(&s->dec_cond);
+                    ise->infl[i].t_us = now_us;  /* re-arm: one ask at a time */
+                    break;                       /* one settle per session */
+                }
             }
         }
         qemu_mutex_unlock(&s->dec_lock);
-        left = true;
+        left |= any;
     }
     /* 0005 (ask-hold): aged release - a stream's last frame gets no next
      * 'dfrm' to clear its hold; past 20 ms the pump may ask again (slower
@@ -2515,6 +2523,7 @@ static void vtpv_send_dpba(AppleVtpv *s, int slot, const uint8_t *uuid16,
                            uint32_t w, uint32_t h);
 
 static void vtpv_pump_dbuf_cur(AppleVtpv *s, int slot, const uint8_t *uuid16);
+static uint32_t vtpv_ans_pending(AppleVtpv *s, VtpvSess *se);
 
 /* ZCode(video) 10-28: pump the uuid's OWN session - s->cur is whatever
  * message was handled last (the pace timer fires between kicks), and a
@@ -2649,7 +2658,7 @@ static void vtpv_pump_dbuf_cur(AppleVtpv *s, int slot, const uint8_t *uuid16)
          * and the player's own pool acquisition blocks instead (q1202's
          * argument).  A decoded picture still asks - it completes at once */
         if (s->ans_async && s->decthread && !se->frame[next].nv12 &&
-            g_queue_get_length(&s->ans_q) >= 16) {
+            vtpv_ans_pending(s, se) >= 16) {    /* q1378: per session (was the device's queue) */
             VTPV_PUMP_GATE(5);
         }
         /*
@@ -2832,12 +2841,16 @@ static void vtpv_shed(AppleVtpv *s, VtpvSess *se)
      * (',dfl' 0x0) and answers at its display rate while it feeds far ahead:
      * 512 waiting per session in q1376 without the shed; the export never had
      * 16 waiting (q1377).  So: real-time and synchronous sessions shed at the
-     * backlog; an asynchronous non-real-time one only past 64 (a safety net
-     * for the frame table, never reached by avconvert). */
+     * backlog; an asynchronous non-real-time one only near a full frame
+     * table (a safety net avconvert never reaches). */
     if (!s->backlog || !s->decthread) {
         return;
     }
-    uint32_t cap = (se->realtime || !se->async_seen) ? s->backlog : MAX(s->backlog, 64u);
+    /* q1378: 64 still shed 129 of a 300-frame clip fed at once (vtdec, the
+     * Telegram pattern) - waiting frames hold compressed samples only, so an
+     * async client may queue up to 3/4 of the table before anything sheds */
+    uint32_t cap = (se->realtime || !se->async_seen) ? s->backlog
+                                                     : MAX(s->backlog, (uint32_t)(VTPV_FRAMES * 3 / 4));
     uint32_t waiting = 0;
     for (int i = 0; i < VTPV_FRAMES; i++) {
         waiting += se->frame[i].in_use && !se->frame[i].dbuf_sent && !se->frame[i].shed;
@@ -3179,7 +3192,7 @@ static void vtpv_dec_drain(AppleVtpv *s, VtpvSess *se)
 {
     qemu_mutex_lock(&s->dec_lock);
     for (;;) {
-        bool pending = s->dec_busy == se;
+        bool pending = se->dec_claim || se->dec_busy;
         for (uint32_t i = 0; i < s->dec_n && !pending; i++) {
             pending = s->dec_job[(s->dec_head + i) % ARRAY_SIZE(s->dec_job)].se == se;
         }
@@ -3261,13 +3274,7 @@ static void vtpv_sess_free(AppleVtpv *s, VtpvSess *se)
      * live frame of the next session decoded with no picture. The drains
      * above mean no route is running against these entries. */
     qemu_mutex_lock(&s->dec_lock);
-    uint32_t keep = 0;
-    for (uint32_t i = 0; i < s->infl_n; i++) {
-        if (s->infl[i].se != se) {
-            s->infl[keep++] = s->infl[i];
-        }
-    }
-    s->infl_n = keep;
+    se->infl_n = 0;
     qemu_mutex_unlock(&s->dec_lock);
     vtpv_dx_close(se->dx);
     if (se->dxe) {
@@ -4206,34 +4213,33 @@ static void vtpv_route_picture(AppleVtpv *s, VtpvSess *se, int64_t tag)
      * 240 fps sessions of one clip interleave frames, and a cross-session
      * FIFO pop marked every switched-to frame pictureless */
     int hit_i = -1;
-    for (uint32_t i = 0; i < s->infl_n; i++) {
-        if (s->infl[i].se == se && s->infl[i].id == (uint64_t)tag) {
+    for (uint32_t i = 0; i < se->infl_n; i++) {
+        if (se->infl[i].id == (uint64_t)tag) {
             hit_i = (int)i;
             break;
         }
     }
     if (hit_i >= 0) {
         uint32_t keep = 0;
-        for (uint32_t i = 0; i < s->infl_n; i++) {
+        for (uint32_t i = 0; i < se->infl_n; i++) {
+            int idx = se->infl[i].idx;
             if (i == (uint32_t)hit_i) {
-                VtpvSess *ise = s->infl[i].se;
-                int idx = s->infl[i].idx;
-                ise->frame[idx].nv12 = k->stage;    /* the frame owns this picture */
-                ise->frame[idx].w = k->w;
-                ise->frame[idx].h = k->h;
-                ise->frame[idx].decoded = true;
+                se->frame[idx].nv12 = k->stage;     /* the frame owns this picture */
+                se->frame[idx].w = k->w;
+                se->frame[idx].h = k->h;
+                se->frame[idx].decoded = true;
                 s->stat_route_hit++;
                 continue;                           /* leaves the FIFO */
             }
-            if (s->infl[i].se == se && i < (uint32_t)hit_i) {
-                /* same session, older, produced no picture */
-                s->infl[i].se->frame[s->infl[i].idx].decoded = true;
+            if (i < (uint32_t)hit_i) {
+                /* older, produced no picture */
+                se->frame[idx].decoded = true;
                 s->stat_route_miss++;
                 continue;
             }
-            s->infl[keep++] = s->infl[i];           /* other sessions stay */
+            se->infl[keep++] = se->infl[i];
         }
-        s->infl_n = keep;
+        se->infl_n = keep;
         k->stage = NULL;
         k->stage_cap = 0;
     }
@@ -4261,16 +4267,11 @@ static void vtpv_async_settle(AppleVtpv *s, VtpvSess *se)
     /* ZCode(video) 10-28: settle only THIS session's submissions - clearing
      * the whole FIFO marked the other session's pending pictures decoded with
      * none (the wallpaper alternates two sessions: its 'pictures=0' runs) */
-    uint32_t keep = 0;
-    for (uint32_t i = 0; i < s->infl_n; i++) {
-        if (s->infl[i].se != se) {
-            s->infl[keep++] = s->infl[i];
-            continue;
-        }
-        s->infl[i].se->frame[s->infl[i].idx].decoded = true;
+    for (uint32_t i = 0; i < se->infl_n; i++) {
+        se->frame[se->infl[i].idx].decoded = true;
         s->stat_route_miss++;
     }
-    s->infl_n = keep;
+    se->infl_n = 0;
     qemu_cond_broadcast(&s->dec_cond);
     qemu_mutex_unlock(&s->dec_lock);
     if (s->ahead_bh) {
@@ -4598,13 +4599,52 @@ static void *vtpv_dec_thread(void *opaque)
     AppleVtpv *s = opaque;
     qemu_mutex_lock(&s->dec_lock);
     for (;;) {
-        while (!s->dec_n) {
+        /* q1378/q1379: a pool of workers; each takes the first job of a
+         * session no other worker holds (decode order within a session,
+         * sessions in parallel), preferring a session other than the one
+         * served last (round robin).  One FIFO thread let the 4K Aerial
+         * wallpaper's jobs sit ahead of every other session's: a 400x400
+         * Telegram-style clip beside it took 39 s for 10 s of video. */
+        int pick, first_free;
+        for (;;) {
+            pick = first_free = -1;
+            for (uint32_t i = 0; i < s->dec_n; i++) {
+                VtpvSess *js = s->dec_job[(s->dec_head + i) % ARRAY_SIZE(s->dec_job)].se;
+                bool earlier_same = false;  /* a session's own order: its first job only */
+                for (uint32_t i2 = 0; i2 < i && !earlier_same; i2++) {
+                    earlier_same = s->dec_job[(s->dec_head + i2) % ARRAY_SIZE(s->dec_job)].se == js;
+                }
+                if (earlier_same || js->dec_claim) {
+                    continue;
+                }
+                if (first_free < 0) {
+                    first_free = (int)i;
+                }
+                if (js != s->dec_last) {
+                    pick = (int)i;
+                    break;
+                }
+            }
+            if (pick < 0) {
+                pick = first_free;
+            }
+            if (pick >= 0) {
+                break;
+            }
             qemu_cond_wait(&s->dec_cond, &s->dec_lock);
         }
-        VtpvSess *se = s->dec_job[s->dec_head].se;
-        int idx = s->dec_job[s->dec_head].idx;
+        uint32_t pos = (uint32_t)pick;
+        uint32_t at = (s->dec_head + pos) % ARRAY_SIZE(s->dec_job);
+        VtpvSess *se = s->dec_job[at].se;
+        int idx = s->dec_job[at].idx;
+        for (uint32_t j = pos; j > 0; j--) {        /* close the gap, order kept */
+            s->dec_job[(s->dec_head + j) % ARRAY_SIZE(s->dec_job)] =
+                s->dec_job[(s->dec_head + j - 1) % ARRAY_SIZE(s->dec_job)];
+        }
         s->dec_head = (s->dec_head + 1) % ARRAY_SIZE(s->dec_job);
         s->dec_n--;
+        s->dec_last = se;
+        se->dec_claim = true;       /* no other worker takes it; dec_busy follows the tile wait */
         /* TEMP lab (ZCode 29-10 review H1): one decoder per session, both
          * ways - the tile thread waits dec_busy out; this side waits the
          * session's tile decode out BEFORE taking dec_busy. The order is the
@@ -4615,7 +4655,7 @@ static void *vtpv_dec_thread(void *opaque)
         while (vtpv_tile_busy_on(s, se)) {
             qemu_cond_wait(&s->dec_cond, &s->dec_lock);
         }
-        s->dec_busy = se;
+        se->dec_busy = true;
         if (idx == -2) {
             /* 0004 (dec-warm): the 'dsts' open job - the D3D12 decoder exists
              * before the first 'dfrm' (q1207: a cold open cost ~500 ms); no
@@ -4623,7 +4663,7 @@ static void *vtpv_dec_thread(void *opaque)
             qemu_mutex_unlock(&s->dec_lock);
             vtpv_dx_decode_sample(s, se, NULL, 0, 0);
             qemu_mutex_lock(&s->dec_lock);
-            s->dec_busy = NULL;
+            se->dec_busy = se->dec_claim = false;
             qemu_cond_broadcast(&s->dec_cond);
             continue;
         }
@@ -4633,7 +4673,7 @@ static void *vtpv_dec_thread(void *opaque)
             qemu_mutex_unlock(&s->dec_lock);
             vtpv_async_settle(s, se);
             qemu_mutex_lock(&s->dec_lock);
-            s->dec_busy = NULL;
+            se->dec_busy = se->dec_claim = false;
             qemu_cond_broadcast(&s->dec_cond);
             continue;
         }
@@ -4661,20 +4701,18 @@ static void *vtpv_dec_thread(void *opaque)
          * reports pictures=0 and the codec walk discards the decoder (the
          * 783e6cbac trap) - settle the oldest blocker's session and this
          * one, so every entry resolves within a bounded number of submits */
-        if (s->infl_n >= ARRAY_SIZE(s->infl)) {
-            vtpv_async_settle(s, s->infl[0].se);
-            vtpv_async_settle(s, se);
+        if (se->infl_n >= ARRAY_SIZE(se->infl)) {
+            vtpv_async_settle(s, se);   /* q1379: only ever its own session */
         }
         bool async = s->dec_async && sample && !tid_skip && se->dx &&
-                     s->infl_n < ARRAY_SIZE(s->infl);
+                     se->infl_n < ARRAY_SIZE(se->infl);
         k->to_stage = true;
         if (async) {
             qemu_mutex_lock(&s->dec_lock);
-            s->infl[s->infl_n].se = se;
-            s->infl[s->infl_n].idx = idx;
-            s->infl[s->infl_n].id = frame_id;
-            s->infl[s->infl_n].t_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
-            s->infl_n++;
+            se->infl[se->infl_n].idx = idx;
+            se->infl[se->infl_n].id = frame_id;
+            se->infl[se->infl_n].t_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+            se->infl_n++;
             qemu_mutex_unlock(&s->dec_lock);
             vtpv_dx_set_pipelined(se->dx, 1);
             k->route = true;
@@ -4695,7 +4733,7 @@ static void *vtpv_dec_thread(void *opaque)
                 vtpv_async_settle(s, se);           /* this session's run ended */
             }
             qemu_mutex_lock(&s->dec_lock);
-            s->dec_busy = NULL;
+            se->dec_busy = se->dec_claim = false;
             qemu_cond_broadcast(&s->dec_cond);
             continue;
         }
@@ -4714,7 +4752,7 @@ static void *vtpv_dec_thread(void *opaque)
         se->frame[idx].w = w;
         se->frame[idx].h = h;
         se->frame[idx].decoded = true;
-        bool settle = s->infl_n;
+        bool settle = se->infl_n;
         for (uint32_t i = 0; i < s->dec_n && settle; i++) {
             if (s->dec_job[(s->dec_head + i) % ARRAY_SIZE(s->dec_job)].se == se) {
                 settle = false;
@@ -4725,13 +4763,27 @@ static void *vtpv_dec_thread(void *opaque)
             vtpv_async_settle(s, se);               /* a tid-skip ended the run */
         }
         qemu_mutex_lock(&s->dec_lock);
-        s->dec_busy = NULL;
+        se->dec_busy = se->dec_claim = false;
         qemu_cond_broadcast(&s->dec_cond);
         if (s->ahead_bh) {
             qemu_bh_schedule(s->ahead_bh);   /* TEMP lab dec-ahead */
         }
     }
     return NULL;
+}
+
+/* q1378: one session may hold at most this many frame jobs in the shared
+ * ring - the wallpaper's two 4K streams filled all of it before */
+#define VTPV_DEC_PER_SESS 8
+
+/* jobs of this session in the ring (dec_lock held) */
+static uint32_t vtpv_dec_jobs_of(AppleVtpv *s, VtpvSess *se)
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < s->dec_n; i++) {
+        n += s->dec_job[(s->dec_head + i) % ARRAY_SIZE(s->dec_job)].se == se;
+    }
+    return n;
 }
 
 static bool vtpv_dec_queue(AppleVtpv *s, VtpvSess *se, int idx)
@@ -4743,7 +4795,7 @@ static bool vtpv_dec_queue(AppleVtpv *s, VtpvSess *se, int idx)
          * slot outlived the frame, the slot was reused and the stale job
          * decoded the NEXT frame out of order ("Could not find ref") */
         ok = true;
-    } else if (s->dec_n < ARRAY_SIZE(s->dec_job)) {
+    } else if (s->dec_n < ARRAY_SIZE(s->dec_job) && vtpv_dec_jobs_of(s, se) < VTPV_DEC_PER_SESS) {
         uint32_t t = (s->dec_head + s->dec_n) % ARRAY_SIZE(s->dec_job);
         s->dec_job[t].se = se;
         s->dec_job[t].idx = idx;
@@ -5170,7 +5222,7 @@ static void *vtpv_tile_thread(void *opaque)
         /* one decoder per session: if the VIDEO thread is decoding this
          * session's frames, wait it out (it holds no lock while decoding,
          * so no cycle); the tile side of the pair is the drain below */
-        while (s->dec_busy == j->se && !cancel) {
+        while (j->se->dec_busy && !cancel) {
             qemu_cond_wait(&s->dec_cond, &s->dec_lock);
         }
         qemu_mutex_unlock(&s->dec_lock);
@@ -5469,12 +5521,24 @@ typedef struct VtpvAns {
     uint32_t token;
 } VtpvAns;
 
-static void vtpv_ans_process(AppleVtpv *s)
+/* q1378: answers settle in order WITHIN a session only.  One FIFO for the
+ * whole device let the 4K Aerial wallpaper's answers - waiting on a decode
+ * ring it saturates - hold every other session's decoded frames behind
+ * them: Telegram's round videos (avc1 400x400) never got frame 1 out. */
+static GList *vtpv_ans_next_ready(AppleVtpv *s)
 {
-    AddressSpace *as = pci_get_address_space(PCI_DEVICE(s));
-    VtpvAns *a;
-    while ((a = g_queue_peek_head(&s->ans_q))) {
+    VtpvSess *blocked[VTPV_SESS];
+    int nb = 0;
+    for (GList *l = s->ans_q.head; l; l = l->next) {
+        VtpvAns *a = l->data;
         VtpvSess *se = a->se;
+        bool skip = false;
+        for (int k = 0; k < nb && !skip; k++) {
+            skip = blocked[k] == se;
+        }
+        if (skip) {
+            continue;
+        }
         bool live = se->used && se->frame[a->idx].in_use && se->frame[a->idx].frame_id == a->frame_id;
         bool ready = !live;
         qemu_mutex_lock(&s->dec_lock);
@@ -5482,14 +5546,38 @@ static void vtpv_ans_process(AppleVtpv *s)
             ready = se->frame[a->idx].decoded || (!se->frame[a->idx].queued && !se->frame[a->idx].sample);
         }
         qemu_mutex_unlock(&s->dec_lock);
-        if (live && !ready && !se->frame[a->idx].queued && se->frame[a->idx].sample) {
+        if (ready) {
+            return l;
+        }
+        if (live && !se->frame[a->idx].queued && se->frame[a->idx].sample) {
             vtpv_dec_queue(s, se, a->idx);  /* never queued (a shed race): decode it now */
-            return;
         }
-        if (!ready) {
-            return;                         /* the decode thread's bh comes back */
+        if (nb < VTPV_SESS) {
+            blocked[nb++] = se;             /* the decode thread's bh comes back */
         }
-        g_queue_pop_head(&s->ans_q);
+    }
+    return NULL;
+}
+
+/* this session's answers waiting in ans_q (the pump's back-pressure) */
+static uint32_t vtpv_ans_pending(AppleVtpv *s, VtpvSess *se)
+{
+    uint32_t n = 0;
+    for (GList *l = s->ans_q.head; l; l = l->next) {
+        n += ((VtpvAns *)l->data)->se == se;
+    }
+    return n;
+}
+
+static void vtpv_ans_process(AppleVtpv *s)
+{
+    AddressSpace *as = pci_get_address_space(PCI_DEVICE(s));
+    GList *l;
+    while ((l = vtpv_ans_next_ready(s))) {
+        VtpvAns *a = l->data;
+        VtpvSess *se = a->se;
+        bool live = se->used && se->frame[a->idx].in_use && se->frame[a->idx].frame_id == a->frame_id;
+        g_queue_delete_link(&s->ans_q, l);
         uint32_t inf = 0;
         int32_t err = a->err;
         uint8_t *pic = live ? se->frame[a->idx].nv12 : NULL;
@@ -7840,8 +7928,10 @@ static void vtpv_realize(PCIDevice *dev, Error **errp)
     }
     qemu_mutex_init(&s->dec_lock);
     qemu_cond_init(&s->dec_cond);
-    qemu_thread_create(&s->dec_thread, "vtpv-decode", vtpv_dec_thread, s,
-                       QEMU_THREAD_DETACHED);
+    for (int w = 0; w < VTPV_DEC_WORKERS; w++) {
+        qemu_thread_create(&s->dec_thread, "vtpv-decode", vtpv_dec_thread, s,
+                           QEMU_THREAD_DETACHED);
+    }
     s->outbox_timer = timer_new_ms(QEMU_CLOCK_REALTIME, vtpv_outbox_tick, s);
     s->tdem_timer = timer_new_us(QEMU_CLOCK_REALTIME, vtpv_tdem_tick, s);
     s->pace_timer = timer_new_us(QEMU_CLOCK_REALTIME, vtpv_pace_tick, s);
@@ -7935,7 +8025,9 @@ static void vtpv_reset_hold(Object *obj, ResetType type)
     memset(s->pace_rep, 0, sizeof(s->pace_rep));
     memset(s->pace_pend, 0, sizeof(s->pace_pend));
     qemu_mutex_lock(&s->dec_lock);
-    s->infl_n = 0;
+    for (int si = 0; si < VTPV_SESS; si++) {
+        s->sess[si].infl_n = 0;
+    }
     qemu_mutex_unlock(&s->dec_lock);
     g_queue_clear_full(&s->tdem_q, g_free);
 }
