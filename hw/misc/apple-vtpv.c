@@ -152,6 +152,8 @@ typedef struct VtpvSess {
     uint32_t dxe_w, dxe_h;          /* the dims it was opened with */
     uint32_t enc_cod;               /* '+enc' codec fourcc ('avc1'), 0 = none */
     bool efds_sent;                 /* the format description went out */
+    uint64_t enc_pre_bitrate;       /* properties set before 'esta' (avconvert) */
+    uint32_t enc_pre_fps;
     uint8_t dxe_avcc[64];           /* its avcC, built at open */
     uint32_t dxe_avcc_len;
 } VtpvSess;
@@ -1610,11 +1612,13 @@ static const uint32_t vtpv_enc_types[15] = {
  * {',pro' dict of scalars}, 'ecop' {',key' string} (o87).  Decodes the top
  * object: bool, int, (long) ASCII string, one-level array, one dict of
  * scalar values; builds the single-object plists the ',val' replies ride. */
-enum { VTPV_BP_BOOL = 1, VTPV_BP_INT, VTPV_BP_STR, VTPV_BP_ARR, VTPV_BP_DICT };
+enum { VTPV_BP_BOOL = 1, VTPV_BP_INT, VTPV_BP_STR, VTPV_BP_ARR, VTPV_BP_DICT, VTPV_BP_REAL,
+       VTPV_BP_OTHER };
 typedef struct VtpvBpVal {
     int kind;
     bool b;
     int64_t i;
+    double d;                      /* REAL (i holds it truncated) */
     char s[40];
     int n;                         /* ARR elements / DICT pairs */
     struct VtpvBpVal *el;          /* ARR: values; DICT: keys then values */
@@ -1745,7 +1749,29 @@ static bool vtpv_bp_val(const uint8_t *pl, uint32_t len, const uint8_t *o,
         v->n = cnt;                        /* dict: key i = el[i], value i = el[i+cnt] */
         return true;
     }
-    return false;                          /* real/utf16/data: not on this wire */
+    if (m == 0x22 || m == 0x23) {          /* Opus 10-30 (q1354): avconvert's
+                                            * ExpectedFrameRate is a real */
+        int nb = m == 0x22 ? 4 : 8;
+        if (o + nb > pl + len) {
+            return false;
+        }
+        if (nb == 4) {
+            uint32_t u = (uint32_t)vtpv_bp_be(o, 4);
+            float f;
+            memcpy(&f, &u, 4);
+            v->d = f;
+        } else {
+            uint64_t u = vtpv_bp_be(o, 8);
+            memcpy(&v->d, &u, 8);
+        }
+        v->kind = VTPV_BP_REAL;
+        v->i = (int64_t)v->d;
+        return true;
+    }
+    /* utf16/data/date: kept as an opaque value so one exotic property never
+     * sinks a whole 'emul' batch (a real encoder ignores what it lacks) */
+    v->kind = VTPV_BP_OTHER;
+    return true;
 }
 
 /* a full single-object plist: header, the object, its offset, the trailer */
@@ -1804,7 +1830,18 @@ static bool vtpv_enc_apply_prop(AppleVtpv *s, const char *key, const VtpvBpVal *
 {
     VtpvDxE *dxe = s->cur->dxe;
     if (!dxe) {
-        return false;
+        /* Opus 10-30 (q1354): avconvert sets properties BEFORE 'esta' - keep
+         * the rate ones for the open, acknowledge the rest */
+        if (strcmp(key, "AverageBitRate") == 0 && v->kind == VTPV_BP_INT && v->i > 0) {
+            s->cur->enc_pre_bitrate = (uint64_t)v->i;
+        } else if (strcmp(key, "ExpectedFrameRate") == 0) {
+            int64_t fps = v->kind == VTPV_BP_REAL ? (int64_t)(v->d + 0.5) :
+                          v->kind == VTPV_BP_INT ? v->i : 0;
+            if (fps > 0 && fps <= 240) {
+                s->cur->enc_pre_fps = (uint32_t)fps;
+            }
+        }
+        return true;
     }
     if (strcmp(key, "AverageBitRate") == 0) {
         if (v->kind == VTPV_BP_INT && v->i > 0) {
@@ -1827,19 +1864,27 @@ static bool vtpv_enc_apply_prop(AppleVtpv *s, const char *key, const VtpvBpVal *
         return true;
     }
     if (strcmp(key, "ExpectedFrameRate") == 0) {
-        if (v->kind == VTPV_BP_INT && v->i > 0 && v->i <= 240) {
-            vtpv_dxe_set_rate(dxe, 0, 0, (uint32_t)v->i);
+        int64_t fps = v->kind == VTPV_BP_REAL ? (int64_t)(v->d + 0.5) :
+                      v->kind == VTPV_BP_INT ? v->i : 0;
+        if (fps > 0 && fps <= 240) {
+            vtpv_dxe_set_rate(dxe, 0, 0, (uint32_t)fps);
             lab_elog("apple-vtpv: enc prop ExpectedFrameRate -> %lld\n",
-                     (long long)v->i);
+                     (long long)fps);
         }
         return true;
     }
     /* MaxKeyFrameInterval (honoured by GOP 1 - intra-only), ProfileLevel
-     * (High, fixed), Quality, RealTime: acknowledged as-is */
-    return strcmp(key, "MaxKeyFrameInterval") == 0 ||
-           strcmp(key, "ProfileLevel") == 0 ||
-           strcmp(key, "Quality") == 0 ||
-           strcmp(key, "RealTime") == 0;
+     * (High, fixed), Quality, RealTime, EncoderUsage, AllowFrameReordering
+     * (no B-frames anyway) and anything else: acknowledged as-is - q1354:
+     * avconvert's 'eset EncoderUsage' and its 'emul' batch got -12900 and it
+     * gave the session up; a hardware encoder accepts what it ignores */
+    static unsigned unk_logged;
+    if (strcmp(key, "MaxKeyFrameInterval") && strcmp(key, "ProfileLevel") &&
+        strcmp(key, "Quality") && strcmp(key, "RealTime") && unk_logged < 32) {
+        unk_logged++;
+        lab_elog("apple-vtpv: enc prop %s (kind %d) acknowledged, not applied\n", key, v->kind);
+    }
+    return true;
 }
 
 static int vtpv_enc_type_idx(uint32_t type)
@@ -3924,14 +3969,19 @@ static bool vtpv_enc_drain(AppleVtpv *s)
 {
     int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     bool idle = false;
+    /* called from a kick: the BQL goes while the worker encodes (the rest of
+     * the VM keeps running; the guest kext's spin lock keeps this client's
+     * other sends out, and enc_bh may deliver meanwhile - same order) */
+    bql_unlock();
     while (!idle && qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t0 < 500000) {
         qemu_mutex_lock(&s->enc_lock);
         idle = g_queue_is_empty(&s->enc_q) && !s->enc_busy;
         qemu_mutex_unlock(&s->enc_lock);
         if (!idle) {
-            g_usleep(100);
+            g_usleep(50);
         }
     }
+    bql_lock();
     vtpv_enc_bh(s);
     return idle;
 }
@@ -6354,8 +6404,9 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                     if (vdi && vl >= 8) {
                         uint32_t w = ldl_be_p(vdi), h = ldl_be_p(vdi + 4);
                         const char *egpu = getenv("VTPV_ENC_GPU");
-                        s->cur->dxe = vtpv_dxe_open(egpu && *egpu ? egpu : "nv",
-                                                    w, h, 30, 0); /* task85: 0 = the 0.1 bpp/frame default */
+                        s->cur->dxe = vtpv_dxe_open(egpu && *egpu ? egpu : "nv", w, h,
+                                                    s->cur->enc_pre_fps ? s->cur->enc_pre_fps : 30,
+                                                    s->cur->enc_pre_bitrate); /* 0 = the 0.1 bpp/frame default */
                         if (s->cur->dxe) {
                             s->cur->dxe_w = w;
                             s->cur->dxe_h = h;
@@ -6449,11 +6500,15 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                         qemu_cond_broadcast(&s->enc_cond);
                         qemu_mutex_unlock(&s->enc_lock);
                         s->enc_accepted++;
-                        /* Opus 10-30 (q1347): the guest keeps ONE frame in
-                         * flight - a frame whose 'Eemt' lands after the next
-                         * 'efrm' fails -19092 (only each session's last frame
-                         * came through).  Its 'Eemt' goes out right behind
-                         * the reply, before this kick returns. */
+                        /* Opus 10-30 (q1351-q1354): -19092 was the guest's
+                         * reply clerk POLLING for this reply (the encoder's
+                         * 10 s CMTime overflows the clerk's 32-bit ns on x86);
+                         * the kext's reply-sync now holds the sender until the
+                         * pump has dispatched what the kick queued.  The
+                         * frame's 'Eemt' rides the same kick right behind the
+                         * reply, so it is handled before the sender returns
+                         * too - async 'Eemt's were handled after the app's
+                         * CompleteFrames and dropped (-12912, q1354). */
                         vtpv_enc_drain(s);
                     }
                 } else if (type == 0x65706672u /* 'epfr' */) {
