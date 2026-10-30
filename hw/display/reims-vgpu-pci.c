@@ -189,7 +189,12 @@ struct ReimsVGPUPCIState {
     bool peek_stopping;
     bool peek_started;
     uint64_t lab_peeks;
-    /* HostOps.irq_pulse may raise MSIs off the BQL (lab A/B: REIMS_VGPU_IRQ_DIRECT=on). */
+    /*
+     * HostOps.irq_pulse may raise MSIs off the BQL. Not a hard enable any
+     * more (Task63): the per-call gate is the Rust live key IRQ_INPLACE,
+     * which coalesces while a raise is un-acked; REIMS_VGPU_IRQ_DIRECT=off
+     * stays a hard kill-switch for an A/B boot.
+     */
     bool irq_direct;
     Notifier shutdown_notifier;
     bool shutdown_notifier_registered;
@@ -1959,14 +1964,18 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
     }
     s->rust_handle = out.handle;
     {
-        const char *d = getenv("REIMS_VGPU_IRQ_DIRECT");   /* lab A/B */
+        const char *d = getenv("REIMS_VGPU_IRQ_DIRECT");   /* lab kill-switch */
 
         /*
-         * Opt-in: with the 1 ms heartbeat the direct pulse lost to the action
-         * BH on the same host (vCPUs waited ~70% longer for the BQL in prerun
-         * and the guest's kernel_task doubled), so it stays a lab arm.
+         * Task63: the un-gated per-pulse direct raise lost its first A/B
+         * (vCPUs waited ~70% longer for the BQL in prerun and the guest's
+         * kernel_task doubled under one-MSI-per-pulse), so the per-call
+         * decision moved to the Rust live key IRQ_INPLACE, which coalesces
+         * while a raise is un-acked. This env is only the hard kill-switch
+         * now: an explicit `off` disables the callback outright; unset and
+         * `on` leave it to the live key.
          */
-        s->irq_direct = d && strcmp(d, "on") == 0;
+        s->irq_direct = !(d && strcmp(d, "off") == 0);
     }
     {
         const char *h = getenv("REIMS_VGPU_ASYNC_HARVEST");   /* lab A/B */
