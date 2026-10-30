@@ -130,6 +130,12 @@ typedef struct VtpvSess {
     } infl[8];                      /* q1379: per session (was the device's) - dec_lock */
     uint32_t infl_n;
     bool dec_busy;                  /* a decode worker is decoding for it (the tile thread waits it out) */
+    bool orphan_logged;             /* q1382: an orphan 'dfrm' was refused and logged */
+    uint32_t tid_hist[8];           /* q1386: temporal ids of the first frames (sync HEVC) */
+    uint32_t tid_n;
+    bool tid_decided;               /* q1386: the keep policy below is set */
+    int8_t tid_keep_max;            /* q1386: frames with a higher tid are answered dropped */
+    double src_fps;                 /* q1386: from the samples' 'stia' duration */
     bool dec_claim;                 /* q1379: a decode worker holds it - set at pick, before dec_busy (dec_lock) */
     bool async_seen;                /* q1376: a 'dfrm' asked kVTDecodeFrame_EnableAsynchronousDecompression */
     bool realtime;                  /* a 'dfrm' carried kVTDecodeFrame_1xRealTimePlayback
@@ -395,6 +401,9 @@ struct AppleVtpv {
      * HEVC temporal layers - tid>=3 frames are droppable without corrupting
      * the tid<=2 sublayer (an honest 60 fps).  -1 = decode everything. */
     int32_t dec_tid_max;
+    bool sync_tid;                  /* q1386: auto temporal-layer thinning for synchronous HEVC sessions */
+    bool tid_drop_now;              /* q1386: this 'dfrm' is answered FrameDropped in its reply */
+    uint64_t stat_sync_tid_drop;
     bool dec_tid_live;
     int64_t tid_live_check_us;
     struct {                /* dec-pace v6: completions beyond the budget wait here */
@@ -5617,6 +5626,79 @@ static void vtpv_ans_process(AppleVtpv *s)
     }
 }
 
+/* q1386: a 'dfrm' sample's display duration rate from its 'stia' (three
+ * native CMTimes, duration first) - 0 if absent */
+static double vtpv_dfrm_fps(AppleVtpv *s, uint64_t total)
+{
+    uint32_t sbf_len = 0, tl = 0;
+    const uint8_t *sbf = vtpv_para_find(s->msg, total, 0x2c736266u /* ',sbf' */, &sbf_len);
+    const uint8_t *st = sbf ? vtpv_atom_find(sbf, sbf_len, "stia", &tl) : NULL;
+    if (!st || tl < 12) {
+        return 0;
+    }
+    int64_t v = (int64_t)ldq_le_p(st);
+    int32_t ts = (int32_t)ldl_le_p(st + 8);
+    return v > 0 && ts > 0 ? (double)ts / (double)v : 0;
+}
+
+/* q1386: sync temporal thinning.  The 4K Aerial wallpaper is a synchronous
+ * client (',dfl' 0x0) of a 240 fps HEVC stream: it submits every frame
+ * (~300 dfrm/s for two sessions) while the screen shows 60, and nothing in
+ * the PV decoder bounds it (ZCode T87: the reply clerk waits ~4 ms - a
+ * 240 fps CMTime - so a held reply only times out; the real host is paced by
+ * its decoder and pool).  Frames above the temporal layers that make ~60 fps
+ * are answered FrameDropped in the 'dfrm' reply itself (',inf' 0x2, the VT
+ * "accepted but dropped" contract): no table entry, no decode, no 4K copy,
+ * no 'Demt' - and no broken reference, since a higher temporal layer is
+ * never referenced by a lower one.  Returns true when this frame drops. */
+static bool vtpv_sync_tid_drop(AppleVtpv *s, uint64_t total, const uint8_t *smp, uint32_t smp_len)
+{
+    VtpvSess *se = s->cur;
+    if (!s->sync_tid || se->dx_codec != VTPV_DX_HEVC || se->async_seen || se->realtime) {
+        return false;
+    }
+    int tid = vtpv_sample_tid(smp, smp_len);
+    if (tid < 0) {
+        return false;
+    }
+    if (!se->tid_decided) {
+        se->tid_hist[MIN(tid, 7)]++;
+        se->tid_n++;
+        if (se->src_fps <= 0) {
+            se->src_fps = vtpv_dfrm_fps(s, total);
+        }
+        if (se->tid_n >= 120) {
+            se->tid_decided = true;
+            se->tid_keep_max = 7;
+            if (se->src_fps > 75) {
+                double need = 60.0 / se->src_fps * 0.95 * se->tid_n;
+                uint32_t cum = 0;
+                for (int t = 0; t < 8; t++) {
+                    cum += se->tid_hist[t];
+                    if (cum >= need) {
+                        se->tid_keep_max = (int8_t)t;
+                        break;
+                    }
+                }
+            }
+            uint32_t kept = 0;
+            for (int t = 0; t <= se->tid_keep_max && t < 8; t++) {
+                kept += se->tid_hist[t];
+            }
+            lab_elog("apple-vtpv: sess%d sync-tid fps=%.1f tids %u/%u/%u/%u/%u keep tid<=%d (%.0f fps)\n",
+                     (int)(se - s->sess), se->src_fps, se->tid_hist[0], se->tid_hist[1], se->tid_hist[2],
+                     se->tid_hist[3], se->tid_hist[4], se->tid_keep_max,
+                     se->src_fps * kept / se->tid_n);
+        }
+        return false;
+    }
+    if (tid <= se->tid_keep_max) {
+        return false;
+    }
+    s->stat_sync_tid_drop++;
+    return true;
+}
+
 static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                                 uint32_t nsurf)
 {
@@ -5723,6 +5805,7 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
             uint32_t dlen = 0;
             const uint8_t *dfl = vtpv_para_find(s->msg, total, 0x2c64666cu /* ',dfl' */, &dlen);
             s->cur_dfl = dfl && dlen == 4 ? ldl_be_p(dfl) : 0;
+            s->cur->async_seen |= (s->cur_dfl & 1u) != 0;
             bool fresh = true;
             for (uint32_t k = 0; k < s->dfl_seen_n; k++) {
                 fresh &= s->dfl_seen[k] != s->cur_dfl;
@@ -5756,6 +5839,7 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                 s->ob_first = false;
                 s->ob_sample = NULL;
                 s->ob_sample_len = 0;
+                s->tid_drop_now = false;
                 /* TEMP lab ans-async: the stream's first picture no longer
                  * decodes inside the kick (q1207: 576 ms with the D3D12
                  * open - the first frame's reply clerk had long given up);
@@ -5794,6 +5878,8 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
                     lab_elog("apple-vtpv: first-pic in kick: frame %llu drain_us=%lld decode_us=%lld ok=%d\n",
                              (unsigned long long)s->last_frame_id, (long long)(t1 - t0),
                              (long long)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t1), s->ob_first);
+                } else if (smp && vtpv_sync_tid_drop(s, total, smp, smp_len)) {
+                    s->tid_drop_now = true;     /* q1386: the reply says FrameDropped */
                 } else if (smp) {
                     /* dec-tid-max: a temporal layer above the cap is answered
                      * "dropped" right here - no decode, no buffer dance, no 4K
@@ -6970,6 +7056,25 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
         if (patch_type) {
             memcpy(rep + 8, s->msg + 8, 4);         /* echo the request's 4CC type */
         }
+        /* q1382: a 'dfrm' for a session that never started here (its
+         * client re-announced the slot after a lock/unlock and the old
+         * session was dropped): nothing can decode it - 3588 "not decodable"
+         * frames and a green wallpaper in the work VM.  Fail the frame with
+         * kVTInvalidSessionErr so the client builds a new session. */
+        if (non_tile_dfrm && reply_tpl == vtpv_tpl_generic &&
+            rlen == (long)sizeof(vtpv_tpl_generic) &&
+            s->cur->dx_codec < 0 && !s->cur->dpba_sent && !s->cur->dx) {
+            stl_be_p(rep + 0x54, (uint32_t)-12903);
+            if (!s->cur->orphan_logged) {
+                s->cur->orphan_logged = true;
+                lab_elog("apple-vtpv: dfrm frame %llu on a session that never started -> -12903\n",
+                         (unsigned long long)s->last_frame_id);
+            }
+        }
+        if (non_tile_dfrm && s->tid_drop_now && reply_tpl == vtpv_tpl_generic &&
+            rlen == (long)sizeof(vtpv_tpl_generic)) {
+            stl_be_p(rep + 104, 1u << 1);   /* ',inf' = kVTDecodeInfo_FrameDropped */
+        }
         if (type == 0x64737473u /* 'dsts' */ && reply_tpl == vtpv_tpl_generic &&
             rlen == (long)sizeof(vtpv_tpl_generic)) {
             if (!s->tiles || (s->tiles_one_session && s->tile_sessions > 0)) {
@@ -7087,6 +7192,8 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
             vtpv_send_dbuf(s, slot, s->last_frame_id, s->msg + 0x10);
         } else if (s->ob_sample) {
             vtpv_send_dbuf(s, slot, s->last_frame_id, s->msg + 0x10);
+        } else if (s->tid_drop_now) {
+            s->tid_drop_now = false;    /* q1386: completed in its reply already */
         } else {
             /* nothing to show for this sample: complete it as dropped
              * (kVTDecodeInfo_FrameDropped) so the session never waits on it */
@@ -8081,6 +8188,7 @@ static const Property vtpv_properties[] = {
     DEFINE_PROP_BOOL("dbuf-gate-live", AppleVtpv, dbuf_gate_live, false), /* A/B-in-one-boot */
     DEFINE_PROP_BOOL("dec-pace", AppleVtpv, dec_pace, false), /* TEMP lab: pool-as-the-clock Dbuf credit */
     DEFINE_PROP_INT32("dec-tid-max", AppleVtpv, dec_tid_max, -1), /* TEMP lab: drop HEVC temporal layers above this tid */
+    DEFINE_PROP_BOOL("sync-tid", AppleVtpv, sync_tid, true), /* q1386: thin synchronous HEVC sessions to ~60 fps by temporal layer */
     DEFINE_PROP_BOOL("dec-tid-max-live", AppleVtpv, dec_tid_live, false), /* A/B-in-one-boot */
     DEFINE_PROP_BOOL("dec-pace-live", AppleVtpv, dec_pace_live, false), /* A/B-in-one-boot */
     DEFINE_PROP_UINT64("tdem-gate-cap-us", AppleVtpv, tdem_gate_cap_us, 100000),
