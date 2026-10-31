@@ -481,6 +481,8 @@ struct AppleVtpv {
                                    * the stock stable; 0 = omit the key */
     bool first_kick;                /* TEMP lab (prop, default off): decode a stream's first picture in the kick */
     bool sw_main10;                 /* TEMP lab (prop, default on): 10-bit HEVC sessions refused -> guest decode */
+    uint32_t sw_main10_fps;         /* q1396: the gate's fps; 0 = every 10-bit HEVC (avgFrameRate may be 0) */
+    uint32_t sw_main10_tl;          /* q1396: ...or this many temporal layers (0 = fps only) */
     bool dec_warm;                  /* TEMP lab (prop, default on): open the decoder at 'dsts'/'dsta', ahead of the first 'dfrm' */
     bool vp9;                       /* TEMP lab (prop, default off): set the VP9 caps bit (VTPV_CAPS) so the guest offers vp09 sessions */
     int64_t vtr_t0;                 /* TEMP lab vtrace: the last '+dec' (us), 0 = none yet */
@@ -7135,19 +7137,30 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
          * [19..20] big-endian, in 256ths of a frame.  Refuse only when that
          * says faster than 90 fps - the Aerial class.  A record too short for
          * the field, or avgFrameRate 0, is ordinary video: our decoder takes
-         * it, and the deadline problem it never had stays theirs. */
+         * it, and the deadline problem it never had stays theirs.
+         *
+         * q1396: the Aerial's hvcC says avgFrameRate 0, so the gate never
+         * fired - and through our decoder the lock screen stayed black: its
+         * players (up to seven, 240 fps each) hold the framework's per-process
+         * send lock across every dfrm kick, the connection's handler threads
+         * starve on it, snapshots fail, every retry adds a player.  Its five
+         * temporal layers (240 fps in dyadic sublayers) name the class too:
+         * >= sw-main10-tl layers goes to the guest decoder as well - the lock
+         * screen plays, the desktop extension idles, ~0.8 core while it plays. */
         if (type == 0x64737461u /* 'dsta' */ && s->sw_main10 && reply_tpl == vtpv_tpl_generic &&
             rlen == (long)sizeof(vtpv_tpl_generic) && s->cur->dx_codec == VTPV_DX_HEVC &&
             s->cur->dx_cfg_len > 18 && (s->cur->dx_cfg[17] & 7) != 0 &&
             s->cur->dx_cfg_len >= 22 &&
-            (uint32_t)lduw_be_p(s->cur->dx_cfg + 19) > 90u * 256u) {
+            (!s->sw_main10_fps || (uint32_t)lduw_be_p(s->cur->dx_cfg + 19) > s->sw_main10_fps * 256u ||
+             (s->sw_main10_tl && ((s->cur->dx_cfg[21] >> 3) & 7) >= s->sw_main10_tl))) {
             stl_be_p(rep + 0x54, (uint32_t)-12906);
             /* no pool for this StartSession; the session itself stays free to
              * start again (8-bit, or with sw-main10=off) and get its 'Dpba' then
              * (ZCode maps review M1: a sticky dpba_sent kept a restart poolless) */
             main10_refused = true;
-            lab_elog("apple-vtpv: dsta Main10 HEVC %u/256 fps -> guest software decode (sw-main10, task65 gate)\n",
-                     (unsigned)lduw_be_p(s->cur->dx_cfg + 19));
+            lab_elog("apple-vtpv: dsta Main10 HEVC %u/256 fps %u temporal layers -> guest software decode "
+                     "(sw-main10, task65 gate)\n", (unsigned)lduw_be_p(s->cur->dx_cfg + 19),
+                     (unsigned)((s->cur->dx_cfg[21] >> 3) & 7));
         }
         /* dec-pace v7: hold the non-tile dfrm's own reply for a token - the
          * guest's DecodeFrame call waits on this reply (the reply clerk), so
@@ -8187,6 +8200,8 @@ static const Property vtpv_properties[] = {
     DEFINE_PROP_BOOL("dpba-10bit", AppleVtpv, dpba_10bit, true), /* TEMP lab: off = '420v' pools always */
     DEFINE_PROP_BOOL("first-kick", AppleVtpv, first_kick, false), /* TEMP lab: on = first picture decoded in the kick */
     DEFINE_PROP_BOOL("sw-main10", AppleVtpv, sw_main10, true), /* TEMP lab: off = our decoder takes 10-bit HEVC too */
+    DEFINE_PROP_UINT32("sw-main10-fps", AppleVtpv, sw_main10_fps, 90), /* q1396: 0 = every 10-bit HEVC to the guest decoder */
+    DEFINE_PROP_UINT32("sw-main10-tl", AppleVtpv, sw_main10_tl, 4), /* q1396: 10-bit HEVC with >= N temporal layers to the guest decoder */
     DEFINE_PROP_BOOL("dec-warm", AppleVtpv, dec_warm, true), /* 0004: open the decoder at 'dsts', ahead of the first 'dfrm' */
     DEFINE_PROP_BOOL("vp9", AppleVtpv, vp9, false), /* TEMP lab: advertise the VP9 caps bit */
     DEFINE_PROP_BOOL("ask-hold", AppleVtpv, dbuf_ask_hold, true), /* 0005: each 'Dbuf' ask waits for the session's next 'dfrm' */
