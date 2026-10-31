@@ -350,7 +350,8 @@ fail:
             alias_off = !(e && strcmp(e, "on") == 0);
         }
         if (alias_off) {
-            failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_ALIAS;
+            /* the rail is off (or tripped): a capability answer, not an attempt */
+            failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_DISABLED;
             return -1;
         }
         hosts = g_new(void *, count);
