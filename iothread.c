@@ -37,6 +37,21 @@ static void *iothread_run(void *opaque)
     g_main_context_push_thread_default(iothread->worker_context);
     qemu_set_current_aio_context(iothread->ctx);
     iothread->thread_id = qemu_get_thread_id();
+#ifdef _WIN32
+    {
+        /*
+         * TEMP lab (Opus 2026-11-01): above normal, like the device's drain thread and slirp, unless
+         * QEMU_IOTHREAD_PRIO=normal. Mish's AMD work VM (RAID disk, iothread on) logged its virtio-blk notify
+         * handler stalling 100-1100 ms ~2000 times in 30 min with no I/O wait inside it: a normal-priority thread
+         * that mostly sleeps, woken while the above-normal drain / recorder / helper threads hold the cores.
+         */
+        const char *e = getenv("QEMU_IOTHREAD_PRIO");
+
+        if (!(e && strcmp(e, "normal") == 0)) {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        }
+    }
+#endif
     qemu_sem_post(&iothread->init_done_sem);
 
     while (iothread->running) {
