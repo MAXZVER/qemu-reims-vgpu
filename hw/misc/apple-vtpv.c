@@ -2739,6 +2739,15 @@ static void vtpv_pump_dbuf_cur(AppleVtpv *s, int slot, const uint8_t *uuid16)
              * the pool's recycled stock).  Lift = the clean window (v5). */
             int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
             if (now < s->gate_probe_us) {
+                /* Mish 11-02 (Telegram hung on a clip): nothing else re-pumps
+                 * a real-time player that waits for output before it feeds the
+                 * next 'dfrm' - the probe must wake itself, or the frames sit
+                 * here with no ask out and the guest spins forever. */
+                memcpy(s->pace_uuid, uuid16, 16);
+                if (!timer_pending(s->pace_timer) ||
+                    timer_expire_time_ns(s->pace_timer) > s->gate_probe_us * 1000) {
+                    timer_mod(s->pace_timer, s->gate_probe_us);
+                }
                 VTPV_PUMP_GATE(8);
             }
             s->gate_probe_us = now + DBUF_GATE_PROBE_US;
@@ -6675,6 +6684,16 @@ static void vtpv_handle_message(AppleVtpv *s, int slot, uint64_t total,
         s->vtr_t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         s->vtr_n = 0;
         vtpv_vtrace(s, "+dec", ldq_be_p(s->msg + 0x20), 0);
+        /* Mish 11-02: a new decoder's pool is cold by construction - the
+         * previous session's cold window must not trip the hidden-layer gate
+         * on the new clip (Telegram: ON 4 s into its second session). */
+        s->gate_win_us = 0;
+        s->gate_cold_win = 0;
+        s->gate_cold_prev = 0;
+        if (s->gate_on) {
+            s->gate_on = false;
+            lab_elog("apple-vtpv: dbuf-gate LIFTED (new session)\n");
+        }
         reply_file = s->reply_plusdec;
         reply_tpl = vtpv_tpl_plusdec;
         reply_tpl_len = sizeof(vtpv_tpl_plusdec);
