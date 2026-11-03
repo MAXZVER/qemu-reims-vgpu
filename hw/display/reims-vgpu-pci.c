@@ -23,6 +23,7 @@
 #include "qemu/main-loop.h"
 #include "qemu/aio.h"
 #include "qemu/thread.h"
+#include "qemu/processor.h"   /* TEMP lab DRAIN_SPIN: cpu_relax */
 #include "qemu/rcu.h"
 #include "qapi/error.h"
 #include "hw/pci/pci_device.h"
@@ -1343,7 +1344,18 @@ static void *reims_vgpu_pci_drain_thread(void *opaque)
     rcu_register_thread();
     for (;;) {
         int rc;
+        /* TEMP (lab DRAIN_SPIN): poll for the next doorbell before the condvar
+         * sleep - a racy hint only; the locked check below decides. */
+        uint32_t spin_us = reims_vgpu_qemu_lab_drain_spin_us();
 
+        if (spin_us) {
+            int64_t end = get_clock() + (int64_t)spin_us * 1000;
+
+            while (!qatomic_read(&s->drain_pending) && !qatomic_read(&s->drain_stopping) &&
+                   get_clock() < end) {
+                cpu_relax();
+            }
+        }
         qemu_mutex_lock(&s->drain_mutex);
         while (!s->drain_pending && !s->drain_stopping) {
             qemu_cond_wait(&s->drain_cond, &s->drain_mutex);
