@@ -24,17 +24,28 @@ typedef enum {
 
 typedef struct {
     const uint8_t *y;     /* luma plane, valid only during the callback */
-    const uint8_t *uv;    /* interleaved CbCr plane */
+    const uint8_t *uv;    /* interleaved CbCr plane; the Cb plane when planar */
     uint32_t y_pitch, uv_pitch;
     uint32_t width, height;   /* display size (cropped) */
     int64_t tag;          /* the tag passed with the sample that produced it */
+    int planar;           /* uv = Cb plane and v = Cr plane (else uv interleaves CbCr) */
+    const uint8_t *v;
+    uint32_t v_pitch;
+    int sx, sy;           /* chroma subsampling shifts: 1,1 = 4:2:0; 1,0 = 4:2:2; 0,0 = 4:4:4 */
+    int gray;             /* luma only (monochrome HEVC: a HEIF alpha plane); uv, v unused */
+    int wide;             /* 16-bit samples, data in the high bits (P010 pass-through, 'x420') */
 } VtpvDxFrame;
 
 typedef void (*VtpvDxOut)(void *opaque, const VtpvDxFrame *f);
 
 /*
- * gpu: "int" (Intel, default) or "nv"; api: "d3d12" (default) or "d3d11"
- * (d3d11 = libavcodec staging readback with a CPU copy).
+ * gpu: "int" (Intel, default) or "nv"; api: "d3d12" (default), "d3d11"
+ * (d3d11 = libavcodec staging readback with a CPU copy) or "cuda" (NVDEC on the
+ * NVIDIA GPU, libavcodec readback; the only one of the three libavcodec offers
+ * HEVC 4:4:4 on - HEIF images with full chroma) or "sw" (libavcodec on the
+ * host CPU: the last resort for streams no GPU here decodes - HEVC 4:2:2, the
+ * Tahoe desktop picture; RTX 40 NVDEC has no 4:2:2 and libavcodec offers no
+ * D3D path for HEVC range extensions).
  * Returns NULL and prints the reason on failure.
  */
 VtpvDx *vtpv_dx_open(const char *gpu, const char *api, VtpvDxCodec codec,
@@ -51,6 +62,10 @@ int vtpv_dx_decode(VtpvDx *d, const uint8_t *sample, uint32_t len, int64_t tag);
  * every callback before vtpv_dx_decode() returns). */
 void vtpv_dx_set_pipelined(VtpvDx *d, int on);
 
+/* 0003 (Task 18): keep P010 as 16-bit samples instead of the GPU NV12
+ * conversion - for 10-bit video sessions whose pool buffer is 'x420'. */
+void vtpv_dx_set_wide(VtpvDx *d, int on);
+
 /* Emit every picture still in flight (VTDecompressionSessionWaitForAsynchronousFrames
  * / FinishDelayedFrames). */
 void vtpv_dx_flush(VtpvDx *d);
@@ -58,6 +73,64 @@ void vtpv_dx_flush(VtpvDx *d);
 /* Average milliseconds per picture: CPU time in libavcodec, GPU wait+copy */
 void vtpv_dx_stats(const VtpvDx *d, double *ms_parse, double *ms_gpu, int *pictures);
 
+/* The session is done with the decoder.  A GPU decoder goes to a small pool
+ * and the next vtpv_dx_open() of the same api, GPU, codec and configuration
+ * record takes it back flushed (every HEIF tile comes in its own decoder
+ * session); pictures still in flight are dropped, the callback never runs
+ * again for this caller. */
 void vtpv_dx_close(VtpvDx *d);
+
+/* Close for good: a decoder that refused its stream. */
+void vtpv_dx_discard(VtpvDx *d);
+
+/* TEMP lab (Zcode 29-10 task61): the handle census of this backend - every
+ * kernel object it creates (CreateEventA / CreateThread /
+ * OpenExistingHeapFromAddress), so a growing QEMU HandleCount is attributed
+ * to it or it is acquitted from the log alone.  The audit that motivated
+ * it: dx_destroy/ka_stop close everything they made and the decoder pool is
+ * bounded; these counters say it live. */
+typedef struct VtpvDxHandles {
+    int open;       /* live decoders (created - destroyed) */
+    int pooled;     /* of those, sitting in the reuse pool */
+    int events;     /* live CreateEventA events */
+    int heaps;      /* live OpenExistingHeapFromAddress heaps */
+    int threads;    /* live keep-alive threads */
+} VtpvDxHandles;
+
+void vtpv_dx_handles(VtpvDxHandles *h);
+
+/* TEMP (lab, Zcode 10-30 task77/83): D3D12 Video Encode backend
+ * (apple-vtpv-dx-enc.c) - host-verified on the RTX 4060 (30/30 frames,
+ * ffmpeg clean) and wired into the device's encode side (task83).  H.264,
+ * NV12 in host memory, AVCC out; GOP 1 so every sample is a self-contained
+ * SPS/PPS+IDR.  gpu: "nv" (default, the RTX 4060) or "int".  Any failure ->
+ * NULL / nonzero, the caller keeps refusing encoder requests - never a hang. */
+typedef struct VtpvDxE VtpvDxE;
+
+/* task85: bitrate 0 = the VBR default (~0.1 bit/pixel/frame at fps); a
+ * session property set re-targets it later. */
+VtpvDxE *vtpv_dxe_open(const char *gpu, uint32_t w, uint32_t h,
+                       uint32_t fps, uint32_t bitrate);
+
+/* encode one NV12 frame; out receives AVCC bytes ([BE32 len][NAL]..., the
+ * parameter sets first - every sample self-contained); 0 = ok. */
+int vtpv_dxe_encode(VtpvDxE *e, const uint8_t *y, uint32_t y_stride,
+                    const uint8_t *uv, uint32_t uv_stride, int force_key,
+                    uint8_t *out, uint32_t out_cap, uint32_t *out_len);
+
+/* task83: the avcC record for the guest's format description
+ * ([1,100,0,52,0xff,0xe1,<SPS>,1,<PPS>]); its length, or -1. */
+int vtpv_dxe_avcc(VtpvDxE *e, uint8_t *out, uint32_t cap);
+
+/* task83: live encoders - the vtpv_handles census line. */
+int vtpv_dxe_open_count(void);
+
+/* task85b: retarget between frames (0 keeps each value; 0 peak = 2x target);
+ * the next encode() submits it with RATE_CONTROL_CHANGE. */
+void vtpv_dxe_set_rate(VtpvDxE *e, uint64_t bitrate, uint64_t peak, uint32_t fps);
+uint64_t vtpv_dxe_target(VtpvDxE *e);   /* the live average target, bits/s */
+uint32_t vtpv_dxe_fps(VtpvDxE *e);      /* the live frame rate */
+
+void vtpv_dxe_close(VtpvDxE *e);
 
 #endif /* HW_MISC_APPLE_VTPV_DX_H */

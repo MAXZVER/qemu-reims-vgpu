@@ -922,6 +922,21 @@ static int net_slirp_init(NetClientState *peer, const char *model,
     cfg.vnameserver6 = ip6_dns;
     cfg.vdnssearch = dnssearch;
     cfg.vdomainname = vdomainname;
+    /*
+     * TEMP lab (Opus 2026-10-27, QEMU_SLIRP_MTU=N; Mish: "the network in the VM is much slower than on the host"):
+     * slirp's MTU/MRU towards the guest. Every guest frame is one trip through slirp's TCP stack on a host CPU, so
+     * 1500-byte frames cap a download at a fraction of the host link; with the guest NIC at the same MTU
+     * (virtio-net host_mtu) a 64 KB frame carries ~43x the data per trip. libslirp clamps to IF_MTU_MAX.
+     */
+    {
+        const char *e = getenv("QEMU_SLIRP_MTU");
+        long mtu = e ? strtol(e, NULL, 10) : 0;
+        if (mtu >= 576 && mtu <= 65521) {
+            cfg.if_mtu = (size_t)mtu;
+            cfg.if_mru = (size_t)mtu;
+            fprintf(stderr, "slirp: lab mtu=%ld\n", mtu);
+        }
+    }
 #ifdef _WIN32
     if (lab_slirp_thread_on()) {   /* TEMP lab (QEMU_SLIRP_THREAD): before slirp_new, which registers sockets */
         s->lab_thread = true;

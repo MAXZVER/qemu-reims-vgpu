@@ -181,6 +181,7 @@ if host_os == 'windows' and fs.exists(vtpv_ffmpeg / 'lib/libavcodec.a')
     link_args: [vtpv_ffmpeg / 'lib/libavcodec.a', vtpv_ffmpeg / 'lib/libavutil.a',
                 '-ld3d12', '-ldxgi', '-ld3d11', '-lbcrypt', '-lole32', '-luser32', '-latomic'])
   system_ss.add(when: 'CONFIG_PCI', if_true: [files('apple-vtpv.c', 'apple-vtpv-decode.c',
-                                                    'apple-vtpv-decode-h265.c', 'apple-vtpv-dx.c'),
+                                                    'apple-vtpv-decode-h265.c', 'apple-vtpv-dx.c',
+                                                    'apple-vtpv-dx-enc.c'),
                                               vtpv_dx_dep])
 endif

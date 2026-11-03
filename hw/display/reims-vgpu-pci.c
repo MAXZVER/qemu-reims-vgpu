@@ -13,6 +13,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/lab-elog.h"   /* TEMP lab: one write per stderr line */
 #if defined(_WIN32)
 #include "system/whpx-wp.h"
 #endif
@@ -22,6 +23,7 @@
 #include "qemu/main-loop.h"
 #include "qemu/aio.h"
 #include "qemu/thread.h"
+#include "qemu/processor.h"   /* TEMP lab DRAIN_SPIN: cpu_relax */
 #include "qemu/rcu.h"
 #include "qapi/error.h"
 #include "hw/pci/pci_device.h"
@@ -188,7 +190,12 @@ struct ReimsVGPUPCIState {
     bool peek_stopping;
     bool peek_started;
     uint64_t lab_peeks;
-    /* HostOps.irq_pulse may raise MSIs off the BQL (lab A/B: REIMS_VGPU_IRQ_DIRECT=on). */
+    /*
+     * HostOps.irq_pulse may raise MSIs off the BQL. Not a hard enable any
+     * more (Task63): the per-call gate is the Rust live key IRQ_INPLACE,
+     * which coalesces while a raise is un-acked; REIMS_VGPU_IRQ_DIRECT=off
+     * stays a hard kill-switch for an A/B boot.
+     */
     bool irq_direct;
     Notifier shutdown_notifier;
     bool shutdown_notifier_registered;
@@ -344,7 +351,8 @@ fail:
             alias_off = !(e && strcmp(e, "on") == 0);
         }
         if (alias_off) {
-            failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_ALIAS;
+            /* the rail is off (or tripped): a capability answer, not an attempt */
+            failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_DISABLED;
             return -1;
         }
         hosts = g_new(void *, count);
@@ -420,7 +428,7 @@ fail:
             }
             if (tripwire_ns > 0 && build_ns_now > tripwire_ns && !alias_off) {
                 alias_off = 1;
-                fprintf(stderr, "reims-pagealias storm tripped: build_us=%"
+                lab_elog("reims-pagealias storm tripped: build_us=%"
                         PRId64 " pages=%zu -> copying rails for this boot\n",
                         build_ns_now / 1000, count);
             }
@@ -456,7 +464,7 @@ fail:
             reims_pagealias.runs += runs_n;
             reims_pagealias.run_pages += count;
             if (!reims_pagealias.last || now - reims_pagealias.last >= NANOSECONDS_PER_SECOND) {
-                fprintf(stderr, "reims-pagealias epoch_ms=%" PRId64 " builds=%" PRIu64
+                lab_elog("reims-pagealias epoch_ms=%" PRId64 " builds=%" PRIu64
                         " build_us=%" PRIu64 " build_max_us=%" PRIu64 " frees=%" PRIu64
                         " free_us=%" PRIu64 " runs=%" PRIu64 " run_pages=%" PRIu64
                         " live=%u fails=%" PRIu64 "\n",
@@ -1024,7 +1032,7 @@ static void *reims_vgpu_pci_peek_thread(void *opaque)
             reims_vgpu_pci_peek_tails(s);
         }
         if (get_clock() - last >= NANOSECONDS_PER_SECOND * 5) {
-            fprintf(stderr, "reims-peek peeks=%" PRIu64 "\n", qatomic_xchg(&s->lab_peeks, 0));
+            lab_elog("reims-peek peeks=%" PRIu64 "\n", qatomic_xchg(&s->lab_peeks, 0));
             last = get_clock();
         }
         qemu_mutex_lock(&s->peek_mutex);
@@ -1248,7 +1256,7 @@ static void reims_vgpu_pci_wait_harvest(ReimsVGPUPCIState *s)
         int64_t now = get_clock();
 
         if (now - s->lab_hv_last >= NANOSECONDS_PER_SECOND) {
-            fprintf(stderr, "reims-harvest epoch_ms=%" PRId64 " harvests=%" PRIu64
+            lab_elog("reims-harvest epoch_ms=%" PRId64 " harvests=%" PRIu64
                     " harvest_us=%" PRIu64 " harvest_max_us=%" PRIu64
                     " waits=%" PRIu64 " wait_us=%" PRIu64 " wait_max_us=%" PRIu64
                     " nobql=%d\n", g_get_real_time() / 1000, s->lab_hv_n,
@@ -1311,7 +1319,7 @@ static void reims_vgpu_hiqos_apply(bool process)
     if (!process) {
         prio = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     }
-    fprintf(stderr, "reims-vgpu-hiqos %s throttling_off=%d priority=%d\n",
+    lab_elog("reims-vgpu-hiqos %s throttling_off=%d priority=%d\n",
             process ? "process" : "drain", ok ? 1 : 0, prio ? 1 : 0);
 }
 #endif
@@ -1336,7 +1344,18 @@ static void *reims_vgpu_pci_drain_thread(void *opaque)
     rcu_register_thread();
     for (;;) {
         int rc;
+        /* TEMP (lab DRAIN_SPIN): poll for the next doorbell before the condvar
+         * sleep - a racy hint only; the locked check below decides. */
+        uint32_t spin_us = reims_vgpu_qemu_lab_drain_spin_us();
 
+        if (spin_us) {
+            int64_t end = get_clock() + (int64_t)spin_us * 1000;
+
+            while (!qatomic_read(&s->drain_pending) && !qatomic_read(&s->drain_stopping) &&
+                   get_clock() < end) {
+                cpu_relax();
+            }
+        }
         qemu_mutex_lock(&s->drain_mutex);
         while (!s->drain_pending && !s->drain_stopping) {
             qemu_cond_wait(&s->drain_cond, &s->drain_mutex);
@@ -1616,7 +1635,7 @@ static void reims_vgpu_pci_gfx_write(void *opaque, hwaddr offset, uint64_t data,
                                 off_seen[k], off_n[k]);
                 off_n[k] = 0;
             }
-            fprintf(stderr, "reims-gfxw epoch_ms=%" PRId64 "%s\n",
+            lab_elog("reims-gfxw epoch_ms=%" PRId64 "%s\n",
                     g_get_real_time() / 1000, len ? buf : "");
             last = now;
         }
@@ -1958,14 +1977,18 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
     }
     s->rust_handle = out.handle;
     {
-        const char *d = getenv("REIMS_VGPU_IRQ_DIRECT");   /* lab A/B */
+        const char *d = getenv("REIMS_VGPU_IRQ_DIRECT");   /* lab kill-switch */
 
         /*
-         * Opt-in: with the 1 ms heartbeat the direct pulse lost to the action
-         * BH on the same host (vCPUs waited ~70% longer for the BQL in prerun
-         * and the guest's kernel_task doubled), so it stays a lab arm.
+         * Task63: the un-gated per-pulse direct raise lost its first A/B
+         * (vCPUs waited ~70% longer for the BQL in prerun and the guest's
+         * kernel_task doubled under one-MSI-per-pulse), so the per-call
+         * decision moved to the Rust live key IRQ_INPLACE, which coalesces
+         * while a raise is un-acked. This env is only the hard kill-switch
+         * now: an explicit `off` disables the callback outright; unset and
+         * `on` leave it to the live key.
          */
-        s->irq_direct = d && strcmp(d, "on") == 0;
+        s->irq_direct = !(d && strcmp(d, "off") == 0);
     }
     {
         const char *h = getenv("REIMS_VGPU_ASYNC_HARVEST");   /* lab A/B */

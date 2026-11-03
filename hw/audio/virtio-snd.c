@@ -1900,7 +1900,12 @@ static void vsnd_lab_sdl_open(VirtIOSoundPCMStream *stream)
     }
     want.freq = stream->as.freq;
     want.channels = stream->as.nchannels;
-    want.samples = 512;
+    /*
+     * A 10 ms period where the rate allows it (480 frames at 48 kHz, 441 at 44.1 kHz). SDL's disk driver paces each
+     * period by `samples * 1000 / freq` in whole milliseconds, so 512 frames at 48 kHz ran it 6.7 % fast and the lab
+     * read the drift as starvation every few seconds (q1432/q1433); a real device is indifferent to the size.
+     */
+    want.samples = (stream->as.freq % 100 == 0 && stream->as.freq / 100 <= 4096) ? stream->as.freq / 100 : 512;
     want.callback = vsnd_lab_sdl_cb;
     want.userdata = stream;
     if (!stream->lab_bh) {

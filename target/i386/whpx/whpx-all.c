@@ -1156,6 +1156,18 @@ static bool whpx_mmio_fast_path(void)
     return qatomic_read(&on) > 0;
 }
 
+/* TEMP lab RAM_RETRY: see whpx_handle_mmio. On unless QEMU_WHPX_RAM_RETRY=0. */
+static bool whpx_ram_retry_on(void)
+{
+    static int on = -1;
+
+    if (qatomic_read(&on) < 0) {
+        const char *v = g_getenv("QEMU_WHPX_RAM_RETRY");
+        qatomic_set(&on, !(v && strcmp(v, "0") == 0));
+    }
+    return qatomic_read(&on) > 0;
+}
+
 /* TEMP lab: QEMU_WHPX_MMIO_FAST_STORE=1 turns on whpx_mmio_fast_store. */
 static bool whpx_mmio_fast_store_path(void)
 {
@@ -1884,6 +1896,71 @@ static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
             whpx_stats_mmio_page(ctx->Gpa);
         }
         return 0;
+    }
+
+    /*
+     * TEMP lab (Opus 11-01): an exit on guest RAM that no hook claimed is emulated below by the instruction
+     * emulator, which is not atomic against the other vCPUs - a guest kernel's `lock cmpxchg` on a PTE emulated
+     * here can lose a concurrent update. a1268/a1276/a1279 ended in guest pmap panics (PTE mismatch on the shared
+     * region) under bulk app kills with 24 vCPUs. Name every such exit: GPA, access, instruction bytes.
+     */
+    {
+        static uint64_t lab_ram_emul;
+        hwaddr lab_xlat, lab_len = 1;
+        MemoryRegion *lab_mr;
+        bool lab_ram;
+
+        RCU_READ_LOCK_GUARD();
+        lab_mr = address_space_translate(&address_space_memory, ctx->Gpa, &lab_xlat, &lab_len,
+                                         ctx->AccessInfo.AccessType == WHvMemoryAccessWrite,
+                                         MEMTXATTRS_UNSPECIFIED);
+        lab_ram = memory_region_is_ram(lab_mr) && !memory_region_is_romd(lab_mr);
+        /*
+         * TEMP lab RAM_RETRY (on, QEMU_WHPX_RAM_RETRY=0 restores the emulation): a store exit on writable guest
+         * RAM that no hook claimed came from a protection that is already gone - two vCPUs stored into one
+         * write-protected page, the first fault made it writable and cleared its bit, and the second exit (taken
+         * while the page was still read-only) found the bit clear. Emulating that store is not atomic against
+         * the first vCPU, which now stores natively; running the instruction again is exactly right, since the
+         * page is writable. Bounded per vCPU: a store that keeps exiting at one GPA falls back to the emulator.
+         */
+        if (lab_ram && ctx->AccessInfo.AccessType == WHvMemoryAccessWrite &&
+            !lab_mr->readonly && !memory_region_is_ram_device(lab_mr) && whpx_ram_retry_on()) {
+            static __thread uint64_t retry_gpa;
+            static __thread unsigned retry_n;
+            static uint64_t lab_ram_retries;
+
+            if (retry_gpa == (uint64_t)ctx->Gpa) {
+                retry_n++;
+            } else {
+                retry_gpa = ctx->Gpa;
+                retry_n = 1;
+            }
+            if (retry_n <= 64) {
+                uint64_t k = qatomic_fetch_inc(&lab_ram_retries);
+
+                if (k < 16 || !(k & (k - 1))) {
+                    fprintf(stderr, "whpx: LAB RAM write retried gpa=0x%" PRIx64 " n=%" PRIu64
+                            " insn=%02x %02x %02x %02x\n", (uint64_t)ctx->Gpa, k + 1,
+                            ctx->InstructionBytes[0], ctx->InstructionBytes[1],
+                            ctx->InstructionBytes[2], ctx->InstructionBytes[3]);
+                }
+                return 0;
+            }
+            retry_n = 0;
+        }
+        if (lab_ram) {
+            uint64_t k = qatomic_fetch_inc(&lab_ram_emul);
+            const uint8_t *ib = ctx->InstructionBytes;
+
+            if (k < 64 || !(k & (k - 1))) {
+                fprintf(stderr, "whpx: LAB RAM %s emulated gpa=0x%" PRIx64 " mr=%s n=%" PRIu64
+                        " insn=%02x %02x %02x %02x %02x %02x %02x %02x (%u)\n",
+                        ctx->AccessInfo.AccessType == WHvMemoryAccessWrite ? "write" : "read",
+                        (uint64_t)ctx->Gpa, memory_region_name(lab_mr), k + 1,
+                        ib[0], ib[1], ib[2], ib[3], ib[4], ib[5], ib[6], ib[7],
+                        (unsigned)ctx->InstructionByteCount);
+            }
+        }
     }
 
     /*

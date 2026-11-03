@@ -38,10 +38,15 @@
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_d3d12va.h>
+#include <libavutil/pixdesc.h>
 #pragma GCC diagnostic pop
 
 #define MAXPEND 8
-#define NSLOT 2
+/* TEMP lab (async readback, Opus 13:1x): 4 slots so the decode thread keeps
+ * 2-3 pictures in flight - a submit costs the CPU-side parse only, the
+ * readback wait lands on vtpv_dx_flush (collect), overlapped with the next
+ * submits.  Depth 2 (the old value) pipelined exactly one picture. */
+#define NSLOT 4
 
 typedef struct {
     ID3D12CommandAllocator *alloc;
@@ -51,6 +56,8 @@ typedef struct {
     ID3D12Resource *buf;        /* placed buffer covering mem */
     UINT64 fv;                  /* copy fence value of the picture in it */
     int busy;                   /* holds a picture whose callback is pending */
+    ID3D12CommandAllocator *valloc;  /* 28-10 (240fps): this slot's P010->NV12 blit */
+    ID3D12VideoProcessCommandList *vlist;
     VtpvDxFrame out;
 } Slot;
 
@@ -72,8 +79,11 @@ struct VtpvDx {
     AVBufferRef *hw;
     enum AVPixelFormat hwfmt;
     int d3d12;
+    int cuda;
+    int soft;                   /* "sw": libavcodec on the CPU, no device */
     int hook;                   /* decode-order output via get_buffer2 */
     int pipelined;
+    int wide;                   /* 0003: P010 pass-through (16-bit samples out) */
     VtpvDxOut out;
     void *opaque;
     AVPacket *pkt;
@@ -92,11 +102,58 @@ struct VtpvDx {
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[2];
     UINT64 tex_w;
     UINT tex_h;
+    DXGI_FORMAT tex_fmt;
+    int nplanes;                /* 2: NV12/P010; 1: the packed HEVC range-extension outputs */
+    /* 28-10 (240fps): GPU P010->NV12 - a VIDEO_PROCESS queue blits the decode
+     * target into an NV12 texture before the readback: the copy moves half
+     * the bytes and fire() does no CPU downshift.  vp_fail = CPU fallback */
+    ID3D12VideoDevice *vd;
+    ID3D12VideoProcessor *vp;
+    ID3D12CommandQueue *vpq;
+    ID3D12Fence *vpf;
+    UINT64 vpfv;
+    ID3D12Resource *nv12;       /* conversion target, decoder-sized */
+    UINT64 nv12_w;
+    UINT nv12_h;
+    int vp_fail;
+    uint8_t *conv;              /* packed -> luma + interleaved CbCr, for the callback */
+    size_t conv_cap;
     /* stats */
     LARGE_INTEGER qf;
     double t_parse, t_gpu;
     int npics;
+    /* pool key (vtpv_dx_close) and the time it went there */
+    int nv;
+    VtpvDxCodec codec;
+    uint8_t *cfg;
+    uint32_t cfg_len;
+    volatile double pooled_at;
 };
+
+/*
+ * Reuse.  Every HEIF tile comes in its own decoder session, and each open paid
+ * the D3D12 device, libavcodec's context, the copy queue and on the first
+ * picture the decoder heap: 12-60 ms a tile against 1.6 ms for a picture on an
+ * open decoder.  The guest's reply clerk times a slow 'dtil' out (TV, 10-23:
+ * "timeout waiting for pending reply ... 'dtil'", -19093); CMPhoto then drops
+ * the image and frees state a later tile's callback still uses (TV, Weather
+ * crashed in it).  So one device per api and GPU for the process, and closed
+ * decoders wait POOL_TTL_MS in a pool for a session with the same stream
+ * configuration (the tiles of one image share it).
+ */
+#define POOL_MAX 8
+#define POOL_TTL_MS 5000.0
+static SRWLOCK pool_lock = SRWLOCK_INIT;
+
+/* TEMP lab (task61): see VtpvDxHandles in the header. */
+static LONG dx_opened, dx_destroyed;
+static LONG ev_created, ev_closed;
+static LONG heaps_opened, heaps_released;
+static LONG ka_started, ka_joined;
+static VtpvDx *pool[POOL_MAX];
+static AVBufferRef *dev_cache[2][2];        /* [cuda][nv] */
+
+static void dx_destroy(VtpvDx *d);
 
 static double now_ms(const VtpvDx *d)
 {
@@ -169,8 +226,15 @@ static int queue_init(VtpvDx *d)
                                                   &IID_ID3D12GraphicsCommandList, (void **)&s->list)))
             return -1;
         ID3D12GraphicsCommandList_Close(s->list);
+        if (FAILED(ID3D12Device_CreateCommandAllocator(d->dev, D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS,
+                                                       &IID_ID3D12CommandAllocator, (void **)&s->valloc)) ||
+            FAILED(ID3D12Device_CreateCommandList(d->dev, 0, D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS, s->valloc,
+                                                  NULL, &IID_ID3D12VideoProcessCommandList, (void **)&s->vlist)))
+            return -1;
+        ID3D12VideoProcessCommandList_Close(s->vlist);
     }
     d->ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+    InterlockedIncrement(&ev_created);
     return 0;
 }
 
@@ -180,6 +244,7 @@ static DWORD WINAPI ka_main(LPVOID p)
     while (!d->ka_stop) {
         Sleep((DWORD)d->ka_ms);
         if (d->ka_stop) break;
+        if (d->pooled_at > 0 && now_ms(d) - d->pooled_at > POOL_TTL_MS) continue;   /* expired in the pool */
         ID3D12CommandAllocator_Reset(d->ka_alloc);
         ID3D12GraphicsCommandList_Reset(d->ka_list, d->ka_alloc, NULL);
         ID3D12GraphicsCommandList_CopyBufferRegion(d->ka_list, d->ka_dst, 0, d->ka_src, 0, 256);
@@ -219,7 +284,9 @@ static void ka_start(VtpvDx *d)
     }
     ID3D12GraphicsCommandList_Close(d->ka_list);
     d->ka_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+    InterlockedIncrement(&ev_created);
     d->ka_thread = CreateThread(NULL, 0, ka_main, d, 0, NULL);
+    if (d->ka_thread) InterlockedIncrement(&ka_started);
 }
 
 static void ka_stop(VtpvDx *d)
@@ -228,6 +295,7 @@ static void ka_stop(VtpvDx *d)
         InterlockedExchange(&d->ka_stop, 1);
         WaitForSingleObject(d->ka_thread, INFINITE);
         CloseHandle(d->ka_thread);
+        InterlockedIncrement(&ka_joined);
         d->ka_thread = NULL;
     }
     if (d->ka_list) ID3D12GraphicsCommandList_Release(d->ka_list);
@@ -235,7 +303,7 @@ static void ka_stop(VtpvDx *d)
     if (d->ka_src) ID3D12Resource_Release(d->ka_src);
     if (d->ka_dst) ID3D12Resource_Release(d->ka_dst);
     if (d->ka_fence) ID3D12Fence_Release(d->ka_fence);
-    if (d->ka_ev) CloseHandle(d->ka_ev);
+    if (d->ka_ev) { CloseHandle(d->ka_ev); InterlockedIncrement(&ev_closed); }
     d->ka_list = NULL; d->ka_alloc = NULL; d->ka_src = d->ka_dst = NULL; d->ka_fence = NULL; d->ka_ev = NULL;
 }
 
@@ -252,7 +320,7 @@ static void slots_free(VtpvDx *d)
     for (int i = 0; i < NSLOT; i++) {
         Slot *s = &d->slot[i];
         if (s->buf) { ID3D12Resource_Release(s->buf); s->buf = NULL; }
-        if (s->heap) { ID3D12Heap_Release(s->heap); s->heap = NULL; }
+        if (s->heap) { ID3D12Heap_Release(s->heap); s->heap = NULL; InterlockedIncrement(&heaps_released); }
         if (s->mem) { VirtualFree(s->mem, 0, MEM_RELEASE); s->mem = NULL; }
     }
 }
@@ -266,6 +334,7 @@ static int slot_mem(VtpvDx *d, Slot *s)
     HRESULT h = ID3D12Device3_OpenExistingHeapFromAddress(d3, s->mem, &IID_ID3D12Heap, (void **)&s->heap);
     ID3D12Device3_Release(d3);
     if (FAILED(h)) { fprintf(stderr, "vtpv-dx: OpenExistingHeapFromAddress -> %#lx\n", (unsigned long)h); return -1; }
+    InterlockedIncrement(&heaps_opened);
     D3D12_RESOURCE_DESC bd = { .Dimension = D3D12_RESOURCE_DIMENSION_BUFFER, .Width = d->memsz, .Height = 1,
         .DepthOrArraySize = 1, .MipLevels = 1, .Format = DXGI_FORMAT_UNKNOWN, .SampleDesc = { 1, 0 },
         .Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR, .Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER };
@@ -282,21 +351,207 @@ static void fire(VtpvDx *d, Slot *s)
     wait_fv(d, s->fv);
     d->t_gpu += now_ms(d) - a;
     s->busy = 0;
+    if (d->nplanes == 1) {
+        /* YUY2 / Y210 (4:2:2) and AYUV / Y410 (4:4:4) as luma + CbCr pairs, 8 bits */
+        const uint8_t *src = s->mem + d->fp[0].Offset;
+        uint32_t pitch = d->fp[0].Footprint.RowPitch, w = s->out.width, h = s->out.height;
+        int c422 = d->tex_fmt == DXGI_FORMAT_YUY2 || d->tex_fmt == DXGI_FORMAT_Y210;
+        uint32_t cw = c422 ? (w + 1) / 2 : w;
+        size_t need = (size_t)w * h + (size_t)cw * 2 * h;
+        if (d->conv_cap < need) {
+            free(d->conv);
+            d->conv = malloc(need);
+            d->conv_cap = d->conv ? need : 0;
+            if (!d->conv) return;
+        }
+        uint8_t *yp = d->conv, *cp = d->conv + (size_t)w * h;
+        for (uint32_t y = 0; y < h; y++) {
+            const uint8_t *r = src + (size_t)y * pitch;
+            uint8_t *yo = yp + (size_t)y * w, *co = cp + (size_t)y * cw * 2;
+            switch (d->tex_fmt) {
+            case DXGI_FORMAT_YUY2:          /* Y0 U Y1 V */
+                for (uint32_t x = 0; x < cw; x++) {
+                    yo[2 * x] = r[4 * x];
+                    if (2 * x + 1 < w) yo[2 * x + 1] = r[4 * x + 2];
+                    co[2 * x] = r[4 * x + 1];
+                    co[2 * x + 1] = r[4 * x + 3];
+                }
+                break;
+            case DXGI_FORMAT_Y210: {        /* the same, 16-bit samples, data in the high bits */
+                const uint16_t *q = (const uint16_t *)r;
+                for (uint32_t x = 0; x < cw; x++) {
+                    yo[2 * x] = q[4 * x] >> 8;
+                    if (2 * x + 1 < w) yo[2 * x + 1] = q[4 * x + 2] >> 8;
+                    co[2 * x] = q[4 * x + 1] >> 8;
+                    co[2 * x + 1] = q[4 * x + 3] >> 8;
+                }
+                break;
+            }
+            case DXGI_FORMAT_AYUV:          /* V U Y A */
+                for (uint32_t x = 0; x < w; x++) {
+                    yo[x] = r[4 * x + 2];
+                    co[2 * x] = r[4 * x + 1];
+                    co[2 * x + 1] = r[4 * x];
+                }
+                break;
+            default: {                      /* Y410: U 0-9, Y 10-19, V 20-29 */
+                const uint32_t *q = (const uint32_t *)r;
+                for (uint32_t x = 0; x < w; x++) {
+                    yo[x] = (q[x] >> 12) & 0xff;
+                    co[2 * x] = (q[x] >> 2) & 0xff;
+                    co[2 * x + 1] = (q[x] >> 22) & 0xff;
+                }
+                break;
+            }
+            }
+        }
+        s->out.y = yp;
+        s->out.y_pitch = w;
+        s->out.uv = cp;
+        s->out.uv_pitch = cw * 2;
+        s->out.planar = 0;
+        s->out.sx = c422 ? 1 : 0;
+        s->out.sy = 0;
+    }
+    /* 28-10 (240fps): with the GPU conversion the slot already holds 8-bit
+     * NV12 - the CPU downshift below is only the vp_fail fallback;
+     * 0003: wide keeps the slot's P010 untouched (16-bit samples out) */
+    if (!d->vp && !d->wide && d->nplanes == 2 && d->tex_fmt == DXGI_FORMAT_P010) {
+        /* TEMP lab main10 (28.10): P010 = 10 bits in the HIGH bits of 16-bit
+         * samples, and every consumer (the stage copy, vtpv_fill_surface, the
+         * guest's '420v' pool - VideoToolbox's own default output for a Main10
+         * stream is 8-bit 420v) reads 8-bit rows: without this the stage took
+         * the row's first w bytes of a 2-per-sample plane - a striped half
+         * picture.  Downshift both planes like the packed 4:2:2/4:4:4 branch */
+        uint32_t w = s->out.width, h = s->out.height;
+        uint32_t cw = (w + 1) / 2, ch = (h + 1) / 2;
+        size_t need = (size_t)w * h + (size_t)cw * 2 * ch;
+        if (d->conv_cap < need) {
+            free(d->conv);
+            d->conv = malloc(need);
+            d->conv_cap = d->conv ? need : 0;
+            if (!d->conv) return;
+        }
+        uint8_t *yp = d->conv, *cp = d->conv + (size_t)w * h;
+        const uint8_t *sy = s->mem + d->fp[0].Offset, *sc = s->mem + d->fp[1].Offset;
+        for (uint32_t y = 0; y < h; y++) {
+            const uint16_t *r = (const uint16_t *)(sy + (size_t)y * d->fp[0].Footprint.RowPitch);
+            uint8_t *o = yp + (size_t)y * w;
+            for (uint32_t x = 0; x < w; x++) {
+                o[x] = (uint8_t)(r[x] >> 8);
+            }
+        }
+        for (uint32_t y = 0; y < ch; y++) {
+            const uint16_t *r = (const uint16_t *)(sc + (size_t)y * d->fp[1].Footprint.RowPitch);
+            uint8_t *o = cp + (size_t)y * cw * 2;
+            for (uint32_t x = 0; x < cw * 2; x++) {
+                o[x] = (uint8_t)(r[x] >> 8);
+            }
+        }
+        s->out.y = yp;
+        s->out.y_pitch = w;
+        s->out.uv = cp;
+        s->out.uv_pitch = cw * 2;
+    }
     d->out(d->opaque, &s->out);
+}
+
+/* 28-10 (240fps): the P010->NV12 conversion target and the VIDEO_PROCESS
+ * queue, once per decoder texture size; any failure sets vp_fail and the
+ * CPU downshift in fire() stays */
+static int vp_setup(VtpvDx *d, const D3D12_RESOURCE_DESC *td)
+{
+    if (d->vp_fail) {
+        return -1;
+    }
+    if (d->vp && d->nv12 && d->nv12_w == td->Width && d->nv12_h == td->Height) {
+        return 0;
+    }
+    if (d->nv12) { ID3D12Resource_Release(d->nv12); d->nv12 = NULL; }
+    if (!d->vd &&
+        FAILED(ID3D12Device_QueryInterface(d->dev, &IID_ID3D12VideoDevice, (void **)&d->vd))) {
+        goto fail;
+    }
+    if (d->vp) {                    /* its size ranges are this texture's */
+        ID3D12VideoProcessor_Release(d->vp);
+        d->vp = NULL;
+    }
+    {
+        UINT tw = (UINT)td->Width, th = td->Height;
+        D3D12_VIDEO_PROCESS_INPUT_STREAM_DESC in = {
+            .Format = DXGI_FORMAT_P010,
+            .ColorSpace = DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
+            .SourceAspectRatio = { 1, 1 }, .DestinationAspectRatio = { 1, 1 },
+            .FrameRate = { 60, 1 },
+            .SourceSizeRange = { .MaxWidth = tw, .MaxHeight = th, .MinWidth = tw, .MinHeight = th },
+            .DestinationSizeRange = { .MaxWidth = tw, .MaxHeight = th, .MinWidth = tw, .MinHeight = th },
+        };
+        D3D12_VIDEO_PROCESS_OUTPUT_STREAM_DESC out = {
+            .Format = DXGI_FORMAT_NV12,
+            .ColorSpace = DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
+            .FrameRate = { 60, 1 },
+        };
+        if (FAILED(ID3D12VideoDevice_CreateVideoProcessor(d->vd, 0, &out, 1, &in,
+                                                          &IID_ID3D12VideoProcessor,
+                                                          (void **)&d->vp))) {
+            goto fail;
+        }
+    }
+    if (!d->vpq) {
+        D3D12_COMMAND_QUEUE_DESC qd = { .Type = D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS };
+        if (FAILED(ID3D12Device_CreateCommandQueue(d->dev, &qd, &IID_ID3D12CommandQueue,
+                                                   (void **)&d->vpq)) ||
+            FAILED(ID3D12Device_CreateFence(d->dev, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence,
+                                            (void **)&d->vpf))) {
+            goto fail;
+        }
+    }
+    D3D12_HEAP_PROPERTIES hp = { .Type = D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC nd = *td;
+    nd.Format = DXGI_FORMAT_NV12;
+    nd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    nd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    if (FAILED(ID3D12Device_CreateCommittedResource(d->dev, &hp, D3D12_HEAP_FLAG_NONE, &nd,
+               D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&d->nv12))) {
+        goto fail;
+    }
+    d->nv12_w = td->Width;
+    d->nv12_h = td->Height;
+    fprintf(stderr, "vtpv-dx: GPU P010->NV12 %llux%llu\n",
+            (unsigned long long)td->Width, (unsigned long long)td->Height);
+    return 0;
+fail:
+    d->vp_fail = 1;
+    fprintf(stderr, "vtpv-dx: video-processor setup failed - CPU downshift stays\n");
+    return -1;
 }
 
 /* (re)size the process-memory buffers for this decoder texture */
 static int slots_setup(VtpvDx *d, ID3D12Resource *tex, int sub)
 {
     D3D12_RESOURCE_DESC td = ID3D12Resource_GetDesc(tex);
-    if (d->slot[0].buf && td.Width == d->tex_w && td.Height == d->tex_h) return 0;
+    if (d->slot[0].buf && td.Width == d->tex_w && td.Height == d->tex_h && td.Format == d->tex_fmt) return 0;
     for (int i = 0; i < NSLOT; i++) fire(d, &d->slot[i]);   /* resolution change: drain */
     slots_free(d);
+    d->tex_fmt = td.Format;
+    d->nplanes = td.Format == DXGI_FORMAT_NV12 || td.Format == DXGI_FORMAT_P010 ? 2 : 1;
+    /* 28-10 (240fps): through the video processor the readback copies the
+     * CONVERTED NV12 texture - footprints and half the bytes from it;
+     * 0003: wide skips the video processor - the footprints stay P010 */
+    if (!d->wide && d->nplanes == 2 && td.Format == DXGI_FORMAT_P010) {
+        vp_setup(d, &td);
+    }
+    D3D12_RESOURCE_DESC nv = td, *fd = &td;
+    if (d->vp && d->nv12 && td.Format == DXGI_FORMAT_P010) {
+        nv.Format = DXGI_FORMAT_NV12;
+        fd = &nv;
+        sub = 0;
+    }
     UINT64 off = 0;
-    for (int p = 0; p < 2; p++) {
-        UINT s = (UINT)sub + (UINT)p * td.DepthOrArraySize * td.MipLevels;
+    for (int p = 0; p < d->nplanes; p++) {
+        UINT s = (UINT)sub + (UINT)p * fd->DepthOrArraySize * fd->MipLevels;
         UINT64 t;
-        ID3D12Device_GetCopyableFootprints(d->dev, &td, s, 1, off, &d->fp[p], NULL, NULL, &t);
+        ID3D12Device_GetCopyableFootprints(d->dev, fd, s, 1, off, &d->fp[p], NULL, NULL, &t);
         off = (d->fp[p].Offset + t + 511) & ~511ull;
     }
     d->memsz = (SIZE_T)((off + 65535) & ~65535ull);
@@ -311,50 +566,160 @@ static int slots_setup(VtpvDx *d, ID3D12Resource *tex, int sub)
  * pipelined mode calls back the PREVIOUS picture once this copy is queued */
 static int emit(VtpvDx *d, AVFrame *f, int64_t tag)
 {
-    VtpvDxFrame o = { .width = (uint32_t)d->c->width, .height = (uint32_t)d->c->height, .tag = tag };
+    VtpvDxFrame o = { .width = (uint32_t)d->c->width, .height = (uint32_t)d->c->height, .tag = tag,
+                      .sx = 1, .sy = 1 };
     d->npics++;
     if (!d->d3d12) {
-        double a = now_ms(d);
-        av_frame_unref(d->sw);
-        if (av_hwframe_transfer_data(d->sw, f, 0) < 0) return -1;
-        d->t_gpu += now_ms(d) - a;
-        o.y = d->sw->data[0];
-        o.y_pitch = (uint32_t)d->sw->linesize[0];
-        o.uv = d->sw->data[1];
-        o.uv_pitch = (uint32_t)d->sw->linesize[1];
+        /* d3d11/cuda: libavcodec's readback; sw: the frame is in memory already */
+        AVFrame *m = f;
+        if (!d->soft) {
+            double a = now_ms(d);
+            av_frame_unref(d->sw);
+            if (av_hwframe_transfer_data(d->sw, f, 0) < 0) return -1;
+            d->t_gpu += now_ms(d) - a;
+            m = d->sw;
+        }
+        o.y = m->data[0];
+        o.y_pitch = (uint32_t)m->linesize[0];
+        o.uv = m->data[1];
+        o.uv_pitch = (uint32_t)m->linesize[1];
+        switch (m->format) {
+        case AV_PIX_FMT_NV12:
+            break;
+        case AV_PIX_FMT_P016LE:  /* 0003: 10-bit readback, samples in the high bits */
+            o.wide = 1;
+            break;
+        case AV_PIX_FMT_GRAY8:
+            o.gray = 1;
+            break;
+        case AV_PIX_FMT_YUV420P:
+        case AV_PIX_FMT_YUVJ420P:
+        case AV_PIX_FMT_YUV422P:
+        case AV_PIX_FMT_YUVJ422P:
+        case AV_PIX_FMT_YUV444P:
+        case AV_PIX_FMT_YUVJ444P: {
+            const AVPixFmtDescriptor *pd = av_pix_fmt_desc_get(m->format);
+            o.planar = 1;
+            o.v = m->data[2];
+            o.v_pitch = (uint32_t)m->linesize[2];
+            o.sx = pd->log2_chroma_w;
+            o.sy = pd->log2_chroma_h;
+            break;
+        }
+        default:
+            fprintf(stderr, "vtpv-dx: picture format %s not handled\n", av_get_pix_fmt_name(m->format));
+            return -1;
+        }
         d->out(d->opaque, &o);
         return 0;
     }
     AVD3D12VAFrame *df = (AVD3D12VAFrame *)f->data[0];
     if (slots_setup(d, df->texture, df->subresource_index) < 0) return -1;
-    Slot *s = &d->slot[d->next];
-    fire(d, s);                                 /* free it (pipelined: picture N-2) */
+    if (d->wide && d->nplanes == 2 && d->tex_fmt == DXGI_FORMAT_P010) {
+        o.wide = 1;               /* the slot holds P010: 16-bit samples out */
+    }
+    Slot *s;
+    if (d->pipelined) {
+        /* async readback: prefer a free slot so the submit returns without a
+         * fence wait; when the pool is full the oldest picture fires first
+         * (backpressure at the pool depth) */
+        s = NULL;
+        for (int i = 0; i < NSLOT && !s; i++) {
+            Slot *c = &d->slot[(d->next + i) % NSLOT];
+            if (!c->busy) {
+                s = c;
+            }
+        }
+        if (!s) {
+            s = &d->slot[d->next];
+            fire(d, s);
+        }
+    } else {
+        s = &d->slot[d->next];
+        fire(d, s);                                 /* free it (pipelined: picture N-2) */
+    }
     D3D12_RESOURCE_DESC td = ID3D12Resource_GetDesc(df->texture);
+    ID3D12Resource *srcTex = df->texture;
+    UINT srcSub = (UINT)df->subresource_index;
+    bool vpBlit = d->vp && d->nv12 && d->tex_fmt == DXGI_FORMAT_P010;
+    if (vpBlit) {
+        /* 28-10 (240fps): the P010->NV12 blit rides this SLOT's video list
+         * (its allocator resets only after the slot's previous picture fired
+         * - the same discipline as the copy list); every wait is GPU-side */
+        ID3D12CommandAllocator_Reset(s->valloc);
+        ID3D12VideoProcessCommandList_Reset(s->vlist, s->valloc);
+        D3D12_RESOURCE_BARRIER tovp[2] = {
+            { .Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+              .Transition = { .pResource = df->texture, .Subresource = df->subresource_index,
+                              .StateBefore = D3D12_RESOURCE_STATE_COMMON,
+                              .StateAfter = D3D12_RESOURCE_STATE_VIDEO_PROCESS_READ } },
+            { .Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+              .Transition = { .pResource = d->nv12, .Subresource = 0,
+                              .StateBefore = D3D12_RESOURCE_STATE_COMMON,
+                              .StateAfter = D3D12_RESOURCE_STATE_VIDEO_PROCESS_WRITE } },
+        };
+        ID3D12VideoProcessCommandList_ResourceBarrier(s->vlist, 2, tovp);
+        D3D12_VIDEO_PROCESS_INPUT_STREAM_ARGUMENTS vin = { 0 };
+        vin.InputStream[0].pTexture2D = df->texture;
+        vin.InputStream[0].Subresource = df->subresource_index;
+        D3D12_RECT whole = { 0, 0, (LONG)td.Width, (LONG)td.Height };
+        vin.Transform.SourceRectangle = whole;
+        vin.Transform.DestinationRectangle = whole;
+        vin.RateInfo.OutputIndex = 0;
+        vin.RateInfo.InputFrameOrField = 0;
+        D3D12_VIDEO_PROCESS_OUTPUT_STREAM_ARGUMENTS vout = { 0 };
+        vout.OutputStream[0].pTexture2D = d->nv12;
+        vout.OutputStream[0].Subresource = 0;
+        vout.TargetRectangle = whole;
+        ID3D12VideoProcessCommandList_ProcessFrames(s->vlist, d->vp, &vout, 1, &vin);
+        D3D12_RESOURCE_BARRIER back[2] = { tovp[0], tovp[1] };
+        back[0].Transition.StateBefore = D3D12_RESOURCE_STATE_VIDEO_PROCESS_READ;
+        back[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+        back[1].Transition.StateBefore = D3D12_RESOURCE_STATE_VIDEO_PROCESS_WRITE;
+        back[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+        ID3D12VideoProcessCommandList_ResourceBarrier(s->vlist, 2, back);
+        ID3D12VideoProcessCommandList_Close(s->vlist);
+        ID3D12CommandQueue_Wait(d->vpq, df->sync_ctx.fence, df->sync_ctx.fence_value);
+        ID3D12CommandList *vl = (ID3D12CommandList *)s->vlist;
+        ID3D12CommandQueue_ExecuteCommandLists(d->vpq, 1, &vl);
+        ID3D12CommandQueue_Signal(d->vpq, d->vpf, ++d->vpfv);
+        srcTex = d->nv12;
+        srcSub = 0;
+    }
     ID3D12CommandAllocator_Reset(s->alloc);
     ID3D12GraphicsCommandList_Reset(s->list, s->alloc, NULL);
-    for (int p = 0; p < 2; p++) {
-        D3D12_TEXTURE_COPY_LOCATION src = { .pResource = df->texture,
+    for (int p = 0; p < d->nplanes; p++) {
+        D3D12_TEXTURE_COPY_LOCATION src = { .pResource = srcTex,
             .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            .SubresourceIndex = (UINT)df->subresource_index + (UINT)p * td.DepthOrArraySize * td.MipLevels };
+            .SubresourceIndex = srcSub + (UINT)p * td.DepthOrArraySize * td.MipLevels };
         D3D12_TEXTURE_COPY_LOCATION dst = { .pResource = s->buf,
             .Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, .PlacedFootprint = d->fp[p] };
         ID3D12GraphicsCommandList_CopyTextureRegion(s->list, &dst, 0, 0, 0, &src, NULL);
     }
     ID3D12GraphicsCommandList_Close(s->list);
-    ID3D12CommandQueue_Wait(d->q, df->sync_ctx.fence, df->sync_ctx.fence_value);
+    if (vpBlit) {
+        ID3D12CommandQueue_Wait(d->q, d->vpf, d->vpfv);
+    } else {
+        ID3D12CommandQueue_Wait(d->q, df->sync_ctx.fence, df->sync_ctx.fence_value);
+    }
     ID3D12CommandList *l = (ID3D12CommandList *)s->list;
     ID3D12CommandQueue_ExecuteCommandLists(d->q, 1, &l);
     ID3D12CommandQueue_Signal(d->q, d->fence, ++d->fv);
     s->fv = d->fv;
     o.y = s->mem + d->fp[0].Offset;
     o.y_pitch = d->fp[0].Footprint.RowPitch;
-    o.uv = s->mem + d->fp[1].Offset;
-    o.uv_pitch = d->fp[1].Footprint.RowPitch;
+    if (d->nplanes == 2) {      /* packed outputs get their planes in fire() */
+        o.uv = s->mem + d->fp[1].Offset;
+        o.uv_pitch = d->fp[1].Footprint.RowPitch;
+    }
     s->out = o;
     s->busy = 1;
-    d->next = (d->next + 1) % NSLOT;
-    if (d->pipelined) fire(d, &d->slot[d->next]);   /* picture N-1, copied while N decoded */
-    else fire(d, s);
+    d->next = (int)((s - d->slot) + 1) % NSLOT;
+    if (!d->pipelined) {
+        fire(d, s);
+    }
+    /* pipelined: nothing fires here - the pool fills to NSLOT-1 pictures and
+     * vtpv_dx_flush() (the collect step) fires them oldest-first */
     return 0;
 }
 
@@ -362,29 +727,102 @@ VtpvDx *vtpv_dx_open(const char *gpu, const char *api, VtpvDxCodec codec,
                      const uint8_t *cfg, uint32_t cfg_len, VtpvDxOut out, void *opaque)
 {
     static const enum AVCodecID ids[] = { AV_CODEC_ID_H264, AV_CODEC_ID_HEVC, AV_CODEC_ID_VP9, AV_CODEC_ID_AV1 };
+    int cuda = api && strcmp(api, "cuda") == 0;
+    int soft = api && strcmp(api, "sw") == 0;
+    int d3d12 = !cuda && !soft && !(api && strcmp(api, "d3d11") == 0);
+    int nv = cuda || (gpu && strcmp(gpu, "nv") == 0);
+    if (cuda || d3d12) {
+        /* a pooled decoder of this stream configuration; drop the expired ones */
+        VtpvDx *hit = NULL, *old[POOL_MAX];
+        int nold = 0;
+        AcquireSRWLockExclusive(&pool_lock);
+        for (int i = 0; i < POOL_MAX; i++) {
+            VtpvDx *p = pool[i];
+            if (!p) continue;
+            if (now_ms(p) - p->pooled_at > POOL_TTL_MS) {
+                old[nold++] = p;
+                pool[i] = NULL;
+            } else if (!hit && p->cuda == cuda && p->d3d12 == d3d12 && p->nv == nv && p->codec == codec &&
+                       p->cfg_len == cfg_len && (!cfg_len || memcmp(p->cfg, cfg, cfg_len) == 0)) {
+                hit = p;
+                pool[i] = NULL;
+            }
+        }
+        ReleaseSRWLockExclusive(&pool_lock);
+        for (int i = 0; i < nold; i++) dx_destroy(old[i]);
+        if (hit) {
+            hit->out = out;
+            hit->opaque = opaque;
+            hit->pipelined = 0;
+            hit->t_parse = hit->t_gpu = 0;
+            hit->npics = 0;
+            hit->pooled_at = 0;
+            return hit;
+        }
+    }
     VtpvDx *d = calloc(1, sizeof(*d));
     if (!d) return NULL;
+    InterlockedIncrement(&dx_opened);   /* the fail path destroys it again */
     QueryPerformanceFrequency(&d->qf);
     d->out = out;
     d->opaque = opaque;
-    d->d3d12 = !(api && strcmp(api, "d3d11") == 0);
-    d->hook = codec == VTPV_DX_H264 || codec == VTPV_DX_HEVC;
-    d->hwfmt = d->d3d12 ? AV_PIX_FMT_D3D12 : AV_PIX_FMT_D3D11;
-    int ai = adapter_for(gpu && strcmp(gpu, "nv") == 0 ? 0x10de : 0x8086);
-    if (ai < 0) { fprintf(stderr, "vtpv-dx: no %s adapter\n", gpu ? gpu : "int"); goto fail; }
-    char devstr[16];
-    snprintf(devstr, sizeof devstr, "%d", ai);
-    if (av_hwdevice_ctx_create(&d->hw, d->d3d12 ? AV_HWDEVICE_TYPE_D3D12VA : AV_HWDEVICE_TYPE_D3D11VA,
-                               devstr, NULL, 0) < 0) {
-        fprintf(stderr, "vtpv-dx: %s device on adapter %d failed\n", d->d3d12 ? "d3d12" : "d3d11", ai);
-        goto fail;
+    d->cuda = cuda;
+    d->soft = soft;
+    d->d3d12 = d3d12;
+    d->nv = nv;
+    d->codec = codec;
+    if (cfg_len) {
+        d->cfg = malloc(cfg_len);
+        if (!d->cfg) goto fail;
+        memcpy(d->cfg, cfg, cfg_len);
+        d->cfg_len = cfg_len;
+    }
+    d->hook = d->d3d12 && (codec == VTPV_DX_H264 || codec == VTPV_DX_HEVC);
+    d->hwfmt = d->cuda ? AV_PIX_FMT_CUDA : d->d3d12 ? AV_PIX_FMT_D3D12 : AV_PIX_FMT_D3D11;
+    if (d->soft) {
+        /* no device: libavcodec's own decoder on this thread */
+    } else if (d->cuda || d->d3d12) {
+        /* one device per api and GPU for the process (see POOL_MAX) */
+        AcquireSRWLockExclusive(&pool_lock);
+        AVBufferRef **dc = &dev_cache[d->cuda][d->nv];
+        if (!*dc) {
+            if (d->cuda) {
+                /* CUDA numbers its own devices: the first NVIDIA GPU */
+                if (av_hwdevice_ctx_create(dc, AV_HWDEVICE_TYPE_CUDA, "0", NULL, 0) < 0) {
+                    fprintf(stderr, "vtpv-dx: cuda device failed (libavcodec without nvdec, or no NVIDIA GPU)\n");
+                }
+            } else {
+                int ai = adapter_for(d->nv ? 0x10de : 0x8086);
+                char devstr[16];
+                snprintf(devstr, sizeof devstr, "%d", ai);
+                if (ai < 0) {
+                    fprintf(stderr, "vtpv-dx: no %s adapter\n", gpu ? gpu : "int");
+                } else if (av_hwdevice_ctx_create(dc, AV_HWDEVICE_TYPE_D3D12VA, devstr, NULL, 0) < 0) {
+                    fprintf(stderr, "vtpv-dx: d3d12 device on adapter %d failed\n", ai);
+                }
+            }
+        }
+        d->hw = *dc ? av_buffer_ref(*dc) : NULL;
+        ReleaseSRWLockExclusive(&pool_lock);
+        if (!d->hw) goto fail;
+    } else {
+        int ai = adapter_for(gpu && strcmp(gpu, "nv") == 0 ? 0x10de : 0x8086);
+        if (ai < 0) { fprintf(stderr, "vtpv-dx: no %s adapter\n", gpu ? gpu : "int"); goto fail; }
+        char devstr[16];
+        snprintf(devstr, sizeof devstr, "%d", ai);
+        if (av_hwdevice_ctx_create(&d->hw, AV_HWDEVICE_TYPE_D3D11VA, devstr, NULL, 0) < 0) {
+            fprintf(stderr, "vtpv-dx: d3d11 device on adapter %d failed\n", ai);
+            goto fail;
+        }
     }
     const AVCodec *dec = avcodec_find_decoder_by_name(avcodec_get_name(ids[codec]));
     if (!dec) goto fail;
     d->c = avcodec_alloc_context3(dec);
     d->c->opaque = d;
-    d->c->hw_device_ctx = av_buffer_ref(d->hw);
-    d->c->get_format = get_fmt;
+    if (!d->soft) {
+        d->c->hw_device_ctx = av_buffer_ref(d->hw);
+        d->c->get_format = get_fmt;
+    }
     if (d->hook) d->c->get_buffer2 = get_buf;
     d->c->thread_count = 1;
     if (cfg && cfg_len) {
@@ -400,7 +838,7 @@ VtpvDx *vtpv_dx_open(const char *gpu, const char *api, VtpvDxCodec codec,
     d->sw = av_frame_alloc();
     return d;
 fail:
-    vtpv_dx_close(d);
+    dx_destroy(d);
     return NULL;
 }
 
@@ -408,6 +846,17 @@ void vtpv_dx_set_pipelined(VtpvDx *d, int on)
 {
     if (!on) vtpv_dx_flush(d);
     d->pipelined = on && d->d3d12;
+}
+
+/* 0003 (Task 18): P010 pass-through for 10-bit video sessions - no GPU NV12
+ * conversion, the callback's planes are 16-bit samples (the 'x420' layout).
+ * Only vtpv.c's video/outbuf sessions turn it on; HEIF tiles stay 8-bit. */
+void vtpv_dx_set_wide(VtpvDx *d, int on)
+{
+    if (d->wide && !on) {
+        vtpv_dx_flush(d);  /* a wide picture may still sit in a slot */
+    }
+    d->wide = on;
 }
 
 void vtpv_dx_flush(VtpvDx *d)
@@ -455,9 +904,74 @@ void vtpv_dx_stats(const VtpvDx *d, double *ms_parse, double *ms_gpu, int *pictu
     if (pictures) *pictures = d->npics;
 }
 
+/* TEMP lab (task61): every live kernel object this backend holds, beside the
+ * pool walk.  Cheap enough for a line a second. */
+void vtpv_dx_handles(VtpvDxHandles *h)
+{
+    h->open = (int)(dx_opened - dx_destroyed);
+    int pooled = 0;
+    AcquireSRWLockExclusive(&pool_lock);
+    for (int i = 0; i < POOL_MAX; i++) {
+        if (pool[i]) pooled++;
+    }
+    ReleaseSRWLockExclusive(&pool_lock);
+    h->pooled = pooled;
+    h->events = (int)(ev_created - ev_closed);
+    h->heaps = (int)(heaps_opened - heaps_released);
+    h->threads = (int)(ka_started - ka_joined);
+}
+
 void vtpv_dx_close(VtpvDx *d)
 {
     if (!d) return;
+    if (d->cuda || d->d3d12) {
+        /* to the pool: pictures in flight are dropped (their copies finished
+         * first, nothing writes the slots later), the decoder forgets its
+         * references */
+        for (int i = 0; i < d->npend; i++) av_frame_free(&d->pend[i]);
+        d->npend = 0;
+        if (d->fence && d->q) {
+            ID3D12CommandQueue_Signal(d->q, d->fence, ++d->fv);
+            wait_fv(d, d->fv);
+        }
+        for (int i = 0; i < NSLOT; i++) d->slot[i].busy = 0;
+        avcodec_flush_buffers(d->c);
+        d->out = NULL;
+        d->opaque = NULL;
+        d->pooled_at = now_ms(d);
+        VtpvDx *evict = d;
+        AcquireSRWLockExclusive(&pool_lock);
+        for (int i = 0; i < POOL_MAX && evict; i++) {
+            if (!pool[i]) {
+                pool[i] = d;
+                evict = NULL;
+            }
+        }
+        if (evict) {
+            /* full: the oldest goes */
+            int o = 0;
+            for (int i = 1; i < POOL_MAX; i++) {
+                if (pool[i]->pooled_at < pool[o]->pooled_at) o = i;
+            }
+            evict = pool[o];
+            pool[o] = d;
+        }
+        ReleaseSRWLockExclusive(&pool_lock);
+        if (evict) dx_destroy(evict);
+        return;
+    }
+    dx_destroy(d);
+}
+
+void vtpv_dx_discard(VtpvDx *d)
+{
+    if (d) dx_destroy(d);
+}
+
+static void dx_destroy(VtpvDx *d)
+{
+    if (!d) return;
+    InterlockedIncrement(&dx_destroyed);
     ka_stop(d);
     for (int i = 0; i < d->npend; i++) av_frame_free(&d->pend[i]);
     if (d->fence && d->q) {
@@ -469,14 +983,23 @@ void vtpv_dx_close(VtpvDx *d)
     for (int i = 0; i < NSLOT; i++) {
         if (d->slot[i].list) ID3D12GraphicsCommandList_Release(d->slot[i].list);
         if (d->slot[i].alloc) ID3D12CommandAllocator_Release(d->slot[i].alloc);
+        if (d->slot[i].vlist) ID3D12VideoProcessCommandList_Release(d->slot[i].vlist);
+        if (d->slot[i].valloc) ID3D12CommandAllocator_Release(d->slot[i].valloc);
     }
+    if (d->vpq) ID3D12CommandQueue_Release(d->vpq);
+    if (d->vpf) ID3D12Fence_Release(d->vpf);
+    if (d->vp) ID3D12VideoProcessor_Release(d->vp);
+    if (d->vd) ID3D12VideoDevice_Release(d->vd);
+    if (d->nv12) ID3D12Resource_Release(d->nv12);
     if (d->q) ID3D12CommandQueue_Release(d->q);
     if (d->fence) ID3D12Fence_Release(d->fence);
-    if (d->ev) CloseHandle(d->ev);
+    if (d->ev) { CloseHandle(d->ev); InterlockedIncrement(&ev_closed); }
+    free(d->conv);
     av_frame_free(&d->fr);
     av_frame_free(&d->sw);
     av_packet_free(&d->pkt);
     avcodec_free_context(&d->c);
     av_buffer_unref(&d->hw);
+    free(d->cfg);
     free(d);
 }
